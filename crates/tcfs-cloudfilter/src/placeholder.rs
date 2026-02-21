@@ -13,8 +13,8 @@
 
 #![cfg(target_os = "windows")]
 
-use std::path::Path;
 use anyhow::{Context, Result};
+use std::path::Path;
 use tracing::{debug, info};
 
 use crate::PlaceholderInfo;
@@ -72,12 +72,15 @@ pub async fn populate_root(
         "populating sync root with placeholders"
     );
 
-    let entries = op.list(&index_prefix).await
+    let entries = op
+        .list(&index_prefix)
+        .await
         .context("listing remote index")?;
 
     let mut count = 0;
     for entry in entries {
-        let rel_path = entry.name()
+        let rel_path = entry
+            .name()
             .strip_prefix(&index_prefix)
             .unwrap_or(entry.name());
 

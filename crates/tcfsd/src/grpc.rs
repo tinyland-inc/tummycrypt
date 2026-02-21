@@ -44,7 +44,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
             version: env!("CARGO_PKG_VERSION").into(),
             storage_endpoint: self.storage_endpoint.clone(),
             storage_ok: self.storage_ok,
-            nats_ok: false, // Phase 2
+            nats_ok: false,   // Phase 2
             active_mounts: 0, // Phase 3
             uptime_secs: uptime,
         }))

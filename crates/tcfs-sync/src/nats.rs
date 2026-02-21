@@ -52,10 +52,7 @@ mod inner {
             local_path: String,
         },
         /// Convert a hydrated file back to a .tc stub.
-        Unsync {
-            task_id: String,
-            local_path: String,
-        },
+        Unsync { task_id: String, local_path: String },
     }
 
     impl SyncTask {
@@ -82,8 +79,7 @@ mod inner {
         }
 
         pub fn from_bytes(data: &[u8]) -> Result<Self> {
-            serde_json::from_slice(data)
-                .map_err(|e| anyhow::anyhow!("deserializing SyncTask: {e}"))
+            serde_json::from_slice(data).map_err(|e| anyhow::anyhow!("deserializing SyncTask: {e}"))
         }
     }
 
@@ -156,7 +152,11 @@ mod inner {
                 .map_err(|e| anyhow::anyhow!("publishing to SYNC_TASKS: {e}"))?
                 .await
                 .map_err(|e| anyhow::anyhow!("awaiting NATS publish ack: {e}"))?;
-            debug!(task_id = task.task_id(), task_type = task.type_name(), "task queued");
+            debug!(
+                task_id = task.task_id(),
+                task_type = task.type_name(),
+                "task queued"
+            );
             Ok(())
         }
 
@@ -188,8 +188,7 @@ mod inner {
                 .map_err(|e| anyhow::anyhow!("opening pull consumer message stream: {e}"))?;
 
             let stream = messages.map(|msg_result| {
-                let msg = msg_result
-                    .map_err(|e| anyhow::anyhow!("receiving NATS message: {e}"))?;
+                let msg = msg_result.map_err(|e| anyhow::anyhow!("receiving NATS message: {e}"))?;
                 let task = SyncTask::from_bytes(&msg.payload)?;
                 Ok(TaskMessage { task, msg })
             });

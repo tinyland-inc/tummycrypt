@@ -63,7 +63,8 @@ impl StubMeta {
             if line.is_empty() {
                 continue;
             }
-            let (key, value) = line.split_once(' ')
+            let (key, value) = line
+                .split_once(' ')
                 .with_context(|| format!("line {}: no space separator: {:?}", lineno + 1, line))?;
 
             match key {
@@ -74,8 +75,11 @@ impl StubMeta {
                     found_version = true;
                 }
                 "chunks" => {
-                    chunks = Some(value.parse::<usize>()
-                        .with_context(|| format!("invalid chunks: {}", value))?);
+                    chunks = Some(
+                        value
+                            .parse::<usize>()
+                            .with_context(|| format!("invalid chunks: {}", value))?,
+                    );
                 }
                 "compressed" => {
                     compressed = Some(value != "0");
@@ -90,8 +94,11 @@ impl StubMeta {
                     origin = Some(value.to_string());
                 }
                 "size" => {
-                    size = Some(value.parse::<u64>()
-                        .with_context(|| format!("invalid size: {}", value))?);
+                    size = Some(
+                        value
+                            .parse::<u64>()
+                            .with_context(|| format!("invalid size: {}", value))?,
+                    );
                 }
                 _ => {
                     // Unknown keys are silently ignored for forward compatibility
@@ -221,7 +228,11 @@ impl IndexEntry {
 
     /// Manifest path under `{prefix}/manifests/`.
     pub fn manifest_path(&self, prefix: &str) -> String {
-        format!("{}/manifests/{}", prefix.trim_end_matches('/'), self.manifest_hash)
+        format!(
+            "{}/manifests/{}",
+            prefix.trim_end_matches('/'),
+            self.manifest_hash
+        )
     }
 }
 
@@ -247,8 +258,14 @@ size 94371840
         assert_eq!(meta.chunks, 23);
         assert!(!meta.compressed);
         assert!(!meta.fetched);
-        assert_eq!(meta.oid, "blake3:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e239");
-        assert_eq!(meta.origin, "seaweedfs://filer.example.com/bucket/path/to/file");
+        assert_eq!(
+            meta.oid,
+            "blake3:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e239"
+        );
+        assert_eq!(
+            meta.origin,
+            "seaweedfs://filer.example.com/bucket/path/to/file"
+        );
         assert_eq!(meta.size, 94_371_840);
 
         let reserialized = meta.to_stub_string();

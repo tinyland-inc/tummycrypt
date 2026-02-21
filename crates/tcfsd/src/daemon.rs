@@ -1,11 +1,11 @@
 //! Daemon lifecycle: startup, health checks, systemd notify, gRPC server
 
 use anyhow::Result;
+use std::sync::Arc;
 use tcfs_core::config::TcfsConfig;
 use tracing::{error, info, warn};
-use std::sync::Arc;
 
-use crate::cred_store::{SharedCredStore, new_shared as new_cred_store};
+use crate::cred_store::{new_shared as new_cred_store, SharedCredStore};
 use crate::grpc::TcfsDaemonImpl;
 
 pub async fn run(config: TcfsConfig) -> Result<()> {
@@ -24,7 +24,8 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
     }
 
     // Verify storage connectivity
-    let storage_ok = if let Some(s3) = cred_store.read().await.as_ref().and_then(|c| c.s3.as_ref()) {
+    let storage_ok = if let Some(s3) = cred_store.read().await.as_ref().and_then(|c| c.s3.as_ref())
+    {
         let op = tcfs_storage::operator::build_from_core_config(
             &config.storage,
             &s3.access_key_id,

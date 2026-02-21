@@ -48,15 +48,14 @@ pub async fn handle_fetch_data(
     debug!(hash = %content_hash, manifest = %manifest_path, "hydrating via CFAPI callback");
 
     // Read manifest
-    let manifest_bytes = op.read(&manifest_path).await
+    let manifest_bytes = op
+        .read(&manifest_path)
+        .await
         .map_err(|e| anyhow::anyhow!("reading manifest {}: {}", manifest_path, e))?;
     let manifest_str = String::from_utf8(manifest_bytes.to_bytes().to_vec())
         .map_err(|e| anyhow::anyhow!("manifest not UTF-8: {}", e))?;
 
-    let chunk_hashes: Vec<&str> = manifest_str
-        .lines()
-        .filter(|l| !l.is_empty())
-        .collect();
+    let chunk_hashes: Vec<&str> = manifest_str.lines().filter(|l| !l.is_empty()).collect();
 
     if chunk_hashes.is_empty() {
         anyhow::bail!("empty manifest: {}", manifest_path);
@@ -66,7 +65,9 @@ pub async fn handle_fetch_data(
     let mut assembled = Vec::new();
     for (i, hash) in chunk_hashes.iter().enumerate() {
         let chunk_key = format!("{}/chunks/{}", prefix, hash);
-        let chunk = op.read(&chunk_key).await
+        let chunk = op
+            .read(&chunk_key)
+            .await
             .map_err(|e| anyhow::anyhow!("chunk {}/{}: {}", i + 1, chunk_hashes.len(), e))?;
         assembled.extend_from_slice(&chunk.to_bytes());
     }

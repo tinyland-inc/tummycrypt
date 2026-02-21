@@ -56,8 +56,7 @@ pub fn hash_to_hex(hash: &Hash) -> String {
 
 /// Parse a 64-char hex string into a Hash
 pub fn hash_from_hex(hex: &str) -> Result<Hash> {
-    blake3::Hash::from_hex(hex)
-        .map_err(|e| anyhow::anyhow!("invalid BLAKE3 hex '{}': {}", hex, e))
+    blake3::Hash::from_hex(hex).map_err(|e| anyhow::anyhow!("invalid BLAKE3 hex '{}': {}", hex, e))
 }
 
 #[cfg(test)]

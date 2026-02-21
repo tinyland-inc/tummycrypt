@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Top-level daemon configuration (loaded from tcfs.toml)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TcfsConfig {
     pub daemon: DaemonConfig,
@@ -40,7 +40,7 @@ pub struct StorageConfig {
     pub credentials_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecretsConfig {
     /// Age identity file (default: ~/.config/sops/age/keys.txt)
@@ -98,16 +98,6 @@ impl Default for StorageConfig {
     }
 }
 
-impl Default for SecretsConfig {
-    fn default() -> Self {
-        Self {
-            age_identity: None,
-            kdbx_path: None,
-            sops_dir: None,
-        }
-    }
-}
-
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
@@ -125,18 +115,6 @@ impl Default for FuseConfig {
             negative_cache_ttl_secs: 30,
             cache_dir: PathBuf::from("~/.cache/tcfs"),
             cache_max_mb: 10240,
-        }
-    }
-}
-
-impl Default for TcfsConfig {
-    fn default() -> Self {
-        Self {
-            daemon: DaemonConfig::default(),
-            storage: StorageConfig::default(),
-            secrets: SecretsConfig::default(),
-            sync: SyncConfig::default(),
-            fuse: FuseConfig::default(),
         }
     }
 }

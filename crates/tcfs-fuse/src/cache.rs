@@ -140,7 +140,10 @@ mod tests {
 
     #[test]
     fn cache_key_extraction() {
-        assert_eq!(cache_key_for_path("mydata/manifests/abc123def"), "abc123def");
+        assert_eq!(
+            cache_key_for_path("mydata/manifests/abc123def"),
+            "abc123def"
+        );
         assert_eq!(cache_key_for_path("abc"), "abc");
     }
 }

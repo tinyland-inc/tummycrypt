@@ -1,7 +1,7 @@
 //! age decryption helpers (age 0.11 API)
 
-use anyhow::{Context, Result};
 use crate::identity::IdentityProvider;
+use anyhow::{Context, Result};
 
 /// Decrypt age-encrypted data using an identity
 ///
@@ -15,12 +15,11 @@ pub fn decrypt_with_identity(
     use std::io::Read;
 
     // Parse identities from key file
-    let identities = age::IdentityFile::from_buffer(
-        std::io::BufReader::new(identity.key_data.as_bytes())
-    )
-    .context("parsing age identity file")?
-    .into_identities()
-    .context("extracting age identities")?;
+    let identities =
+        age::IdentityFile::from_buffer(std::io::BufReader::new(identity.key_data.as_bytes()))
+            .context("parsing age identity file")?
+            .into_identities()
+            .context("extracting age identities")?;
 
     // Create decryptor — age 0.11: Decryptor is a plain struct, not an enum
     let armored = ArmoredReader::new(encrypted_data);
@@ -37,7 +36,9 @@ pub fn decrypt_with_identity(
         .context("decrypting with age identity")?;
 
     let mut plaintext = Vec::new();
-    reader.read_to_end(&mut plaintext).context("reading decrypted data")?;
+    reader
+        .read_to_end(&mut plaintext)
+        .context("reading decrypted data")?;
 
     Ok(plaintext)
 }

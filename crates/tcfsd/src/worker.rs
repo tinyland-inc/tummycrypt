@@ -48,9 +48,7 @@ mod inner {
             let tasks_failed = Family::default();
             let task_duration =
                 Family::<Vec<(String, String)>, Histogram>::new_with_constructor(|| {
-                    Histogram::new(
-                        [0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0],
-                    )
+                    Histogram::new([0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0])
                 });
 
             registry.register(
@@ -69,7 +67,11 @@ mod inner {
                 task_duration.clone(),
             );
 
-            WorkerMetrics { tasks_processed, tasks_failed, task_duration }
+            WorkerMetrics {
+                tasks_processed,
+                tasks_failed,
+                task_duration,
+            }
         }
 
         fn task_labels(task_type: &str) -> Vec<(String, String)> {
@@ -126,7 +128,6 @@ mod inner {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or_else(|| {
-                
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4)
@@ -224,10 +225,7 @@ mod inner {
 
         match result {
             Ok(()) => {
-                metrics
-                    .tasks_processed
-                    .get_or_create(&labels)
-                    .inc();
+                metrics.tasks_processed.get_or_create(&labels).inc();
                 metrics
                     .task_duration
                     .get_or_create(&labels)
@@ -253,7 +251,11 @@ mod inner {
         state: &Arc<TokioMutex<tcfs_sync::state::StateCache>>,
     ) -> anyhow::Result<()> {
         match task {
-            SyncTask::Push { local_path, remote_prefix, .. } => {
+            SyncTask::Push {
+                local_path,
+                remote_prefix,
+                ..
+            } => {
                 let local = std::path::Path::new(local_path);
                 let mut guard = state.lock().await;
                 if local.is_file() {
@@ -269,7 +271,12 @@ mod inner {
                 }
                 guard.flush().context("flushing state cache")
             }
-            SyncTask::Pull { manifest_path, remote_prefix, local_path, .. } => {
+            SyncTask::Pull {
+                manifest_path,
+                remote_prefix,
+                local_path,
+                ..
+            } => {
                 let local = std::path::Path::new(local_path);
                 tcfs_sync::engine::download_file(op, manifest_path, local, remote_prefix, None)
                     .await
@@ -309,9 +316,7 @@ mod inner {
         let _ = axum::serve(listener, app).await;
     }
 
-    async fn metrics_handler(
-        State(registry): State<Arc<Mutex<Registry>>>,
-    ) -> String {
+    async fn metrics_handler(State(registry): State<Arc<Mutex<Registry>>>) -> String {
         let mut buf = String::new();
         let guard = registry.lock().expect("registry lock poisoned");
         encode(&mut buf, &guard).unwrap_or_default();

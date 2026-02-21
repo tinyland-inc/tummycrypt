@@ -12,12 +12,12 @@ pub mod kdbx;
 pub mod rotate;
 pub mod sops;
 
-pub use identity::{IdentityProvider, find_age_identity};
-pub use sops::{SopsFile, SopsCredentials, decrypt_sops_file};
-pub use kdbx::{KdbxStore, KdbxCredential};
+pub use identity::{find_age_identity, IdentityProvider};
+pub use kdbx::{KdbxCredential, KdbxStore};
+pub use sops::{decrypt_sops_file, SopsCredentials, SopsFile};
 
-use std::path::PathBuf;
 use anyhow::Result;
+use std::path::Path;
 
 /// Loaded S3 credentials, sourced from SOPS-encrypted file or environment
 #[derive(Debug, Clone)]
@@ -38,13 +38,18 @@ impl CredStore {
     /// Load credentials using the full discovery chain:
     /// 1. SOPS-encrypted file (decrypted with age identity)
     /// 2. Environment variables (AWS_ACCESS_KEY_ID etc.)
-    pub async fn load(config: &tcfs_core::config::SecretsConfig, storage: &tcfs_core::config::StorageConfig) -> Result<Self> {
+    pub async fn load(
+        config: &tcfs_core::config::SecretsConfig,
+        storage: &tcfs_core::config::StorageConfig,
+    ) -> Result<Self> {
         // Try SOPS credential file first
         if let Some(cred_file) = &storage.credentials_file {
             if cred_file.exists() {
                 match Self::load_from_sops(cred_file, config).await {
                     Ok(store) => return Ok(store),
-                    Err(e) => tracing::warn!("SOPS credential load failed: {e}, falling back to env"),
+                    Err(e) => {
+                        tracing::warn!("SOPS credential load failed: {e}, falling back to env")
+                    }
                 }
             }
         }
@@ -53,7 +58,10 @@ impl CredStore {
         Self::load_from_env(storage)
     }
 
-    async fn load_from_sops(cred_file: &PathBuf, secrets_config: &tcfs_core::config::SecretsConfig) -> Result<Self> {
+    async fn load_from_sops(
+        cred_file: &Path,
+        secrets_config: &tcfs_core::config::SecretsConfig,
+    ) -> Result<Self> {
         let identity = identity::find_age_identity(secrets_config).await?;
         let creds = sops::decrypt_sops_file(cred_file, &identity).await?;
 

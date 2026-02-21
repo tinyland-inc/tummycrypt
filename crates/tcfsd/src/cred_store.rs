@@ -10,4 +10,3 @@ pub type SharedCredStore = Arc<RwLock<Option<tcfs_secrets::CredStore>>>;
 pub fn new_shared() -> SharedCredStore {
     Arc::new(RwLock::new(None))
 }
-

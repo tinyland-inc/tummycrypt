@@ -35,16 +35,16 @@ pub struct ChunkSizes {
 impl ChunkSizes {
     /// Default for most files (small-file optimized)
     pub const SMALL: ChunkSizes = ChunkSizes {
-        min_size: 2 * 1024,       // 2KB
-        avg_size: 4 * 1024,       // 4KB
-        max_size: 16 * 1024,      // 16KB
+        min_size: 2 * 1024,  // 2KB
+        avg_size: 4 * 1024,  // 4KB
+        max_size: 16 * 1024, // 16KB
     };
 
     /// For pack/binary files (reduced overhead for large sequential data)
     pub const PACK: ChunkSizes = ChunkSizes {
-        min_size: 32 * 1024,      // 32KB
-        avg_size: 64 * 1024,      // 64KB
-        max_size: 256 * 1024,     // 256KB
+        min_size: 32 * 1024,  // 32KB
+        avg_size: 64 * 1024,  // 64KB
+        max_size: 256 * 1024, // 256KB
     };
 
     /// Select chunk sizes based on file extension
@@ -65,12 +65,8 @@ pub fn chunk_data(data: &[u8], sizes: ChunkSizes) -> Vec<Chunk> {
         return vec![];
     }
 
-    let chunker = fastcdc::v2020::FastCDC::new(
-        data,
-        sizes.min_size,
-        sizes.avg_size,
-        sizes.max_size,
-    );
+    let chunker =
+        fastcdc::v2020::FastCDC::new(data, sizes.min_size, sizes.avg_size, sizes.max_size);
 
     chunker
         .map(|c| {

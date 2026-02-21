@@ -102,8 +102,8 @@ impl StateCache {
                 .with_context(|| format!("creating state dir: {}", parent.display()))?;
         }
 
-        let json = serde_json::to_string_pretty(&self.entries)
-            .context("serializing state cache")?;
+        let json =
+            serde_json::to_string_pretty(&self.entries).context("serializing state cache")?;
 
         // Atomic write: write to temp file, then rename
         let tmp_path = self.db_path.with_extension("tmp");
@@ -125,7 +125,8 @@ impl StateCache {
             .with_context(|| format!("stat: {}", local_path.display()))?;
 
         let size = meta.len();
-        let mtime = meta.modified()
+        let mtime = meta
+            .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
@@ -182,7 +183,8 @@ pub fn make_sync_state(
     let meta = std::fs::metadata(local_path)
         .with_context(|| format!("stat for sync state: {}", local_path.display()))?;
 
-    let mtime = meta.modified()
+    let mtime = meta
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
@@ -224,14 +226,17 @@ mod tests {
         let fake_path = dir.path().join("file.txt");
         std::fs::write(&fake_path, b"hello").unwrap();
 
-        cache.set(&fake_path, SyncState {
-            blake3: "abc123".into(),
-            size: 5,
-            mtime: 1000,
-            chunk_count: 1,
-            remote_path: "bucket/file.txt".into(),
-            last_synced: 9999,
-        });
+        cache.set(
+            &fake_path,
+            SyncState {
+                blake3: "abc123".into(),
+                size: 5,
+                mtime: 1000,
+                chunk_count: 1,
+                remote_path: "bucket/file.txt".into(),
+                last_synced: 9999,
+            },
+        );
         cache.flush().unwrap();
 
         // Reload and verify

@@ -1,7 +1,7 @@
 //! Age identity discovery chain
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tcfs_core::config::SecretsConfig;
 
 /// A loaded age identity (private key)
@@ -100,13 +100,13 @@ fn dirs_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
-fn expand_tilde(path: &PathBuf) -> PathBuf {
+fn expand_tilde(path: &Path) -> PathBuf {
     if let Some(s) = path.to_str() {
-        if s.starts_with("~/") {
-            return dirs_path().join(&s[2..]);
+        if let Some(rest) = s.strip_prefix("~/") {
+            return dirs_path().join(rest);
         }
     }
-    path.clone()
+    path.to_path_buf()
 }
 
 #[cfg(test)]

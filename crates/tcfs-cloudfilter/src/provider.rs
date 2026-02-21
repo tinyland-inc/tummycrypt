@@ -10,11 +10,11 @@
 
 #![cfg(target_os = "windows")]
 
-use std::path::Path;
 use anyhow::{Context, Result};
+use std::path::Path;
 use tracing::{info, warn};
 
-use crate::{SyncRootConfig, HydrationPolicy, PopulationPolicy};
+use crate::{HydrationPolicy, PopulationPolicy, SyncRootConfig};
 
 /// Active connection to a registered sync root.
 ///
@@ -63,9 +63,7 @@ impl SyncRootConnection {
 
         warn!("Cloud Files sync root registration not yet implemented");
 
-        Ok(SyncRootConnection {
-            _config: config,
-        })
+        Ok(SyncRootConnection { _config: config })
     }
 
     /// Disconnect from the sync root (stop handling callbacks).

@@ -25,7 +25,7 @@ tonic = { workspace = true }
 [features]
 default = []
 # Enable with: cargo build --features tcfs-fuse/fuse
-fuse = ["dep:fuse3", "dep:libc", "dep:bytes", "dep:futures-util"]
+fuse = ["dep:fuse3", "fuse3/unprivileged", "dep:libc", "dep:bytes", "dep:futures-util"]
 macos-fuse = ["fuse"]
 erofs = []
 

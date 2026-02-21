@@ -20,9 +20,9 @@
 //!   2. Decrypt with age identity → data key (32 bytes)
 //!   3. For each ENC[...] value: AES-256-GCM decrypt with data key
 
+use crate::identity::IdentityProvider;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use crate::identity::IdentityProvider;
 
 /// Decrypted credentials extracted from a SOPS file
 #[derive(Debug, Clone, Default)]
@@ -48,9 +48,8 @@ pub struct SopsFile {
 }
 
 impl SopsFile {
-    pub fn from_str(yaml_str: &str) -> Result<Self> {
-        let data: serde_yml::Value =
-            serde_yml::from_str(yaml_str).context("parsing SOPS YAML")?;
+    pub fn parse(yaml_str: &str) -> Result<Self> {
+        let data: serde_yml::Value = serde_yml::from_str(yaml_str).context("parsing SOPS YAML")?;
 
         let age_enc = extract_age_enc(&data)?;
 
@@ -67,7 +66,7 @@ pub async fn decrypt_sops_file(
         .await
         .with_context(|| format!("reading SOPS file: {}", path.display()))?;
 
-    let sops_file = SopsFile::from_str(&yaml_str)?;
+    let sops_file = SopsFile::parse(&yaml_str)?;
 
     // Step 1: Decrypt the data key with age
     let data_key = crate::age::decrypt_with_identity(identity, sops_file.age_enc.as_bytes())
@@ -222,7 +221,7 @@ mod tests {
 
     #[test]
     fn parse_non_sops_yaml_fails_gracefully() {
-        let result = SopsFile::from_str("key: value\nother: 123\n");
+        let result = SopsFile::parse("key: value\nother: 123\n");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("sops"));
     }

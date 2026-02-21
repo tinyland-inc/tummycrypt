@@ -18,10 +18,7 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-use tcfs_core::proto::{
-    tcfs_daemon_client::TcfsDaemonClient,
-    Empty, StatusRequest,
-};
+use tcfs_core::proto::{tcfs_daemon_client::TcfsDaemonClient, Empty, StatusRequest};
 
 // ── CLI structure ──────────────────────────────────────────────────────────────
 
@@ -34,7 +31,12 @@ use tcfs_core::proto::{
 )]
 struct Cli {
     /// Path to tcfs.toml configuration file
-    #[arg(long, short = 'c', env = "TCFS_CONFIG", default_value = "/etc/tcfs/config.toml")]
+    #[arg(
+        long,
+        short = 'c',
+        env = "TCFS_CONFIG",
+        default_value = "/etc/tcfs/config.toml"
+    )]
     config: PathBuf,
 
     #[command(subcommand)]
@@ -59,7 +61,6 @@ enum Commands {
     },
 
     // ── Phase 2 commands ───────────────────────────────────────────────────────
-
     /// Upload a local file or directory tree to SeaweedFS
     ///
     /// Credentials are read from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
@@ -102,7 +103,6 @@ enum Commands {
     },
 
     // ── Phase 3: FUSE mount + stub management ────────────────────────────────
-
     /// Mount a remote as a local directory (requires FUSE)
     #[cfg(feature = "fuse")]
     Mount {
@@ -173,26 +173,51 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Status => cmd_status(&config).await,
-        Commands::Config { action: ConfigAction::Show } => cmd_config_show(&config, &cli.config),
-        Commands::Kdbx { action: KdbxAction::Resolve { query, kdbx_path, password } } => {
-            cmd_kdbx_resolve(&config, &query, kdbx_path.as_deref(), &password)
-        }
-        Commands::Kdbx { action: KdbxAction::Import { .. } } => {
+        Commands::Config {
+            action: ConfigAction::Show,
+        } => cmd_config_show(&config, &cli.config),
+        Commands::Kdbx {
+            action:
+                KdbxAction::Resolve {
+                    query,
+                    kdbx_path,
+                    password,
+                },
+        } => cmd_kdbx_resolve(&config, &query, kdbx_path.as_deref(), &password),
+        Commands::Kdbx {
+            action: KdbxAction::Import { .. },
+        } => {
             anyhow::bail!("kdbx import: not yet implemented (Phase 5)")
         }
-        Commands::Push { local, prefix, state } => {
-            cmd_push(&config, &local, prefix.as_deref(), state.as_deref()).await
-        }
-        Commands::Pull { manifest, local, prefix, state } => {
-            cmd_pull(&config, &manifest, local.as_deref(), prefix.as_deref(), state.as_deref()).await
+        Commands::Push {
+            local,
+            prefix,
+            state,
+        } => cmd_push(&config, &local, prefix.as_deref(), state.as_deref()).await,
+        Commands::Pull {
+            manifest,
+            local,
+            prefix,
+            state,
+        } => {
+            cmd_pull(
+                &config,
+                &manifest,
+                local.as_deref(),
+                prefix.as_deref(),
+                state.as_deref(),
+            )
+            .await
         }
         Commands::SyncStatus { path, state } => {
             cmd_sync_status(&config, path.as_deref(), state.as_deref())
         }
         #[cfg(feature = "fuse")]
-        Commands::Mount { remote, mountpoint, read_only } => {
-            cmd_mount(&config, &remote, &mountpoint, read_only).await
-        }
+        Commands::Mount {
+            remote,
+            mountpoint,
+            read_only,
+        } => cmd_mount(&config, &remote, &mountpoint, read_only).await,
         #[cfg(feature = "fuse")]
         Commands::Unmount { mountpoint } => cmd_unmount(&mountpoint),
         Commands::Unsync { path, force } => cmd_unsync(&config, &path, force).await,
@@ -206,8 +231,7 @@ async fn load_config(path: &Path) -> Result<tcfs_core::config::TcfsConfig> {
         let content = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("reading config: {}", path.display()))?;
-        toml::from_str(&content)
-            .with_context(|| format!("parsing config: {}", path.display()))
+        toml::from_str(&content).with_context(|| format!("parsing config: {}", path.display()))
     } else {
         Ok(tcfs_core::config::TcfsConfig::default())
     }
@@ -219,9 +243,7 @@ async fn load_config(path: &Path) -> Result<tcfs_core::config::TcfsConfig> {
 ///
 /// Reads AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (standard S3 env vars).
 /// These override any config file credentials for direct CLI use.
-fn build_operator_from_env(
-    config: &tcfs_core::config::TcfsConfig,
-) -> Result<opendal::Operator> {
+fn build_operator_from_env(config: &tcfs_core::config::TcfsConfig) -> Result<opendal::Operator> {
     let access_key = std::env::var("AWS_ACCESS_KEY_ID")
         .or_else(|_| std::env::var("TCFS_ACCESS_KEY_ID"))
         .context(
@@ -229,7 +251,7 @@ fn build_operator_from_env(
              Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.\n\
              Example:\n\
              \texport AWS_ACCESS_KEY_ID=your-key\n\
-             \texport AWS_SECRET_ACCESS_KEY=your-secret"
+             \texport AWS_SECRET_ACCESS_KEY=your-secret",
         )?;
     let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
         .or_else(|_| std::env::var("TCFS_SECRET_ACCESS_KEY"))
@@ -242,16 +264,19 @@ fn build_operator_from_env(
 /// Expand `~` in path to the user's home directory
 fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
-    if s.starts_with("~/") {
+    if let Some(rest) = s.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(format!("{}/{}", home, &s[2..]))
+        PathBuf::from(format!("{}/{}", home, rest))
     } else {
         path.to_path_buf()
     }
 }
 
 /// Resolve the state cache path: CLI flag > config > default user data dir
-fn resolve_state_path(config: &tcfs_core::config::TcfsConfig, override_path: Option<&Path>) -> PathBuf {
+fn resolve_state_path(
+    config: &tcfs_core::config::TcfsConfig,
+    override_path: Option<&Path>,
+) -> PathBuf {
     if let Some(p) = override_path {
         return p.to_path_buf();
     }
@@ -266,11 +291,9 @@ fn resolve_state_path(config: &tcfs_core::config::TcfsConfig, override_path: Opt
 fn make_progress_bar(total: u64, prefix: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
-        ProgressStyle::with_template(
-            "{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {msg}"
-        )
-        .unwrap()
-        .progress_chars("=>-"),
+        ProgressStyle::with_template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("=>-"),
     );
     pb.set_prefix(prefix.to_string());
     pb.enable_steady_tick(Duration::from_millis(100));
@@ -279,10 +302,7 @@ fn make_progress_bar(total: u64, prefix: &str) -> ProgressBar {
 
 fn make_spinner(prefix: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{prefix:.bold} {spinner} {msg}")
-            .unwrap()
-    );
+    pb.set_style(ProgressStyle::with_template("{prefix:.bold} {spinner} {msg}").unwrap());
     pb.set_prefix(prefix.to_string());
     pb.enable_steady_tick(Duration::from_millis(80));
     pb
@@ -331,23 +351,22 @@ async fn cmd_push(
             pb_clone.set_message(msg.to_string());
         });
 
-        let result = tcfs_sync::engine::upload_file(
-            &op, local, &remote_prefix, &mut state, Some(&progress),
-        )
-        .await
-        .with_context(|| format!("uploading {}", local.display()))?;
+        let result =
+            tcfs_sync::engine::upload_file(&op, local, &remote_prefix, &mut state, Some(&progress))
+                .await
+                .with_context(|| format!("uploading {}", local.display()))?;
 
         state.flush().context("flushing state cache")?;
 
         if result.skipped {
-            pb.finish_with_message(format!("{} (unchanged)", local.file_name().unwrap_or_default().to_string_lossy()));
+            pb.finish_with_message(format!(
+                "{} (unchanged)",
+                local.file_name().unwrap_or_default().to_string_lossy()
+            ));
             println!("  skipped (unchanged since last sync)");
         } else {
             pb.finish_with_message("done".to_string());
-            println!(
-                "  hash:    {}",
-                &result.hash[..16.min(result.hash.len())]
-            );
+            println!("  hash:    {}", &result.hash[..16.min(result.hash.len())]);
             println!("  chunks:  {}", result.chunks);
             println!("  bytes:   {}", fmt_bytes(result.bytes));
             println!("  remote:  {}", result.remote_path);
@@ -362,7 +381,7 @@ async fn cmd_push(
             if total > 0 {
                 pb_clone.set_style(
                     ProgressStyle::with_template(
-                        "{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {msg}"
+                        "{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
                     )
                     .unwrap()
                     .progress_chars("=>-"),
@@ -373,11 +392,10 @@ async fn cmd_push(
             pb_clone.set_message(msg.to_string());
         });
 
-        let (uploaded, skipped, bytes) = tcfs_sync::engine::push_tree(
-            &op, local, &remote_prefix, &mut state, Some(&progress),
-        )
-        .await
-        .with_context(|| format!("pushing tree: {}", local.display()))?;
+        let (uploaded, skipped, bytes) =
+            tcfs_sync::engine::push_tree(&op, local, &remote_prefix, &mut state, Some(&progress))
+                .await
+                .with_context(|| format!("pushing tree: {}", local.display()))?;
 
         pb.finish_with_message("done".to_string());
         println!();
@@ -386,7 +404,10 @@ async fn cmd_push(
         println!("  skipped:  {} files (unchanged)", skipped);
         println!("  total:    {} files", uploaded + skipped);
     } else {
-        anyhow::bail!("path not found or not a file/directory: {}", local.display());
+        anyhow::bail!(
+            "path not found or not a file/directory: {}",
+            local.display()
+        );
     }
 
     Ok(())
@@ -416,19 +437,12 @@ async fn cmd_pull(
         });
 
     // Default local path: current dir + manifest hash (last path component)
-    let hash_basename = manifest_path
-        .split('/')
-        .next_back()
-        .unwrap_or("downloaded");
+    let hash_basename = manifest_path.split('/').next_back().unwrap_or("downloaded");
     let local_path = local
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(hash_basename));
 
-    println!(
-        "Pulling {} → {}",
-        manifest_path,
-        local_path.display(),
-    );
+    println!("Pulling {} → {}", manifest_path, local_path.display(),);
 
     let pb = make_progress_bar(0, "pull");
     pb.set_message("fetching manifest...".to_string());
@@ -441,7 +455,11 @@ async fn cmd_pull(
     });
 
     let result = tcfs_sync::engine::download_file(
-        &op, manifest_path, &local_path, &remote_prefix, Some(&progress),
+        &op,
+        manifest_path,
+        &local_path,
+        &remote_prefix,
+        Some(&progress),
     )
     .await
     .with_context(|| format!("downloading {}", manifest_path))?;
@@ -470,14 +488,17 @@ fn cmd_sync_status(
     println!("Tracked files: {}", state.len());
 
     if let Some(p) = path {
-        let canonical = std::fs::canonicalize(p)
-            .with_context(|| format!("resolving path: {}", p.display()))?;
+        let canonical =
+            std::fs::canonicalize(p).with_context(|| format!("resolving path: {}", p.display()))?;
 
         match state.get(&canonical) {
             Some(entry) => {
                 println!();
                 println!("File: {}", canonical.display());
-                println!("  hash:       {}", &entry.blake3[..16.min(entry.blake3.len())]);
+                println!(
+                    "  hash:       {}",
+                    &entry.blake3[..16.min(entry.blake3.len())]
+                );
                 println!("  size:       {}", fmt_bytes(entry.size));
                 println!("  chunks:     {}", entry.chunk_count);
                 println!("  remote:     {}", entry.remote_path);
@@ -497,7 +518,10 @@ fn cmd_sync_status(
             }
             None => {
                 println!();
-                println!("File: {} — not in sync state (never pushed)", canonical.display());
+                println!(
+                    "File: {} — not in sync state (never pushed)",
+                    canonical.display()
+                );
             }
         }
     }
@@ -537,13 +561,26 @@ async fn cmd_status(config: &tcfs_core::config::TcfsConfig) -> Result<()> {
     println!("tcfsd v{}", status.version);
     println!("  uptime:        {uptime}");
     println!("  socket:        {}", socket.display());
-    println!("  storage:       {} [{}]",
+    println!(
+        "  storage:       {} [{}]",
         status.storage_endpoint,
-        if status.storage_ok { "ok" } else { "UNREACHABLE" }
+        if status.storage_ok {
+            "ok"
+        } else {
+            "UNREACHABLE"
+        }
     );
-    println!("  nats:          {}", if status.nats_ok { "ok" } else { "not connected (Phase 2)" });
+    println!(
+        "  nats:          {}",
+        if status.nats_ok {
+            "ok"
+        } else {
+            "not connected (Phase 2)"
+        }
+    );
     println!("  active mounts: {}", status.active_mounts);
-    println!("  credentials:   {} (source: {})",
+    println!(
+        "  credentials:   {} (source: {})",
         if creds.loaded { "loaded" } else { "NOT LOADED" },
         creds.source
     );
@@ -580,11 +617,13 @@ fn cmd_config_show(config: &tcfs_core::config::TcfsConfig, config_path: &Path) -
     if config_path.exists() {
         println!("# Configuration from: {}", config_path.display());
     } else {
-        println!("# Configuration: defaults (no file at {})", config_path.display());
+        println!(
+            "# Configuration: defaults (no file at {})",
+            config_path.display()
+        );
     }
     println!();
-    let rendered = toml::to_string_pretty(config)
-        .context("serializing config to TOML")?;
+    let rendered = toml::to_string_pretty(config).context("serializing config to TOML")?;
     print!("{rendered}");
     Ok(())
 }
@@ -652,7 +691,7 @@ fn parse_remote_spec(spec: &str) -> anyhow::Result<(String, String, String)> {
         .find('/')
         .with_context(|| format!("remote spec must include /bucket — got: {}", spec))?;
 
-    let host = &rest[..slash];   // e.g. "dees-appu-bearts:8333"
+    let host = &rest[..slash]; // e.g. "dees-appu-bearts:8333"
     let path = &rest[slash + 1..]; // e.g. "tcfs-test" or "tcfs-test/subdir"
 
     // First path component = bucket, remainder = prefix
@@ -677,9 +716,7 @@ async fn cmd_mount(
     // Credentials
     let access_key = std::env::var("AWS_ACCESS_KEY_ID")
         .or_else(|_| std::env::var("TCFS_ACCESS_KEY_ID"))
-        .context(
-            "S3 credentials not set — export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
-        )?;
+        .context("S3 credentials not set — export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")?;
     let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
         .or_else(|_| std::env::var("TCFS_SECRET_ACCESS_KEY"))
         .context("AWS_SECRET_ACCESS_KEY not set")?;
@@ -691,8 +728,7 @@ async fn cmd_mount(
         access_key_id: access_key,
         secret_access_key: secret_key,
     };
-    let op = tcfs_storage::build_operator(&storage_cfg)
-        .context("building storage operator")?;
+    let op = tcfs_storage::build_operator(&storage_cfg).context("building storage operator")?;
 
     // Ensure mountpoint exists
     tokio::fs::create_dir_all(mountpoint)
@@ -704,12 +740,16 @@ async fn cmd_mount(
     let cache_max = config.fuse.cache_max_mb * 1024 * 1024;
 
     println!(
-        "Mounting {} (prefix: {}) → {}",
-        format!("{}:{}", endpoint, bucket),
+        "Mounting {}:{} (prefix: {}) → {}",
+        endpoint,
+        bucket,
         if prefix.is_empty() { "(root)" } else { &prefix },
         mountpoint.display()
     );
-    println!("Press Ctrl-C or run `tcfs unmount {}` to stop.", mountpoint.display());
+    println!(
+        "Press Ctrl-C or run `tcfs unmount {}` to stop.",
+        mountpoint.display()
+    );
 
     tcfs_fuse::mount(tcfs_fuse::MountConfig {
         op,
@@ -831,13 +871,14 @@ async fn cmd_unsync(
     }
 
     // Build stub at path.tc
-    let stub_path = tcfs_fuse::real_to_stub_name(
-        path.file_name().context("path has no filename")?
-    );
-    let stub_full = path.parent().unwrap_or(std::path::Path::new(".")).join(stub_path);
+    let stub_path = tcfs_fuse::real_to_stub_name(path.file_name().context("path has no filename")?);
+    let stub_full = path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(stub_path);
 
     let stub = tcfs_fuse::StubMeta {
-        chunks: 0,  // unknown without state — leave as 0
+        chunks: 0, // unknown without state — leave as 0
         compressed: false,
         fetched: false,
         oid: format!("blake3:{}", hash_hex),

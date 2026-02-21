@@ -85,7 +85,12 @@ pub async fn upload_file(
     if op.exists(&remote_manifest).await.unwrap_or(false) {
         debug!(hash = %file_hash_hex, "dedup: manifest already exists");
         let remote_path = remote_manifest.clone();
-        let sync_state = make_sync_state(local_path, file_hash_hex.clone(), chunks.len(), remote_path.clone())?;
+        let sync_state = make_sync_state(
+            local_path,
+            file_hash_hex.clone(),
+            chunks.len(),
+            remote_path.clone(),
+        )?;
         state.set(local_path, sync_state);
         return Ok(UploadResult {
             path: local_path.to_path_buf(),
@@ -170,17 +175,15 @@ pub async fn download_file(
     progress: Option<&ProgressFn>,
 ) -> Result<DownloadResult> {
     // Read manifest
-    let manifest_bytes = op.read(remote_manifest)
+    let manifest_bytes = op
+        .read(remote_manifest)
         .await
         .with_context(|| format!("reading manifest: {remote_manifest}"))?;
 
     let manifest_str = String::from_utf8(manifest_bytes.to_bytes().to_vec())
         .context("manifest is not valid UTF-8")?;
 
-    let chunk_hashes: Vec<&str> = manifest_str
-        .lines()
-        .filter(|l| !l.is_empty())
-        .collect();
+    let chunk_hashes: Vec<&str> = manifest_str.lines().filter(|l| !l.is_empty()).collect();
 
     if chunk_hashes.is_empty() {
         anyhow::bail!("manifest is empty: {remote_manifest}");
@@ -192,14 +195,19 @@ pub async fn download_file(
 
     for (i, hash) in chunk_hashes.iter().enumerate() {
         let chunk_key = format!("{remote_prefix}/chunks/{hash}");
-        let chunk_data = op.read(&chunk_key)
+        let chunk_data = op
+            .read(&chunk_key)
             .await
             .with_context(|| format!("downloading chunk {i}: {chunk_key}"))?;
 
         assembled.extend_from_slice(&chunk_data.to_bytes());
 
         if let Some(cb) = progress {
-            cb((i + 1) as u64, total as u64, &format!("chunk {}/{total}", i + 1));
+            cb(
+                (i + 1) as u64,
+                total as u64,
+                &format!("chunk {}/{total}", i + 1),
+            );
         }
     }
 
@@ -301,8 +309,8 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn collect_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading dir: {}", dir.display()))?
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("reading dir: {}", dir.display()))?
     {
         let entry = entry.context("reading dir entry")?;
         let path = entry.path();

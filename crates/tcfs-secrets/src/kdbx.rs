@@ -22,7 +22,9 @@ pub struct KdbxStore {
 
 impl KdbxStore {
     pub fn open(path: &Path) -> Self {
-        KdbxStore { db_path: path.to_path_buf() }
+        KdbxStore {
+            db_path: path.to_path_buf(),
+        }
     }
 
     /// Resolve a credential by group-path query.
@@ -33,21 +35,15 @@ impl KdbxStore {
         let mut file = std::fs::File::open(&self.db_path)
             .with_context(|| format!("opening KDBX: {}", self.db_path.display()))?;
 
-        let key = keepass::DatabaseKey::new()
-            .with_password(master_password);
+        let key = keepass::DatabaseKey::new().with_password(master_password);
 
-        let db = keepass::Database::open(&mut file, key)
-            .context("opening KDBX database")?;
+        let db = keepass::Database::open(&mut file, key).context("opening KDBX database")?;
 
         self.search_group(&db.root, query)
             .ok_or_else(|| anyhow::anyhow!("no entry found for path: {query}"))
     }
 
-    fn search_group(
-        &self,
-        group: &keepass::db::Group,
-        query: &str,
-    ) -> Option<KdbxCredential> {
+    fn search_group(&self, group: &keepass::db::Group, query: &str) -> Option<KdbxCredential> {
         let parts: Vec<&str> = query.splitn(2, '/').collect();
 
         match parts.as_slice() {

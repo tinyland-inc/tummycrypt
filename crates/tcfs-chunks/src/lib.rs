@@ -12,6 +12,6 @@ pub mod fastcdc;
 pub mod seekable_zstd;
 
 // Convenience re-exports for the most common operations
-pub use blake3::{Hash, hash_bytes, hash_file, hash_to_hex, hash_from_hex};
-pub use fastcdc::{Chunk, ChunkSizes, chunk_data, chunk_file, chunk_slice};
-pub use seekable_zstd::{SeekEntry, SeekableBlob, compress, decompress_all, decompress_range};
+pub use blake3::{hash_bytes, hash_file, hash_from_hex, hash_to_hex, Hash};
+pub use fastcdc::{chunk_data, chunk_file, chunk_slice, Chunk, ChunkSizes};
+pub use seekable_zstd::{compress, decompress_all, decompress_range, SeekEntry, SeekableBlob};

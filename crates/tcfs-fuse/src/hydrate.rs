@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use opendal::Operator;
 use tracing::{debug, warn};
 
-use crate::cache::{DiskCache, cache_key_for_path};
+use crate::cache::{cache_key_for_path, DiskCache};
 
 /// Fetch the fully-assembled content for a manifest path.
 ///
@@ -35,10 +35,7 @@ pub async fn fetch_content(
     let manifest_str = String::from_utf8(manifest_bytes.to_bytes().to_vec())
         .context("manifest is not valid UTF-8")?;
 
-    let chunk_hashes: Vec<&str> = manifest_str
-        .lines()
-        .filter(|l| !l.is_empty())
-        .collect();
+    let chunk_hashes: Vec<&str> = manifest_str.lines().filter(|l| !l.is_empty()).collect();
 
     if chunk_hashes.is_empty() {
         anyhow::bail!("empty manifest: {}", manifest_path);
@@ -49,10 +46,14 @@ pub async fn fetch_content(
 
     for (i, hash) in chunk_hashes.iter().enumerate() {
         let chunk_key = format!("{}/chunks/{}", prefix, hash);
-        let chunk = op
-            .read(&chunk_key)
-            .await
-            .with_context(|| format!("downloading chunk {}/{}: {}", i + 1, chunk_hashes.len(), chunk_key))?;
+        let chunk = op.read(&chunk_key).await.with_context(|| {
+            format!(
+                "downloading chunk {}/{}: {}",
+                i + 1,
+                chunk_hashes.len(),
+                chunk_key
+            )
+        })?;
         assembled.extend_from_slice(&chunk.to_bytes());
     }
 

@@ -5,5 +5,5 @@ pub mod multipart;
 pub mod operator;
 pub mod seaweedfs;
 
-pub use operator::{build_operator, StorageConfig};
 pub use health::check_health;
+pub use operator::{build_operator, StorageConfig};

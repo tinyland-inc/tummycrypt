@@ -50,7 +50,7 @@ mod inner {
 
     /// Fake uid/gid used for all files (real process uid/gid set at mount)
     const PERM_FILE: u16 = 0o444; // r--r--r--
-    const PERM_DIR: u16 = 0o555;  // r-xr-xr-x
+    const PERM_DIR: u16 = 0o555; // r-xr-xr-x
 
     // ── File handle table ─────────────────────────────────────────────────────
 
@@ -116,10 +116,15 @@ mod inner {
                 return None; // root directory — no index key
             }
             // Strip .tc suffix to get the real filename
-            let real = rel.strip_suffix(".tc")
+            let real = rel
+                .strip_suffix(".tc")
                 .or_else(|| rel.strip_suffix(".tcf"))
                 .unwrap_or(rel);
-            Some(format!("{}/index/{}", self.prefix.trim_end_matches('/'), real))
+            Some(format!(
+                "{}/index/{}",
+                self.prefix.trim_end_matches('/'),
+                real
+            ))
         }
 
         /// The index prefix for directory listing: `{prefix}/index/{rel_dir}/`
@@ -139,6 +144,17 @@ mod inner {
             let data = self.op.read(&key).await.ok()?;
             let text = String::from_utf8(data.to_bytes().to_vec()).ok()?;
             IndexEntry::parse(&text).ok()
+        }
+
+        /// Fetch the real file size from an index entry by its S3 key.
+        async fn read_index_entry_size(&self, index_key: &str) -> u64 {
+            match self.op.read(index_key).await {
+                Ok(data) => {
+                    let text = String::from_utf8(data.to_bytes().to_vec()).unwrap_or_default();
+                    IndexEntry::parse(&text).map(|e| e.size).unwrap_or(0)
+                }
+                Err(_) => 0,
+            }
         }
 
         /// Synthesize a `FileAttr` for a stub file given its size.
@@ -182,7 +198,7 @@ mod inner {
 
     impl PathFilesystem for TcfsFs {
         async fn init(&self, _req: Request) -> fuse3::Result<ReplyInit> {
-            info!(prefix = %self.prefix, "tcfs-fuse mounted");
+            debug!(prefix = %self.prefix, "tcfs-fuse init");
             Ok(ReplyInit {
                 max_write: NonZeroU32::new(128 * 1024).unwrap(),
             })
@@ -236,12 +252,10 @@ mod inner {
             // Otherwise treat as a directory: check if any index entries exist under it
             let dir_prefix = self.index_prefix_for_dir(path_str);
             match self.op.list(&dir_prefix).await {
-                Ok(entries) if !entries.is_empty() => {
-                    Ok(ReplyAttr {
-                        ttl: ATTR_TTL,
-                        attr: self.dir_attr(),
-                    })
-                }
+                Ok(entries) if !entries.is_empty() => Ok(ReplyAttr {
+                    ttl: ATTR_TTL,
+                    attr: self.dir_attr(),
+                }),
                 _ => {
                     self.negative_cache.insert(path_str);
                     Err(Errno::from(libc::ENOENT))
@@ -288,12 +302,10 @@ mod inner {
             // Directory lookup
             let dir_prefix = self.index_prefix_for_dir(&full_path);
             match self.op.list(&dir_prefix).await {
-                Ok(entries) if !entries.is_empty() => {
-                    Ok(ReplyEntry {
-                        ttl: ATTR_TTL,
-                        attr: self.dir_attr(),
-                    })
-                }
+                Ok(entries) if !entries.is_empty() => Ok(ReplyEntry {
+                    ttl: ATTR_TTL,
+                    attr: self.dir_attr(),
+                }),
                 _ => {
                     self.negative_cache.insert(&full_path);
                     Err(Errno::from(libc::ENOENT))
@@ -302,11 +314,15 @@ mod inner {
         }
 
         // Directory entry stream types
-        type DirEntryStream<'a> = stream::Iter<std::vec::IntoIter<fuse3::Result<DirectoryEntry>>>
-        where Self: 'a;
+        type DirEntryStream<'a>
+            = stream::Iter<std::vec::IntoIter<fuse3::Result<DirectoryEntry>>>
+        where
+            Self: 'a;
 
-        type DirEntryPlusStream<'a> = stream::Iter<std::vec::IntoIter<fuse3::Result<DirectoryEntryPlus>>>
-        where Self: 'a;
+        type DirEntryPlusStream<'a>
+            = stream::Iter<std::vec::IntoIter<fuse3::Result<DirectoryEntryPlus>>>
+        where
+            Self: 'a;
 
         async fn readdir<'a>(
             &'a self,
@@ -318,14 +334,15 @@ mod inner {
             let path_str = path.to_str().unwrap_or("/");
             let index_prefix = self.index_prefix_for_dir(path_str);
 
-            // List objects under {prefix}/index/{rel_dir}/
-            let raw_entries = self.op.list(&index_prefix).await
+            let raw_entries = self
+                .op
+                .list(&index_prefix)
+                .await
                 .map_err(|_| Errno::from(libc::EIO))?;
 
             let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut entries: Vec<fuse3::Result<DirectoryEntry>> = Vec::new();
 
-            // . and .. (offset 0 and 1)
             if offset == 0 {
                 entries.push(Ok(DirectoryEntry {
                     kind: FileType::Directory,
@@ -341,22 +358,20 @@ mod inner {
                 }));
             }
 
-            // Strip index_prefix to get relative key, then determine if it's a
-            // direct child file or a subdirectory
             let mut next_offset = 3i64;
             for entry in raw_entries {
-                let name = entry.name();
-                let rel = name.trim_start_matches(&index_prefix).trim_start_matches('/');
+                let full_path = entry.path();
+                let rel = full_path
+                    .trim_start_matches(&index_prefix)
+                    .trim_start_matches('/');
                 if rel.is_empty() {
                     continue;
                 }
 
-                // Determine if this is a direct child or deeper
                 let first_component = rel.split('/').next().unwrap_or(rel);
                 let is_dir = rel.contains('/') || rel.ends_with('/');
 
                 let (dir_entry_name, kind) = if is_dir {
-                    // Subdirectory — emit once per unique first component
                     let dir_name = first_component.trim_end_matches('/').to_string();
                     if seen_dirs.contains(&dir_name) {
                         continue;
@@ -364,7 +379,6 @@ mod inner {
                     seen_dirs.insert(dir_name.clone());
                     (dir_name, FileType::Directory)
                 } else {
-                    // Regular file — show with .tc extension
                     let stub_name = format!("{}.tc", first_component);
                     (stub_name, FileType::RegularFile)
                 };
@@ -384,7 +398,99 @@ mod inner {
             })
         }
 
-        async fn opendir(&self, _req: Request, _path: &OsStr, _flags: u32) -> fuse3::Result<ReplyOpen> {
+        async fn readdirplus<'a>(
+            &'a self,
+            _req: Request,
+            path: &'a OsStr,
+            _fh: u64,
+            offset: u64,
+            _lock_owner: u64,
+        ) -> fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
+            let path_str = path.to_str().unwrap_or("/");
+            let index_prefix = self.index_prefix_for_dir(path_str);
+
+            let raw_entries = self
+                .op
+                .list(&index_prefix)
+                .await
+                .map_err(|_| Errno::from(libc::EIO))?;
+
+            let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut entries: Vec<fuse3::Result<DirectoryEntryPlus>> = Vec::new();
+            let offset = offset as i64;
+
+            if offset == 0 {
+                entries.push(Ok(DirectoryEntryPlus {
+                    kind: FileType::Directory,
+                    name: ".".into(),
+                    offset: 1,
+                    attr: self.dir_attr(),
+                    entry_ttl: ATTR_TTL,
+                    attr_ttl: ATTR_TTL,
+                }));
+            }
+            if offset <= 1 {
+                entries.push(Ok(DirectoryEntryPlus {
+                    kind: FileType::Directory,
+                    name: "..".into(),
+                    offset: 2,
+                    attr: self.dir_attr(),
+                    entry_ttl: ATTR_TTL,
+                    attr_ttl: ATTR_TTL,
+                }));
+            }
+
+            let mut next_offset = 3i64;
+            for entry in raw_entries {
+                let full_path = entry.path().to_string();
+                let rel = full_path
+                    .trim_start_matches(&index_prefix)
+                    .trim_start_matches('/');
+                if rel.is_empty() {
+                    continue;
+                }
+
+                let first_component = rel.split('/').next().unwrap_or(rel);
+                let is_dir = rel.contains('/') || rel.ends_with('/');
+
+                let (dir_entry_name, kind, attr) = if is_dir {
+                    let dir_name = first_component.trim_end_matches('/').to_string();
+                    if seen_dirs.contains(&dir_name) {
+                        continue;
+                    }
+                    seen_dirs.insert(dir_name.clone());
+                    (dir_name, FileType::Directory, self.dir_attr())
+                } else {
+                    let stub_name = format!("{}.tc", first_component);
+                    // Read actual file size from the index entry content
+                    let size = self.read_index_entry_size(&full_path).await;
+                    (stub_name, FileType::RegularFile, self.file_attr(size))
+                };
+
+                if next_offset > offset {
+                    entries.push(Ok(DirectoryEntryPlus {
+                        kind,
+                        name: dir_entry_name.into(),
+                        offset: next_offset,
+                        attr,
+                        entry_ttl: ATTR_TTL,
+                        attr_ttl: ATTR_TTL,
+                    }));
+                }
+                next_offset += 1;
+            }
+
+            Ok(ReplyDirectoryPlus {
+                entries: stream::iter(entries),
+            })
+        }
+
+        async fn opendir(
+            &self,
+            _req: Request,
+            _path: &OsStr,
+            _flags: u32,
+        ) -> fuse3::Result<ReplyOpen> {
             Ok(ReplyOpen { fh: 0, flags: 0 })
         }
 
@@ -396,7 +502,9 @@ mod inner {
                 return Err(Errno::from(libc::ENOENT));
             }
 
-            let entry = self.get_index_entry(path_str).await
+            let entry = self
+                .get_index_entry(path_str)
+                .await
                 .ok_or(Errno::from(libc::ENOENT))?;
 
             let manifest_path = entry.manifest_path(&self.prefix);
@@ -508,14 +616,15 @@ mod inner {
         let mut opts = MountOptions::default();
         opts.fs_name("tcfs");
         opts.read_only(cfg.read_only);
+        opts.force_readdir_plus(true);
         if cfg.allow_other {
             opts.allow_other(true);
         }
 
-        info!(mountpoint = %cfg.mountpoint.display(), "mounting tcfs");
+        info!(mountpoint = %cfg.mountpoint.display(), "mounting tcfs (unprivileged via fusermount3)");
 
         let handle = Session::new(opts)
-            .mount(fs, &cfg.mountpoint)
+            .mount_with_unprivileged(fs, &cfg.mountpoint)
             .await?;
 
         handle.await
@@ -523,4 +632,4 @@ mod inner {
 }
 
 #[cfg(feature = "fuse")]
-pub use inner::{MountConfig, TcfsFs, mount};
+pub use inner::{mount, MountConfig, TcfsFs};

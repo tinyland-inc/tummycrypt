@@ -22,7 +22,12 @@ use tracing::info;
 #[command(name = "tcfsd", version, about = "TummyCrypt filesystem daemon")]
 struct Cli {
     /// Path to tcfs.toml configuration file
-    #[arg(long, short = 'c', env = "TCFS_CONFIG", default_value = "/etc/tcfs/config.toml")]
+    #[arg(
+        long,
+        short = 'c',
+        env = "TCFS_CONFIG",
+        default_value = "/etc/tcfs/config.toml"
+    )]
     config: PathBuf,
 
     /// Daemon mode
@@ -75,7 +80,9 @@ async fn main() -> Result<()> {
             #[cfg(feature = "k8s-worker")]
             return worker::run(config).await;
             #[cfg(not(feature = "k8s-worker"))]
-            anyhow::bail!("worker mode requires the k8s-worker feature: cargo build --features k8s-worker")
+            anyhow::bail!(
+                "worker mode requires the k8s-worker feature: cargo build --features k8s-worker"
+            )
         }
     }
 }
@@ -99,8 +106,7 @@ async fn load_config(path: &PathBuf) -> Result<tcfs_core::config::TcfsConfig> {
 fn init_logging(level: &str, format: &LogFormat) {
     use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     match format {
         LogFormat::Json => {

@@ -36,7 +36,10 @@ pub struct SeekableBlob {
 impl SeekableBlob {
     /// Total uncompressed size
     pub fn uncompressed_size(&self) -> u64 {
-        self.seek_table.iter().map(|e| e.uncompressed_size as u64).sum()
+        self.seek_table
+            .iter()
+            .map(|e| e.uncompressed_size as u64)
+            .sum()
     }
 
     /// Number of frames
@@ -62,12 +65,19 @@ pub fn compress(data: &[u8], frame_size: usize, level: i32) -> Result<SeekableBl
         seek_table.push(entry);
     }
 
-    Ok(SeekableBlob { compressed, seek_table })
+    Ok(SeekableBlob {
+        compressed,
+        seek_table,
+    })
 }
 
 /// Decompress all frames back to the original data.
 pub fn decompress_all(blob: &SeekableBlob) -> Result<Vec<u8>> {
-    let total: usize = blob.seek_table.iter().map(|e| e.uncompressed_size as usize).sum();
+    let total: usize = blob
+        .seek_table
+        .iter()
+        .map(|e| e.uncompressed_size as usize)
+        .sum();
     let mut out = Vec::with_capacity(total);
 
     for entry in &blob.seek_table {
@@ -85,11 +95,7 @@ pub fn decompress_all(blob: &SeekableBlob) -> Result<Vec<u8>> {
 ///
 /// `range_start` and `range_end` are offsets into the uncompressed data.
 /// Only the frames overlapping the range are decompressed.
-pub fn decompress_range(
-    blob: &SeekableBlob,
-    range_start: u64,
-    range_end: u64,
-) -> Result<Vec<u8>> {
+pub fn decompress_range(blob: &SeekableBlob, range_start: u64, range_end: u64) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut frame_start: u64 = 0;
 

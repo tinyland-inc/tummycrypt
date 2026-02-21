@@ -13,8 +13,8 @@ pub mod stub;
 
 // Re-export the mount API when the fuse feature is enabled
 #[cfg(feature = "fuse")]
-pub use driver::{MountConfig, mount};
+pub use driver::{mount, MountConfig};
 
-pub use stub::{IndexEntry, StubMeta, is_stub_path, real_to_stub_name, stub_to_real_name};
-pub use negative_cache::NegativeCache;
 pub use cache::DiskCache;
+pub use negative_cache::NegativeCache;
+pub use stub::{is_stub_path, real_to_stub_name, stub_to_real_name, IndexEntry, StubMeta};
