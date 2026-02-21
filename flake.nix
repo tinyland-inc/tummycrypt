@@ -54,9 +54,19 @@
           darwin.apple_sdk.frameworks.SystemConfiguration
         ];
 
+        # Source filter: include .proto files alongside standard Cargo sources
+        src = let
+          protoFilter = path: _type: builtins.match ".*\\.proto$" path != null;
+          filter = path: type:
+            (protoFilter path type) || (craneLib.filterCargoSources path type);
+        in pkgs.lib.cleanSourceWith {
+          src = craneLib.path ./.;
+          inherit filter;
+        };
+
         # Common args shared by all crate builds
         commonArgs = {
-          src = craneLib.cleanCargoSource (craneLib.path ./.);
+          inherit src;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = with pkgs; [ pkg-config protobuf ];
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
