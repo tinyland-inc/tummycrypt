@@ -28,6 +28,8 @@ allow = [
     "CC0-1.0",
     "OpenSSL",
     "Unicode-3.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
 ]
 exceptions = []
 
