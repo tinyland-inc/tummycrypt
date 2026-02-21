@@ -4,6 +4,44 @@
 .fleet
 **/.idea
 
+# Rust
+/target/
+/dist/
+Cargo.lock
+
+# Nix
+result
+result-*
+.direnv/
+
+# Secrets (NEVER commit plaintext)
+*.key
+*.pem
+id_rsa
+id_ed25519
+.env
+.env.*
+kubeconfig
+*.kubeconfig
+age-identity.txt
+!*.enc.yaml
+
+# OpenTofu / Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!*.enc.yaml
+.terraform.lock.hcl
+tfplan
+
+# Cache
+.cache/
+
+# Build outputs
+bin/
+out/
+
 # Logs
 logs
 *.log

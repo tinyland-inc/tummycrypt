@@ -1,0 +1,7 @@
+---
+weed_release_url: https://github.com/seaweedfs/seaweedfs/releases/download/3.80/linux_amd64_full.tar.gz
+branch: master
+reset: true 
+uname: jess
+
+

@@ -1,0 +1,91 @@
+# Containerfile.mcp
+# MCP Development Stack Container
+
+FROM debian:bookworm-slim AS base
+
+# Install base dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    git \
+    vim \
+    jq \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Go 1.23
+FROM base AS go-builder
+ENV GO_VERSION=1.23.0
+RUN wget -q "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz && \
+    tar -C /usr/local -xzf /tmp/go.tar.gz && \
+    rm /tmp/go.tar.gz
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+# Install Chapel 1.33
+FROM base AS chapel-builder
+ENV CHAPEL_VERSION=1.33.0
+RUN wget -q "https://github.com/chapel-lang/chapel/releases/download/${CHAPEL_VERSION}/chapel-${CHAPEL_VERSION}.tar.gz" -O /tmp/chapel.tar.gz && \
+    mkdir -p /opt && \
+    tar -C /opt -xzf /tmp/chapel.tar.gz && \
+    mv /opt/chapel-${CHAPEL_VERSION} /opt/chapel && \
+    rm /tmp/chapel.tar.gz
+ENV CHPL_HOME=/opt/chapel
+ENV PATH="${CHPL_HOME}/bin:${PATH}"
+
+# Install Protocol Buffers
+FROM base AS protoc-builder
+ENV PROTOC_VERSION=25.0
+RUN wget -q "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -O /tmp/protoc.zip && \
+    unzip -q /tmp/protoc.zip -d /usr/local && \
+    rm /tmp/protoc.zip
+
+# Runtime image
+FROM base
+
+# Copy installed tools
+COPY --from=go-builder /usr/local/go /usr/local/go
+COPY --from=chapel-builder /opt/chapel /opt/chapel
+COPY --from=protoc-builder /usr/local/bin/protoc /usr/local/bin/protoc
+
+# Set PATH
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV CHPL_HOME=/opt/chapel
+ENV PATH="${CHPL_HOME}/bin:${PATH}"
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    podman \
+    gcc \
+    make \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create workspace directory
+WORKDIR /workspace
+
+# Create non-root user
+RUN groupadd -r mcp && useradd -r -g mcp -m -d /workspace mcp
+RUN chown -R mcp:mcp /workspace
+
+USER mcp:mcp
+
+# Set default environment
+ENV MCP_CREDENTIAL_PATH=/mcp-data/credentials
+ENV CHPL_RT_NUM_THREADS_PER_LOCALE=4
+ENV dataParMaxChunkSize=65536
+
+# Set working directory
+WORKDIR /workspace
+
+# Verify installation
+RUN go version
+RUN chpl --version
+RUN protoc --version
+RUN podman --version
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD test -f /workspace/.mcp-health || exit 1
+
+# Default command
+CMD ["/bin/bash"]
