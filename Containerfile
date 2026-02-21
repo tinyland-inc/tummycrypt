@@ -15,7 +15,7 @@
 
 # ── Stage 1: Rust builder ─────────────────────────────────────────────────────
 
-FROM rust:1.82-slim-bookworm AS builder
+FROM rust:1.93-slim-bookworm AS builder
 
 WORKDIR /build
 
