@@ -16,3 +16,10 @@ variable "image_tag" {
   type        = string
   default     = "latest"
 }
+
+variable "grafana_admin_pw" {
+  description = "Grafana admin credential - override via tfvars.enc.yaml"
+  type        = string
+  default     = "tcfs-changeme"
+  sensitive   = true
+}

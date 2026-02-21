@@ -22,8 +22,8 @@ variable "loki_chart_version" {
   default     = "6.6.4"
 }
 
-variable "grafana_admin_password" {
-  description = "Grafana admin password"
+variable "grafana_admin_pw" {
+  description = "Grafana admin credential"
   type        = string
   sensitive   = true
   default     = "tcfs-changeme"
