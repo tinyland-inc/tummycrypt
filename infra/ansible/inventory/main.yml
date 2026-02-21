@@ -1,0 +1,43 @@
+---
+all:
+  vars:
+    tummy_access_key_jess: whQ4jrxaTRridt4NdL29ana3q4ssW9mQrKrLesdwARuVR2xQFiQWo
+    tummy_secret_key_jess: rNsMFMUK95CzRwU7vQkuNwsJvmzpiFSuw9HZ9NZNvCd7puHUVNXMf
+    tummy_access_key_kate: uebx7j7nbScZE4LwqdcHwy7SnqnyRLK3QQxc3NAySDoZjsib5f9RK
+    tummy_secret_key_kate: vCi9xPykb9P52FxNsssawYc5CLdTfx4ACqdbFXdUeHWSRyzKLXHum
+    tummy_access_key_friends: fKzRULKpdKuF3CqDoVK7bgQqo2YDYc2rMJYd2sybmrfawCqZyFuPy
+    tummy_secret_key_friends: iPjAsVu9LZ297aNZXQmitLhUSnAgdh2jWpr2LQYZeYFAXJcce449r
+    tummy_rclone_password1: c93YrceAC27qjZiKJnAH4xCFabJAbX7TvQYa4cjpdbL9hrAfy5ngu4AX7x5vdkA
+    tummy_rclone_password2: SmZMqWu2g2SsEY2nnT7vnqypsVavixnoEdA24KR3EsNWZZ5MnnXY7jP4CAyN7jZ
+    tummy_access_key_public: 7qitUvNVeiaub5WzTCuXPRWiVgwe7ytdw4uyjgXkDRpXtWaC7fJNPJtdbatDQQNiH9YRQNseD
+    tummy_secret_key_public: anSDhgTPSFzSd2snXxV3m75XVQrdhMypyMTZ2peCyALjj9ziAFegm2NmJRtHufV4z3JkXSmsf
+    jwt_key: kXE2ST77ziKsTeYfnNzE2ZnYcXaL9D3tYHXDq4WMZoqAH2Nugp5W37UycNX
+    
+masters:
+  hosts:
+    192.168.101.249:
+    192.168.101.184:
+    192.168.101.248:
+  vars:
+    ip1: 192.168.101.249
+    ip2: 192.168.101.184
+    ip3: 192.168.101.248
+
+volumes:
+  hosts:
+    192.168.101.171:
+  vars:
+    ms_ip1: 192.168.101.249
+    ms_ip2: 192.168.101.184
+    ms_ip3: 192.168.101.248
+    drobo_vol_port: 8080
+    hdd_mnt_1: /mnt/usb-Drobo_5C_D0A164802100235-0:0-part1
+filers:
+  hosts:
+    # drobo host:
+    192.168.101.146:
+    # vm host:
+  vars:
+    ms_ip1: 192.168.101.249
+    ms_ip2: 192.168.101.184
+    ms_ip3: 192.168.101.248
