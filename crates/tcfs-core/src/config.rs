@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 /// Top-level daemon configuration (loaded from tcfs.toml)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TcfsConfig {
     pub daemon: DaemonConfig,
     pub storage: StorageConfig,
@@ -12,6 +13,7 @@ pub struct TcfsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DaemonConfig {
     /// Unix socket path for gRPC (default: /run/tcfsd/tcfsd.sock)
     pub socket: PathBuf,
@@ -26,6 +28,7 @@ pub struct DaemonConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
     /// SeaweedFS S3 endpoint
     pub endpoint: String,
@@ -38,6 +41,7 @@ pub struct StorageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SecretsConfig {
     /// Age identity file (default: ~/.config/sops/age/keys.txt)
     pub age_identity: Option<PathBuf>,
@@ -48,6 +52,7 @@ pub struct SecretsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SyncConfig {
     /// NATS JetStream endpoint
     pub nats_url: String,
@@ -60,6 +65,7 @@ pub struct SyncConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FuseConfig {
     /// Negative dentry cache TTL in seconds (default: 30)
     pub negative_cache_ttl_secs: u64,
@@ -69,38 +75,68 @@ pub struct FuseConfig {
     pub cache_max_mb: u64,
 }
 
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            socket: PathBuf::from("/run/tcfsd/tcfsd.sock"),
+            listen: None,
+            metrics_addr: Some("127.0.0.1:9100".into()),
+            log_level: "info".into(),
+            log_format: "json".into(),
+        }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:8333".into(),
+            region: "us-east-1".into(),
+            bucket: "tcfs".into(),
+            credentials_file: None,
+        }
+    }
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            age_identity: None,
+            kdbx_path: None,
+            sops_dir: None,
+        }
+    }
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            nats_url: "nats://localhost:4222".into(),
+            state_db: PathBuf::from("~/.local/share/tcfsd/state.db"),
+            workers: 0,
+            max_retries: 3,
+        }
+    }
+}
+
+impl Default for FuseConfig {
+    fn default() -> Self {
+        Self {
+            negative_cache_ttl_secs: 30,
+            cache_dir: PathBuf::from("~/.cache/tcfs"),
+            cache_max_mb: 10240,
+        }
+    }
+}
+
 impl Default for TcfsConfig {
     fn default() -> Self {
         Self {
-            daemon: DaemonConfig {
-                socket: PathBuf::from("/run/tcfsd/tcfsd.sock"),
-                listen: None,
-                metrics_addr: Some("127.0.0.1:9100".into()),
-                log_level: "info".into(),
-                log_format: "json".into(),
-            },
-            storage: StorageConfig {
-                endpoint: "http://localhost:8333".into(),
-                region: "us-east-1".into(),
-                bucket: "tcfs".into(),
-                credentials_file: None,
-            },
-            secrets: SecretsConfig {
-                age_identity: None,
-                kdbx_path: None,
-                sops_dir: None,
-            },
-            sync: SyncConfig {
-                nats_url: "nats://localhost:4222".into(),
-                state_db: PathBuf::from("~/.local/share/tcfsd/state.db"),
-                workers: 0,
-                max_retries: 3,
-            },
-            fuse: FuseConfig {
-                negative_cache_ttl_secs: 30,
-                cache_dir: PathBuf::from("~/.cache/tcfs"),
-                cache_max_mb: 10240,
-            },
+            daemon: DaemonConfig::default(),
+            storage: StorageConfig::default(),
+            secrets: SecretsConfig::default(),
+            sync: SyncConfig::default(),
+            fuse: FuseConfig::default(),
         }
     }
 }
