@@ -48,10 +48,7 @@ pub fn watch_credentials(
                 Ok(event) => {
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) => {
-                            tracing::debug!(
-                                "credential file changed: {:?}",
-                                event.kind
-                            );
+                            tracing::debug!("credential file changed: {:?}", event.kind);
                             // Non-blocking send — if the channel is full, the reload
                             // is already queued and we can skip this notification
                             let _ = tx_clone.try_send(());
@@ -101,9 +98,7 @@ pub fn watch_credentials(
                 }
                 Err(e) => {
                     tracing::error!("credential reload failed: {e}");
-                    tracing::warn!(
-                        "keeping previous credentials — fix the file and save again"
-                    );
+                    tracing::warn!("keeping previous credentials — fix the file and save again");
                 }
             }
         }

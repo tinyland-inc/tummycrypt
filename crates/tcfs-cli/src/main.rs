@@ -1186,11 +1186,7 @@ async fn cmd_init(
     // Display mnemonic in groups of 4 words
     let words: Vec<&str> = mnemonic.split_whitespace().collect();
     for (i, chunk) in words.chunks(4).enumerate() {
-        println!(
-            "  {:2}. {}",
-            i * 4 + 1,
-            chunk.join("  ")
-        );
+        println!("  {:2}. {}", i * 4 + 1, chunk.join("  "));
     }
     println!();
     println!("Device name:     {}", device_name);
@@ -1265,8 +1261,8 @@ fn cmd_auth_unlock() -> Result<()> {
         );
     }
 
-    let passphrase = rpassword::prompt_password("Master passphrase: ")
-        .context("failed to read passphrase")?;
+    let passphrase =
+        rpassword::prompt_password("Master passphrase: ").context("failed to read passphrase")?;
 
     // Store in keychain for session use
     tcfs_secrets::keychain::store_secret(

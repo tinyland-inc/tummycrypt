@@ -105,9 +105,9 @@ pub fn unwrap_key(master: &MasterKey, wrapped: &[u8]) -> anyhow::Result<FileKey>
     let nonce = XNonce::from_slice(nonce_bytes);
     let cipher = XChaCha20Poly1305::new(master.as_bytes().into());
 
-    let mut plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow::anyhow!("key unwrapping failed: invalid master key or corrupted data"))?;
+    let mut plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        anyhow::anyhow!("key unwrapping failed: invalid master key or corrupted data")
+    })?;
 
     if plaintext.len() != KEY_SIZE {
         plaintext.zeroize();
@@ -170,7 +170,10 @@ mod tests {
         let manifest_key = derive_manifest_key(&master).unwrap();
         let name_key = derive_name_key(&master).unwrap();
 
-        assert_ne!(manifest_key, name_key, "different domains must produce different keys");
+        assert_ne!(
+            manifest_key, name_key,
+            "different domains must produce different keys"
+        );
     }
 
     #[test]

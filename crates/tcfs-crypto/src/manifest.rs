@@ -9,8 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::keys::{FileKey, wrap_key, unwrap_key};
 use crate::kdf::MasterKey;
+use crate::keys::{unwrap_key, wrap_key, FileKey};
 
 /// A single chunk entry in the manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]

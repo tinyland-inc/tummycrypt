@@ -155,7 +155,10 @@ mod tests {
         let encrypted = encrypt_chunk(&key, 0, &file_id, b"secret data").unwrap();
         let result = decrypt_chunk(&key, 1, &file_id, &encrypted);
 
-        assert!(result.is_err(), "wrong chunk_index must fail (AAD mismatch)");
+        assert!(
+            result.is_err(),
+            "wrong chunk_index must fail (AAD mismatch)"
+        );
     }
 
     #[test]

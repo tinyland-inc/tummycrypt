@@ -65,10 +65,7 @@ pub async fn rotate_s3_credentials(
     reload_tx: Option<&watch::Sender<u64>>,
 ) -> Result<RotationResult> {
     if !cred_file.exists() {
-        anyhow::bail!(
-            "credential file not found: {}",
-            cred_file.display()
-        );
+        anyhow::bail!("credential file not found: {}", cred_file.display());
     }
 
     // Step 1: Create a timestamped backup
@@ -159,15 +156,15 @@ async fn sops_encrypt(plaintext: &str, cred_file: &Path) -> Result<String> {
     use tokio::process::Command;
 
     // Determine the sops config file location (search upward from cred_file)
-    let working_dir = cred_file
-        .parent()
-        .unwrap_or(Path::new("."));
+    let working_dir = cred_file.parent().unwrap_or(Path::new("."));
 
     let mut child = Command::new("sops")
         .args([
             "--encrypt",
-            "--input-type", "yaml",
-            "--output-type", "yaml",
+            "--input-type",
+            "yaml",
+            "--output-type",
+            "yaml",
             "/dev/stdin",
         ])
         .current_dir(working_dir)
@@ -187,10 +184,7 @@ async fn sops_encrypt(plaintext: &str, cred_file: &Path) -> Result<String> {
         // Drop stdin to close it, signaling EOF to sops
     }
 
-    let output = child
-        .wait_with_output()
-        .await
-        .context("waiting for sops")?;
+    let output = child.wait_with_output().await.context("waiting for sops")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -203,10 +197,7 @@ async fn sops_encrypt(plaintext: &str, cred_file: &Path) -> Result<String> {
 /// Clean up old backup files, keeping only the most recent `keep` backups.
 pub async fn cleanup_backups(cred_file: &Path, keep: usize) -> Result<usize> {
     let parent = cred_file.parent().unwrap_or(Path::new("."));
-    let stem = cred_file
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let stem = cred_file.file_name().unwrap_or_default().to_string_lossy();
 
     let mut backups: Vec<(String, std::path::PathBuf)> = Vec::new();
 
@@ -256,7 +247,8 @@ mod tests {
 
     #[test]
     fn test_build_rotated_yaml_updates_credentials() {
-        let input = "access_key_id: OLD_KEY\nsecret_access_key: OLD_SECRET\nendpoint: http://example.com\n";
+        let input =
+            "access_key_id: OLD_KEY\nsecret_access_key: OLD_SECRET\nendpoint: http://example.com\n";
         let result = build_rotated_yaml(input, "NEW_KEY", "NEW_SECRET").unwrap();
 
         assert!(result.contains("NEW_KEY"));

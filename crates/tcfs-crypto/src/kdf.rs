@@ -105,7 +105,11 @@ mod tests {
         let key1 = derive_master_key(&passphrase, &salt, &params).unwrap();
         let key2 = derive_master_key(&passphrase, &salt, &params).unwrap();
 
-        assert_eq!(key1.as_bytes(), key2.as_bytes(), "KDF must be deterministic");
+        assert_eq!(
+            key1.as_bytes(),
+            key2.as_bytes(),
+            "KDF must be deterministic"
+        );
     }
 
     #[test]
@@ -117,10 +121,8 @@ mod tests {
             parallelism: 1,
         };
 
-        let key1 =
-            derive_master_key(&SecretString::from("passphrase-a"), &salt, &params).unwrap();
-        let key2 =
-            derive_master_key(&SecretString::from("passphrase-b"), &salt, &params).unwrap();
+        let key1 = derive_master_key(&SecretString::from("passphrase-a"), &salt, &params).unwrap();
+        let key2 = derive_master_key(&SecretString::from("passphrase-b"), &salt, &params).unwrap();
 
         assert_ne!(
             key1.as_bytes(),

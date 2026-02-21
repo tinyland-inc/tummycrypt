@@ -42,8 +42,7 @@ pub fn encrypt_name(name_key: &[u8; KEY_SIZE], plaintext_name: &str) -> anyhow::
 ///
 /// The `encrypted_hex` is the hex-encoded ciphertext from `encrypt_name`.
 pub fn decrypt_name(name_key: &[u8; KEY_SIZE], encrypted_hex: &str) -> anyhow::Result<String> {
-    let ciphertext =
-        hex::decode(encrypted_hex).map_err(|e| anyhow::anyhow!("hex decode: {e}"))?;
+    let ciphertext = hex::decode(encrypted_hex).map_err(|e| anyhow::anyhow!("hex decode: {e}"))?;
 
     let mut double_key = [0u8; 64];
     let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, name_key);
@@ -76,9 +75,7 @@ mod hex {
         }
         (0..s.len())
             .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("invalid hex: {e}"))
-            })
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("invalid hex: {e}")))
             .collect()
     }
 }

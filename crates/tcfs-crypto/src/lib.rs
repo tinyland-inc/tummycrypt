@@ -22,7 +22,9 @@ pub mod recovery;
 
 pub use chunk::{decrypt_chunk, encrypt_chunk};
 pub use kdf::{derive_master_key, MasterKey};
-pub use keys::{derive_manifest_key, derive_name_key, generate_file_key, wrap_key, unwrap_key, FileKey};
+pub use keys::{
+    derive_manifest_key, derive_name_key, generate_file_key, unwrap_key, wrap_key, FileKey,
+};
 pub use manifest::{EncryptedManifest, ManifestEntry};
 pub use names::{decrypt_name, encrypt_name};
 pub use recovery::{generate_mnemonic, mnemonic_to_master_key};

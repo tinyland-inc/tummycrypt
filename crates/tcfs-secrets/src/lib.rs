@@ -115,9 +115,7 @@ impl CredStore {
     /// and parses the JSON output. This is a best-effort fallback -- if
     /// RemoteJuggler is not installed or the entry doesn't exist, returns an error
     /// and the discovery chain continues.
-    async fn load_from_remote_juggler(
-        storage: &tcfs_core::config::StorageConfig,
-    ) -> Result<Self> {
+    async fn load_from_remote_juggler(storage: &tcfs_core::config::StorageConfig) -> Result<Self> {
         let mut cmd = tokio::process::Command::new("remote-juggler");
         cmd.args(["kdbx", "get", "tcfs/s3-credentials", "--format", "json"]);
 
