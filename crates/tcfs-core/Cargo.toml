@@ -16,6 +16,9 @@ prost = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [build-dependencies]
 # tonic 0.14: codegen via tonic-prost-build (replaces tonic-build + prost-build)
 tonic-prost-build = { workspace = true }

@@ -20,6 +20,7 @@ id_rsa
 id_ed25519
 .env
 .env.*
+!.env.example
 kubeconfig
 *.kubeconfig
 age-identity.txt

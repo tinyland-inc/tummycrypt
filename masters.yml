@@ -1,4 +1,0 @@
----
-- hosts: masters
-  roles:
-  - role: seaweedfs-masters

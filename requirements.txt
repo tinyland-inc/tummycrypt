@@ -1,4 +1,0 @@
-ansible
-cryptography
-ansible-lint
-ansible-vault

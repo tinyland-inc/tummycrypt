@@ -245,4 +245,88 @@ mod tests {
         assert_eq!(entry.blake3, "abc123");
         assert_eq!(entry.size, 5);
     }
+
+    #[test]
+    fn test_remove_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        let fake_path = dir.path().join("to_remove.txt");
+        std::fs::write(&fake_path, b"data").unwrap();
+
+        cache.set(
+            &fake_path,
+            SyncState {
+                blake3: "hash1".into(),
+                size: 4,
+                mtime: 1000,
+                chunk_count: 1,
+                remote_path: "bucket/to_remove.txt".into(),
+                last_synced: 9999,
+            },
+        );
+        assert_eq!(cache.len(), 1);
+
+        cache.remove(&fake_path);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get(&fake_path).is_none());
+    }
+
+    #[test]
+    fn test_multiple_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        for i in 0..5 {
+            let fake_path = dir.path().join(format!("file_{i}.txt"));
+            std::fs::write(&fake_path, format!("content {i}")).unwrap();
+
+            cache.set(
+                &fake_path,
+                SyncState {
+                    blake3: format!("hash_{i}"),
+                    size: 9,
+                    mtime: 1000 + i,
+                    chunk_count: 1,
+                    remote_path: format!("bucket/file_{i}.txt"),
+                    last_synced: 9999,
+                },
+            );
+        }
+
+        assert_eq!(cache.len(), 5);
+        cache.flush().unwrap();
+
+        // Reload and verify all entries
+        let cache2 = StateCache::open(&path).unwrap();
+        assert_eq!(cache2.len(), 5);
+    }
+
+    #[test]
+    fn test_needs_sync_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let cache = StateCache::open(&path).unwrap();
+
+        let file = dir.path().join("new.txt");
+        std::fs::write(&file, b"new content").unwrap();
+
+        let result = cache.needs_sync(&file).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "new file");
+    }
+
+    #[test]
+    fn test_flush_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        // Flush empty cache — should succeed even though file doesn't exist
+        cache.flush().unwrap();
+        // Flush again — no-op
+        cache.flush().unwrap();
+    }
 }

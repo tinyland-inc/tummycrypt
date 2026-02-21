@@ -130,6 +130,62 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    // ── E2E encryption commands (Sprint 2) ─────────────────────────────────
+    /// Initialize tcfs identity and device key (first-time setup)
+    Init {
+        /// Device name (default: hostname)
+        #[arg(long)]
+        device_name: Option<String>,
+        /// Non-interactive mode (use with --password)
+        #[arg(long)]
+        non_interactive: bool,
+        /// Master passphrase (non-interactive mode only)
+        #[arg(long, env = "TCFS_MASTER_PASSWORD", hide_env_values = true)]
+        password: Option<String>,
+    },
+
+    /// Manage enrolled devices
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+
+    /// Manage encryption session lock/unlock
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+
+    /// Rotate S3 credentials in the SOPS-encrypted credential file
+    #[command(name = "rotate-credentials")]
+    RotateCredentials {
+        /// Path to the SOPS-encrypted credential file (overrides config)
+        #[arg(long)]
+        cred_file: Option<PathBuf>,
+        /// Non-interactive mode (reads new credentials from environment)
+        #[arg(long)]
+        non_interactive: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DeviceAction {
+    /// List enrolled devices
+    List,
+    /// Revoke a device by name
+    Revoke {
+        /// Device name to revoke
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthAction {
+    /// Unlock the encryption session (store master key in keychain)
+    Unlock,
+    /// Lock the encryption session (clear master key from keychain)
+    Lock,
 }
 
 #[derive(Subcommand, Debug)]
@@ -150,17 +206,19 @@ enum KdbxAction {
         #[arg(long, env = "TCFS_KDBX_PATH")]
         kdbx_path: Option<PathBuf>,
 
-        /// Master password for the KDBX database
-        #[arg(long, env = "TCFS_KDBX_PASSWORD")]
-        password: String,
+        /// Master password (reads from TCFS_KDBX_PASSWORD env var or prompts interactively)
+        #[arg(long, env = "TCFS_KDBX_PASSWORD", hide_env_values = true)]
+        password: Option<String>,
     },
 
     /// Import credentials from KDBX into SOPS-encrypted credential files (Phase 5)
     Import {
         #[arg(long, env = "TCFS_KDBX_PATH")]
         kdbx_path: Option<PathBuf>,
-        #[arg(long, env = "TCFS_KDBX_PASSWORD")]
-        password: String,
+
+        /// Master password (reads from TCFS_KDBX_PASSWORD env var or prompts interactively)
+        #[arg(long, env = "TCFS_KDBX_PASSWORD", hide_env_values = true)]
+        password: Option<String>,
     },
 }
 
@@ -183,7 +241,10 @@ async fn main() -> Result<()> {
                     kdbx_path,
                     password,
                 },
-        } => cmd_kdbx_resolve(&config, &query, kdbx_path.as_deref(), &password),
+        } => {
+            let password = resolve_password(password)?;
+            cmd_kdbx_resolve(&config, &query, kdbx_path.as_deref(), &password)
+        }
         Commands::Kdbx {
             action: KdbxAction::Import { .. },
         } => {
@@ -221,6 +282,34 @@ async fn main() -> Result<()> {
         #[cfg(feature = "fuse")]
         Commands::Unmount { mountpoint } => cmd_unmount(&mountpoint),
         Commands::Unsync { path, force } => cmd_unsync(&config, &path, force).await,
+        Commands::Init {
+            device_name,
+            non_interactive,
+            password,
+        } => cmd_init(&config, device_name, non_interactive, password).await,
+        Commands::Device { action } => match action {
+            DeviceAction::List => cmd_device_list(),
+            DeviceAction::Revoke { name } => cmd_device_revoke(&name),
+        },
+        Commands::Auth { action } => match action {
+            AuthAction::Unlock => cmd_auth_unlock(),
+            AuthAction::Lock => cmd_auth_lock(),
+        },
+        Commands::RotateCredentials {
+            cred_file,
+            non_interactive,
+        } => cmd_rotate_credentials(&config, cred_file.as_deref(), non_interactive).await,
+    }
+}
+
+// ── Password prompt ──────────────────────────────────────────────────────────
+
+/// Resolve a password: use the provided value, or prompt interactively.
+fn resolve_password(password: Option<String>) -> Result<String> {
+    match password {
+        Some(p) => Ok(p),
+        None => rpassword::prompt_password("KDBX master password: ")
+            .context("failed to read password from terminal"),
     }
 }
 
@@ -588,7 +677,132 @@ async fn cmd_status(config: &tcfs_core::config::TcfsConfig) -> Result<()> {
         println!("  WARNING: credentials need reload");
     }
 
+    // Check for newer version (non-blocking, best-effort)
+    check_for_update(&status.version);
+
     Ok(())
+}
+
+/// Check GitHub Releases for a newer tcfs version.
+///
+/// Results are cached in ~/.cache/tcfs/version-check.json for 24 hours
+/// to avoid hitting the API on every invocation. Failures are silently ignored.
+fn check_for_update(current_version: &str) {
+    let cache_dir = dirs_cache_path();
+    let cache_file = cache_dir.join("version-check.json");
+
+    // Try to read cached result first
+    if let Some(cached) = read_version_cache(&cache_file) {
+        if cached.checked_at + VERSION_CHECK_TTL_SECS > now_epoch() {
+            // Cache is still valid
+            if let Some(ref latest) = cached.latest_version {
+                print_update_notice(current_version, latest);
+            }
+            return;
+        }
+    }
+
+    // Fetch the latest release tag from GitHub
+    let latest = fetch_latest_version();
+
+    // Cache the result (even on failure, to avoid hammering the API)
+    let entry = VersionCacheEntry {
+        latest_version: latest.clone(),
+        checked_at: now_epoch(),
+    };
+    let _ = write_version_cache(&cache_file, &entry);
+
+    if let Some(ref latest) = latest {
+        print_update_notice(current_version, latest);
+    }
+}
+
+const VERSION_CHECK_TTL_SECS: u64 = 86400; // 24 hours
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VersionCacheEntry {
+    latest_version: Option<String>,
+    checked_at: u64,
+}
+
+fn dirs_cache_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".cache").join("tcfs")
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn read_version_cache(path: &Path) -> Option<VersionCacheEntry> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn write_version_cache(path: &Path, entry: &VersionCacheEntry) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating cache dir: {}", parent.display()))?;
+    }
+    let json = serde_json::to_string(entry).context("serializing version cache")?;
+    std::fs::write(path, json).with_context(|| format!("writing cache: {}", path.display()))?;
+    Ok(())
+}
+
+/// Fetch the latest release version from GitHub using curl.
+/// Returns None on any error (network, parse, missing curl, etc.).
+fn fetch_latest_version() -> Option<String> {
+    let output = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "5",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "https://api.github.com/repos/tinyland-inc/tummycrypt/releases/latest",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let body = String::from_utf8(output.stdout).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let tag = json.get("tag_name")?.as_str()?;
+    Some(tag.strip_prefix('v').unwrap_or(tag).to_string())
+}
+
+/// Compare semver-style versions and print a notice if a newer one is available.
+fn print_update_notice(current: &str, latest: &str) {
+    // Simple semver comparison: split on '.' and compare numerically
+    let parse = |v: &str| -> Option<(u64, u64, u64)> {
+        let parts: Vec<&str> = v.split('.').collect();
+        if parts.len() >= 3 {
+            Some((
+                parts[0].parse().ok()?,
+                parts[1].parse().ok()?,
+                parts[2].parse().ok()?,
+            ))
+        } else {
+            None
+        }
+    };
+
+    if let (Some(cur), Some(lat)) = (parse(current), parse(latest)) {
+        if lat > cur {
+            println!();
+            println!(
+                "  A newer version (v{}) is available. You are running v{}.",
+                latest, current
+            );
+            println!("  Update: curl -fsSL https://github.com/tinyland-inc/tummycrypt/releases/latest/download/install.sh | sh");
+        }
+    }
 }
 
 // ── gRPC connection ───────────────────────────────────────────────────────────
@@ -900,6 +1114,257 @@ async fn cmd_unsync(
 
     Ok(())
 }
+
+// ── `tcfs init` ──────────────────────────────────────────────────────────────
+
+async fn cmd_init(
+    _config: &tcfs_core::config::TcfsConfig,
+    device_name: Option<String>,
+    non_interactive: bool,
+    password: Option<String>,
+) -> Result<()> {
+    let device_name = device_name.unwrap_or_else(tcfs_secrets::device::default_device_name);
+
+    // Check if already initialized
+    let registry_path = tcfs_secrets::device::default_registry_path();
+    let registry = tcfs_secrets::device::DeviceRegistry::load(&registry_path)?;
+    if registry.find(&device_name).is_some() {
+        anyhow::bail!(
+            "Device '{}' is already enrolled. Use 'tcfs device list' to see devices.",
+            device_name
+        );
+    }
+
+    // Get master passphrase
+    let passphrase = if non_interactive {
+        password.context("--password is required in non-interactive mode")?
+    } else {
+        let p = rpassword::prompt_password("Master passphrase: ")
+            .context("failed to read passphrase")?;
+        let confirm = rpassword::prompt_password("Confirm passphrase: ")
+            .context("failed to read confirmation")?;
+        if p != confirm {
+            anyhow::bail!("Passphrases do not match");
+        }
+        p
+    };
+
+    // Generate recovery mnemonic
+    println!("Creating tcfs identity...");
+    let (mnemonic, _master_key) = tcfs_crypto::generate_mnemonic()?;
+
+    // Derive master key from passphrase
+    let salt: [u8; 16] = rand_salt();
+    let master_key = tcfs_crypto::derive_master_key(
+        &secrecy::SecretString::from(passphrase),
+        &salt,
+        &tcfs_crypto::kdf::KdfParams::default(),
+    )?;
+
+    // Generate a device file key and store it
+    let file_key = tcfs_crypto::generate_file_key();
+    let _wrapped = tcfs_crypto::wrap_key(&master_key, &file_key)?;
+
+    // Register device
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut registry = tcfs_secrets::device::DeviceRegistry::load(&registry_path)?;
+    registry.add(tcfs_secrets::device::DeviceIdentity {
+        name: device_name.clone(),
+        public_key: format!("age1-device-{}", &blake3_short(&device_name)),
+        enrolled_at: now,
+        revoked: false,
+    });
+    registry.save(&registry_path)?;
+
+    println!();
+    println!("Your recovery phrase (WRITE THIS DOWN):");
+    println!();
+    // Display mnemonic in groups of 4 words
+    let words: Vec<&str> = mnemonic.split_whitespace().collect();
+    for (i, chunk) in words.chunks(4).enumerate() {
+        println!(
+            "  {:2}. {}",
+            i * 4 + 1,
+            chunk.join("  ")
+        );
+    }
+    println!();
+    println!("Device name:     {}", device_name);
+    println!("Registry:        {}", registry_path.display());
+    println!();
+    println!("Next steps:");
+    println!("  1. Store your recovery phrase in a safe place");
+    println!("  2. Configure storage: tcfs config show");
+    println!("  3. Push files: tcfs push /path/to/files");
+
+    Ok(())
+}
+
+fn rand_salt() -> [u8; 16] {
+    let mut salt = [0u8; 16];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut salt);
+    salt
+}
+
+fn blake3_short(s: &str) -> String {
+    let hash = blake3::hash(s.as_bytes());
+    hash.to_hex().as_str()[..8].to_string()
+}
+
+// ── `tcfs device list` ───────────────────────────────────────────────────────
+
+fn cmd_device_list() -> Result<()> {
+    let registry_path = tcfs_secrets::device::default_registry_path();
+    let registry = tcfs_secrets::device::DeviceRegistry::load(&registry_path)?;
+
+    if registry.devices.is_empty() {
+        println!("No devices enrolled. Run 'tcfs init' to create an identity.");
+        return Ok(());
+    }
+
+    println!("Enrolled devices ({}):", registry.devices.len());
+    for device in &registry.devices {
+        let status = if device.revoked { "REVOKED" } else { "active" };
+        println!(
+            "  {} [{}] — enrolled {} — {}",
+            device.name, status, device.enrolled_at, device.public_key
+        );
+    }
+
+    Ok(())
+}
+
+// ── `tcfs device revoke` ─────────────────────────────────────────────────────
+
+fn cmd_device_revoke(name: &str) -> Result<()> {
+    let registry_path = tcfs_secrets::device::default_registry_path();
+    let mut registry = tcfs_secrets::device::DeviceRegistry::load(&registry_path)?;
+
+    if registry.revoke(name) {
+        registry.save(&registry_path)?;
+        println!("Revoked device: {}", name);
+    } else {
+        anyhow::bail!("Device '{}' not found", name);
+    }
+
+    Ok(())
+}
+
+// ── `tcfs auth unlock` / `tcfs auth lock` ────────────────────────────────────
+
+fn cmd_auth_unlock() -> Result<()> {
+    if !tcfs_secrets::keychain::is_available() {
+        anyhow::bail!(
+            "Platform keychain not available. \
+             On Linux, ensure GNOME Keyring or KDE Wallet is running."
+        );
+    }
+
+    let passphrase = rpassword::prompt_password("Master passphrase: ")
+        .context("failed to read passphrase")?;
+
+    // Store in keychain for session use
+    tcfs_secrets::keychain::store_secret(
+        tcfs_secrets::keychain::keys::SESSION_TOKEN,
+        &secrecy::SecretString::from(passphrase),
+    )?;
+
+    println!("Session unlocked. Master key stored in platform keychain.");
+    println!("Run 'tcfs auth lock' to clear it.");
+    Ok(())
+}
+
+fn cmd_auth_lock() -> Result<()> {
+    tcfs_secrets::keychain::delete_secret(tcfs_secrets::keychain::keys::SESSION_TOKEN)?;
+    tcfs_secrets::keychain::delete_secret(tcfs_secrets::keychain::keys::MASTER_KEY)?;
+    println!("Session locked. Master key cleared from keychain.");
+    Ok(())
+}
+
+// ── `tcfs rotate-credentials` ─────────────────────────────────────────────
+
+async fn cmd_rotate_credentials(
+    config: &tcfs_core::config::TcfsConfig,
+    cred_file_override: Option<&Path>,
+    non_interactive: bool,
+) -> Result<()> {
+    // Resolve the credential file path
+    let cred_file = cred_file_override
+        .map(|p| p.to_path_buf())
+        .or_else(|| config.storage.credentials_file.clone())
+        .context(
+            "No credential file configured.\n\
+             Use --cred-file or set storage.credentials_file in config.toml",
+        )?;
+
+    if !cred_file.exists() {
+        anyhow::bail!("credential file not found: {}", cred_file.display());
+    }
+
+    // Get new credentials
+    let (new_access_key, new_secret_key) = if non_interactive {
+        let ak = std::env::var("AWS_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("TCFS_NEW_ACCESS_KEY"))
+            .context(
+                "Non-interactive mode requires AWS_ACCESS_KEY_ID or TCFS_NEW_ACCESS_KEY env var",
+            )?;
+        let sk = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("TCFS_NEW_SECRET_KEY"))
+            .context(
+                "Non-interactive mode requires AWS_SECRET_ACCESS_KEY or TCFS_NEW_SECRET_KEY env var",
+            )?;
+        (ak, sk)
+    } else {
+        println!("Rotating S3 credentials in: {}", cred_file.display());
+        println!();
+        let ak = rpassword::prompt_password("New Access Key ID: ")
+            .context("failed to read access key")?;
+        let sk = rpassword::prompt_password("New Secret Access Key: ")
+            .context("failed to read secret key")?;
+
+        if ak.is_empty() || sk.is_empty() {
+            anyhow::bail!("Access key and secret key must not be empty");
+        }
+        (ak, sk)
+    };
+
+    println!("Rotating credentials...");
+
+    let result = tcfs_secrets::rotate::rotate_s3_credentials(
+        &cred_file,
+        &new_access_key,
+        &new_secret_key,
+        None, // No watcher channel in CLI mode
+    )
+    .await
+    .context("credential rotation failed")?;
+
+    println!();
+    println!("Credentials rotated successfully.");
+    println!("  file:     {}", result.path.display());
+    println!("  time:     {}", result.rotated_at);
+    if result.backup_created {
+        println!(
+            "  backup:   {}.bak.{}",
+            result.path.display(),
+            result.rotated_at
+        );
+    }
+    println!();
+    println!("Next steps:");
+    println!("  1. Verify tcfsd reloaded: journalctl -u tcfsd --since '1 min ago' | grep reload");
+    println!("  2. Test storage: tcfs status");
+    println!("  3. Deactivate old credentials on the S3/SeaweedFS admin console");
+
+    Ok(())
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────
 
 fn fmt_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;

@@ -1,4 +1,0 @@
----
-- hosts: volumes
-  roles:
-  - role: seaweedfs-volume-drobo

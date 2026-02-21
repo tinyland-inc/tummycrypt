@@ -9,8 +9,8 @@ keywords:
   - tummycrypt
   - sync
   - seaweedfs
-home: https://github.com/tummycrypt/tummycrypt
+home: https://github.com/tinyland-inc/tummycrypt
 sources:
-  - https://github.com/tummycrypt/tummycrypt
+  - https://github.com/tinyland-inc/tummycrypt
 maintainers:
   - name: TummyCrypt Contributors

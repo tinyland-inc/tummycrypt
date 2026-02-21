@@ -5,7 +5,7 @@ clients (odrive, Dropbox desktop, etc.). It mounts remote SeaweedFS storage as a
 directory, with files appearing as zero-byte `.tc` stubs until accessed — at which point they
 are transparently hydrated on demand.
 
-**Status**: Phase 0 (repo foundation). No functional binaries yet.
+**Status**: Active development. Core sync (push/pull), FUSE mount, CLI, TUI, K8s worker mode, and cross-platform CI are functional. E2E encryption in progress.
 
 ## What it does
 
@@ -40,14 +40,13 @@ nats server ping nats://localhost:4222
 
 ## Security: Credential Setup
 
-This repo previously contained plaintext S3 credentials in `hosts/main.yml`.
-They have been migrated to SOPS-encrypted files. To set up locally:
+Credentials are managed via SOPS-encrypted files with age keys:
 
 ```bash
 # 1. Generate age key + configure .sops.yaml
 task sops:init
 
-# 2. Migrate credentials from Ansible inventory to SOPS-encrypted files
+# 2. Migrate credentials to SOPS-encrypted files
 task sops:migrate
 
 # 3. Verify encryption works
@@ -69,7 +68,8 @@ tummycrypt/
 │   ├── tcfs-storage/       # OpenDAL + SeaweedFS
 │   ├── tcfs-chunks/        # FastCDC, BLAKE3, zstd
 │   ├── tcfs-sync/          # Sync engine + NATS
-│   ├── tcfs-fuse/          # FUSE driver
+│   ├── tcfs-fuse/          # FUSE driver (Linux)
+│   ├── tcfs-cloudfilter/   # Windows CFAPI (skeleton)
 │   ├── tcfsd/              # Daemon binary
 │   ├── tcfs-cli/           # CLI binary (tcfs)
 │   └── tcfs-tui/           # TUI binary

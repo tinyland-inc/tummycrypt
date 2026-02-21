@@ -1,6 +1,15 @@
 {
   description = "tummycrypt/tcfs - FOSS self-hosted odrive replacement";
 
+  nixConfig = {
+    extra-substituters = [
+      "https://nix-cache.fuzzy-dev.tinyland.dev/main"
+    ];
+    extra-trusted-public-keys = [
+      "main:NKRk1XYo/dfd9fcDqgotUJg2DTDHWp5ny+Ba7WzRjgE="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay = {
@@ -45,8 +54,8 @@
           darwin.apple_sdk.frameworks.SystemConfiguration
         ];
 
-        # Build workspace
-        workspace = craneLib.buildPackage {
+        # Common args shared by all crate builds
+        commonArgs = {
           src = craneLib.cleanCargoSource (craneLib.path ./.);
           buildInputs = commonBuildInputs;
           nativeBuildInputs = with pkgs; [ pkg-config protobuf ];
@@ -55,12 +64,35 @@
           ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
         };
 
+        # Pre-build workspace deps (shared across all crate builds for caching)
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+        # Build individual crates as separate derivations
+        tcfsd = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "tcfsd";
+          cargoExtraArgs = "-p tcfsd";
+          meta.mainProgram = "tcfsd";
+        });
+
+        tcfs-cli = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "tcfs-cli";
+          cargoExtraArgs = "-p tcfs-cli";
+          meta.mainProgram = "tcfs";
+        });
+
+        tcfs-tui = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "tcfs-tui";
+          cargoExtraArgs = "-p tcfs-tui";
+          meta.mainProgram = "tcfs-tui";
+        });
+
       in {
         packages = {
-          default = workspace;
-          tcfsd = workspace;
-          tcfs-cli = workspace;
-          tcfs-tui = workspace;
+          default = tcfsd;
+          inherit tcfsd tcfs-cli tcfs-tui;
         };
 
         devShells.default = pkgs.mkShell {

@@ -21,6 +21,11 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 notify = { workspace = true }
 tokio = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+rpassword = { workspace = true }
+keyring = { workspace = true }
+hostname = "0.4"
 
 [dev-dependencies]
 tokio-test = { workspace = true }

@@ -5,6 +5,7 @@ members = [
     "crates/tcfs-secrets",
     "crates/tcfs-storage",
     "crates/tcfs-chunks",
+    "crates/tcfs-crypto",
     "crates/tcfs-sync",
     "crates/tcfs-fuse",
     "crates/tcfs-cloudfilter",
@@ -18,8 +19,8 @@ version = "0.1.0"
 edition = "2021"
 authors = ["TummyCrypt Contributors"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tummycrypt/tummycrypt"
-rust-version = "1.82"
+repository = "https://github.com/tinyland-inc/tummycrypt"
+rust-version = "1.93"
 
 [workspace.dependencies]
 # Async runtime
@@ -42,6 +43,19 @@ fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
 # Cryptography / secrets
 age = { version = "0.11", features = ["armor"] }
 keepass = { version = "0.8" }
+zeroize = { version = "1", features = ["derive"] }
+secrecy = { version = "0.10", features = ["serde"] }
+rpassword = { version = "7" }
+
+# E2E encryption (Phase 2 sprint)
+chacha20poly1305 = { version = "0.10" }
+argon2 = { version = "0.5" }
+aes-siv = { version = "0.7" }
+hkdf = { version = "0.12" }
+sha2 = { version = "0.10" }
+rand = { version = "0.8" }
+bip39 = { version = "2" }
+keyring = { version = "3" }
 
 # SOPS decryption deps
 serde_yml = { version = "0.0" }

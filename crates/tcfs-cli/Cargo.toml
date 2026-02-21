@@ -17,6 +17,10 @@ tcfs-storage = { path = "../tcfs-storage" }
 tcfs-sync = { path = "../tcfs-sync" }
 tcfs-chunks = { path = "../tcfs-chunks" }
 tcfs-fuse = { path = "../tcfs-fuse" }
+tcfs-crypto = { path = "../tcfs-crypto" }
+secrecy = { workspace = true }
+rand = { workspace = true }
+blake3 = { workspace = true }
 fuse3 = { workspace = true, optional = true }
 opendal = { workspace = true }
 clap = { workspace = true }
@@ -33,6 +37,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+rpassword = { workspace = true }
 
 [features]
 default = ["fuse"]

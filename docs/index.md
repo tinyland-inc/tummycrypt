@@ -4,44 +4,40 @@
 
 tcfs is a FUSE-based file sync daemon backed by [SeaweedFS](https://github.com/seaweedfs/seaweedfs) with end-to-end [age](https://age-encryption.org) encryption, content-defined chunking, and on-demand hydration via `.tc` stub files.
 
-## Quick Install
+## Installation
 
-### Linux / macOS
+> **Note:** tcfs is in active development. Binary releases will be published once the first stable release is tagged.
 
-```bash
-curl -fsSL https://github.com/tummycrypt/tummycrypt/releases/latest/download/install.sh | sh
-```
-
-### Homebrew
+### From Source (recommended for now)
 
 ```bash
-brew install tummycrypt/tap/tcfs
-```
-
-### Debian / Ubuntu
-
-```bash
-# Download the .deb from the latest release
-sudo dpkg -i tcfs-*.deb
-```
-
-### RPM (Fedora / RHEL / Rocky)
-
-```bash
-sudo rpm -i tcfsd-*.rpm
+# Requires Rust 1.93+, protoc, libfuse3-dev
+git clone https://github.com/tinyland-inc/tummycrypt.git
+cd tummycrypt
+cargo build --release
+# Binaries: target/release/tcfs, target/release/tcfsd, target/release/tcfs-tui
 ```
 
 ### Nix
 
 ```bash
-nix profile install github:tummycrypt/tummycrypt
+nix build github:tinyland-inc/tummycrypt
+# Or enter a devShell:
+nix develop github:tinyland-inc/tummycrypt
 ```
 
 ### Container (K8s worker mode)
 
 ```bash
-podman pull ghcr.io/tummycrypt/tcfsd:latest
+podman pull ghcr.io/tinyland-inc/tcfsd:latest
 ```
+
+### Future Channels (once releases are published)
+
+- **curl installer**: `curl -fsSL .../install.sh | sh`
+- **Homebrew**: `brew install tinyland-inc/tap/tcfs`
+- **Debian/Ubuntu**: `sudo dpkg -i tcfs-*.deb`
+- **RPM**: `sudo rpm -i tcfsd-*.rpm`
 
 ## How It Works
 

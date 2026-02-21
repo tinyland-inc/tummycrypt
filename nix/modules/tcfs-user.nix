@@ -10,6 +10,15 @@
 #       { remote = "seaweedfs://host/bucket"; local = "~/tcfs"; }
 #     ];
 #   };
+#
+# With RemoteJuggler integration:
+#   programs.tcfs = {
+#     enable = true;
+#     remoteJuggler = {
+#       enable = true;
+#       identity = "github-personal";
+#     };
+#   };
 
 let
   cfg = config.programs.tcfs;
@@ -44,6 +53,16 @@ in {
       default = {};
       description = "Additional tcfs.toml settings";
     };
+
+    remoteJuggler = {
+      enable = lib.mkEnableOption "RemoteJuggler integration for credential management";
+
+      identity = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "RemoteJuggler identity name (e.g., 'github-personal')";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -66,6 +85,11 @@ in {
         Type = "notify";
         ExecStart = "${cfg.package}/bin/tcfsd --mode daemon";
         Restart = "on-failure";
+        Environment = lib.mkMerge [
+          (lib.mkIf (cfg.remoteJuggler.enable && cfg.remoteJuggler.identity != null) [
+            "REMOTE_JUGGLER_IDENTITY=${cfg.remoteJuggler.identity}"
+          ])
+        ];
       };
       Install = {
         WantedBy = [ "default.target" ];

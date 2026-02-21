@@ -1,6 +1,7 @@
 //! Daemon lifecycle: startup, health checks, systemd notify, gRPC server
 
 use anyhow::Result;
+use secrecy::ExposeSecret;
 use std::sync::Arc;
 use tcfs_core::config::TcfsConfig;
 use tracing::{error, info, warn};
@@ -29,7 +30,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
         let op = tcfs_storage::operator::build_from_core_config(
             &config.storage,
             &s3.access_key_id,
-            &s3.secret_access_key,
+            s3.secret_access_key.expose_secret(),
         )?;
         match tcfs_storage::check_health(&op).await {
             Ok(()) => {
@@ -57,6 +58,31 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
             }
         });
     }
+
+    // Start credential file watcher (if a credentials_file is configured)
+    let _cred_watcher = if let Some(ref cred_file) = config.storage.credentials_file {
+        if cred_file.exists() {
+            match crate::cred_store::watch_credentials(
+                cred_file.clone(),
+                config.secrets.clone(),
+                config.storage.clone(),
+                cred_store.clone(),
+            ) {
+                Ok(watcher) => {
+                    info!(path = %watcher.path().display(), "credential file watcher started");
+                    Some(watcher)
+                }
+                Err(e) => {
+                    warn!("credential file watcher failed to start: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Send systemd ready notification
     notify_ready();
