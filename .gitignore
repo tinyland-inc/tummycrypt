@@ -7,7 +7,6 @@
 # Rust
 /target/
 /dist/
-Cargo.lock
 
 # Nix
 result
