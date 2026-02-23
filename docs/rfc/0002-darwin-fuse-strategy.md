@@ -1,571 +1,439 @@
-# RFC 0002: Darwin FUSE Strategy — macFUSE Alternatives and Privilege Escalation
+# RFC 0002: Darwin File Integration Strategy
 
-**Status**: Draft
+**Status**: Draft (Revised)
 **Author**: xoxd
-**Date**: 2026-02-22
-**Tracking**: Sprint 7
-**Signed-off-by**: xoxd
+**Date**: 2026-02-23
+**Tracking**: Sprint 7+
+**Supersedes**: Initial draft (FUSE-only framing)
 
 ---
 
 ## Abstract
 
-This RFC addresses the macOS-specific challenges of mounting FUSE filesystems for
-tcfs on Darwin. The current dependency on macFUSE introduces friction: it requires
-a third-party kernel extension (or system extension on Apple Silicon), manual
-approval in System Settings, and elevated privileges for mount operations. On
-managed machines with ABR (Admin By Request), additional automation is needed.
+This RFC addresses macOS file integration for tcfs. The initial draft evaluated
+FUSE alternatives (macFUSE, FUSE-T, NFS loopback, FSKit). Research revealed that
+**Apple's FileProvider framework (`NSFileProviderReplicatedExtension`)** is the
+correct integration point for cloud storage on macOS --- the same mechanism used
+by iCloud Drive, Dropbox, and OneDrive.
 
-We evaluate three paths forward:
-
-1. **Status quo**: macFUSE with automated bootstrapping and extension approval
-2. **Native reimplementation**: Pure Rust (or Zig) FUSE userspace via macOS NFS
-   loopback or FSKit (macOS 15+)
-3. **Hybrid**: macFUSE for existing macOS versions, FSKit for macOS 15+
+FUSE remains the correct approach for Linux. macFUSE serves as a transitional
+option on macOS for users who want it, but FileProvider is the primary path.
 
 ## Motivation
 
-During the Sprint 6 fleet deployment, tcfsd successfully connected to SeaweedFS
-on all Darwin machines but failed to mount the FUSE filesystem:
+During Sprint 6 fleet deployment, FUSE mounting failed on both Darwin machines:
 
 | Host | macOS Version | Error | Root Cause |
 |------|---------------|-------|------------|
 | xoxd-bates | Sequoia 15.3 | `Read-only file system (os error 30)` | macFUSE system extension not approved |
 | petting-zoo-mini | Sequoia 15.3 | `Permission denied (os error 13)` | macFUSE system extension not loaded |
 
-The daemon's non-FUSE functionality works perfectly: S3 storage, gRPC socket,
-metrics endpoint, device identity, and fleet sync all operate without FUSE. Only
-the local mount point (which provides transparent file access via Finder/CLI)
-requires FUSE.
+Investigation of alternatives (FUSE-T, NFS loopback, FSKit) revealed fundamental
+limitations. FileProvider emerged as the Apple-sanctioned solution designed
+specifically for cloud storage with on-demand hydration.
 
-### Why This Is Non-Trivial on macOS
+## Platform Integration Matrix
 
-1. **Sealed System Volume**: macOS 13+ enforces a read-only system volume. FUSE
-   mounts must target the data volume (`/System/Volumes/Data`) or user-writable
-   paths like `~/tcfs`.
+| Platform | Integration Point | Framework | Crate | Status |
+|----------|------------------|-----------|-------|--------|
+| Linux | Kernel FUSE | fuse3 | tcfs-fuse | Working (v0.3.0) |
+| Windows | Cloud Files API | CFAPI | tcfs-cloudfilter | Skeleton |
+| macOS | FileProvider | NSFileProviderReplicatedExtension | tcfs-fileprovider | This RFC |
+| iOS | FileProvider | NSFileProviderExtension | tcfs-fileprovider (shared) | RFC 0003 |
 
-2. **System Extension Approval**: macFUSE 4.x uses a system extension instead of
-   a kernel extension. This requires:
-   - User navigates to System Settings > Privacy & Security
-   - Clicks "Allow" for the macFUSE extension
-   - Reboots the machine
-   - On Apple Silicon: may require reduced security in Recovery Mode
+Note: **macOS and iOS share the FileProvider framework.** The `tcfs-fileprovider`
+crate serves both platforms with platform-conditional compilation.
 
-3. **Gatekeeper & Notarization**: macFUSE is notarized by its developer
-   (Benjamin Fleischer), but custom FUSE implementations need their own Apple
-   Developer ID and notarization workflow.
+---
 
-4. **Admin By Request (ABR)**: Managed machines in enterprise/education
-   environments use ABR to gate sudo access. FUSE mount operations that require
-   root (or the macFUSE helper) need ABR elevation, which is time-limited and
-   requires user approval via a native dialog.
+## Part 1: Why Not FUSE on macOS
 
-## Option 1: macFUSE with Automated Bootstrapping
+### FUSE Options Evaluated
 
-### Approach
+| Approach | Blocker |
+|----------|---------|
+| **macFUSE (kext)** | Requires system extension approval, Reduced Security on Apple Silicon, fragile across macOS upgrades |
+| **macFUSE (FSKit backend)** | macOS 15.4+ only; mount restricted to `/Volumes`; FUSE notifications not supported; non-local FS deferred to macOS 26 |
+| **FUSE-T** | libfuse2 only (tcfs uses fuse3 crate); no FSEvents; no Spotlight; Finder crash on copy (macOS 15, issue #75) |
+| **NFS loopback** | `mount(2)` requires root on macOS (kernel restriction); no FSEvents; no Spotlight |
+| **FSKit native** | Block devices only; no cloud/network filesystem support; `FSFileSystem` not public in v1; non-local FS deferred to macOS 26 |
 
-Keep macFUSE as the FUSE provider. Automate as much of the setup as possible via
-the Nix home-manager module and launchd agents.
+### Key Findings
 
-### Implementation
+1. **`mount(2)` requires root on macOS** --- this is a kernel-level restriction.
+   The `diskarbitrationd` daemon runs as root specifically for this. macOS does
+   not support Linux's `user` fstab option. This eliminates NFS loopback's
+   "zero-privilege" advantage.
 
-#### 1.1 Installation Detection & Auto-Install
+2. **FSKit is for disk filesystems, not cloud storage.** It operates on
+   `FSBlockDeviceResource` (block devices). There is no `FSResource` type for
+   network/cloud endpoints. The Cryptomator project confirmed FSKit is "not
+   suitable" for their encrypted cloud storage use case.
 
-```nix
-# In tummycrypt.nix Darwin activation
-home.activation.ensureMacFuse = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-  if ! [ -d "/Library/Filesystems/macfuse.fs" ]; then
-    echo "macFUSE not installed. Installing via Homebrew..."
-    if command -v brew &>/dev/null; then
-      $DRY_RUN_CMD brew install --cask macfuse
-    else
-      echo "ERROR: Homebrew not available. Install macFUSE manually:"
-      echo "  brew install --cask macfuse"
-      exit 1
-    fi
-  fi
-'';
-```
+3. **FUSE-T only supports libfuse2.** The `fuse3` Rust crate used by tcfs-fuse
+   is not compatible. An open FUSE-T issue (#93) requests fuse3 support with no
+   timeline.
 
-#### 1.2 System Extension Approval Automation
+4. **FSEvents only work with macFUSE kext backend.** All NFS-based approaches
+   (FUSE-T, raw loopback) lose Finder change notifications and Spotlight indexing.
 
-macOS does not provide a programmatic API to approve system extensions. However:
+5. **macFUSE 5.x has an FSKit backend** (`-o backend=fskit`), but it is
+   experimental: mount restricted to `/Volumes`, FUSE notifications not yet
+   supported, non-local (distributed) volumes deferred to macOS 26.
 
-**Option A: MDM Profile (Recommended for managed fleets)**
+---
 
-Deploy a configuration profile that pre-approves the macFUSE system extension:
+## Part 2: FileProvider --- The Correct Approach
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "...">
-<plist version="1.0">
-<dict>
-    <key>PayloadContent</key>
-    <array>
-        <dict>
-            <key>PayloadType</key>
-            <string>com.apple.system-extension-policy</string>
-            <key>AllowedSystemExtensions</key>
-            <dict>
-                <key>9T634XKSRH</key>  <!-- macFUSE developer team ID -->
-                <array>
-                    <string>io.macfuse.filesystems.macfuse</string>
-                </array>
-            </dict>
-        </dict>
-    </array>
-</dict>
-</plist>
-```
+### What is FileProvider?
 
-This requires an MDM server (Mosyle, Jamf, Fleet). For lab machines without MDM,
-this is not viable unless we self-host a minimal MDM.
+`NSFileProviderReplicatedExtension` (macOS 11+) is Apple's official framework
+for cloud storage integration. It provides:
 
-**Option B: osascript/AppleScript Guided Approval**
+| Feature | Support |
+|---------|---------|
+| Files in Finder sidebar | Yes, under "Locations" at `~/Library/CloudStorage/` |
+| On-demand hydration | Yes, via APFS dataless files |
+| Cloud status icons | Yes (downloaded, cloud-only, syncing) |
+| Spotlight integration | Yes (native APFS) |
+| FSEvents integration | Yes (native APFS) |
+| File pinning | Yes (macOS Sonoma+) |
+| Automatic eviction | Yes (system reclaims space when disk is low) |
+| Incremental fetch | Yes (`NSFileProviderIncrementalContentFetching`) |
+| Conflict resolution | Built-in version tracking |
+| Minimum macOS | 11.0 (Big Sur) |
+| Kernel extension | None required |
+| System extension approval | None required |
+| Root/sudo | None required |
 
-Cannot auto-approve, but can guide the user:
+### How Hydration Works
 
-```bash
-osascript -e 'display dialog "macFUSE needs approval.\n\nSystem Settings > Privacy & Security > Allow" \
-  with title "tcfs Setup" buttons {"Open Settings", "Later"} default button 1'
-if [ "$?" = "0" ]; then
-  open "x-apple.systempreferences:com.apple.preference.security"
-fi
-```
-
-**Option C: Reduced Security Mode (Apple Silicon)**
-
-For headless machines (petting-zoo-mini), system extensions require booting into
-Recovery Mode and running:
-
-```bash
-csrutil enable --without kext  # Or: bputil -d  (Reduced Security)
-```
-
-This is a one-time manual step per machine.
-
-#### 1.3 ABR (Admin By Request) Integration
-
-ABR gates sudo access behind a native approval dialog. When tcfs needs elevated
-privileges (mount operations, extension loading), we need to detect and integrate
-with ABR.
-
-**Detection:**
-
-```bash
-# Check if ABR is installed
-abr_installed() {
-  [ -f "/Library/Application Support/AdminByRequest/AdminByRequest" ] || \
-  [ -d "/Applications/Admin By Request.app" ]
-}
-
-# Check if ABR elevation is active (user has temporary admin)
-abr_elevated() {
-  # ABR adds user to admin group temporarily
-  groups | grep -q admin
-}
-```
-
-**Elevation Flow:**
-
-```bash
-if abr_installed && ! abr_elevated; then
-  # Prompt user to request ABR elevation
-  osascript -e 'display dialog "tcfs needs administrator access for FUSE mount.\n\n\
-Please request Admin By Request elevation, then retry." \
-    with title "tcfs - Admin Required" \
-    buttons {"Request Admin", "Cancel"} default button 1'
-
-  if [ "$?" = "0" ]; then
-    # Open ABR elevation request
-    open -a "Admin By Request"
-    echo "Waiting for ABR elevation..."
-    # Poll for elevation (max 5 minutes)
-    for i in $(seq 1 30); do
-      if abr_elevated; then
-        echo "ABR elevation granted. Proceeding with mount."
-        break
-      fi
-      sleep 10
-    done
-  fi
-fi
-```
-
-**Launchd Integration:**
-
-The tcfsd launchd agent should detect ABR and defer mount operations until
-elevation is available:
-
-```nix
-# In daemon wrapper
-if [ "$(uname)" = "Darwin" ] && abr_installed && ! abr_elevated; then
-  echo "ABR detected, no elevation. Running in degraded mode (no FUSE mount)."
-  exec ${tcfsdBin} --config "${configPath}" --no-mount
-fi
-```
-
-### Pros
-
-- Mature, well-tested (macFUSE has been around since 2006 as MacFuse/OSXFUSE)
-- Supports all macOS versions back to 10.15
-- Large user base (Docker Desktop, Cryptomator, VeraCrypt all use macFUSE)
-- No additional code to maintain
-
-### Cons
-
-- Third-party dependency with unclear long-term maintenance
-- System extension approval is manual and per-machine
-- Apple Silicon requires reduced security mode for some configurations
-- Notarization tied to macFUSE developer, not our keys
-- ABR integration is polling-based, not event-driven
-- Each macOS major release risks breaking macFUSE
-
-## Option 2: Native FUSE Reimplementation in Rust
-
-### Approach
-
-Eliminate macFUSE entirely by implementing FUSE-like functionality using macOS
-native APIs. Two sub-options exist:
-
-#### 2A: NFS Loopback Mount
-
-Mount a local NFS server that translates filesystem operations to tcfs operations.
-No kernel extension needed.
-
-**Architecture:**
+When a user opens a cloud-only file, the kernel intercepts the read and calls
+the FileProvider extension:
 
 ```
-Finder / CLI
-    |
-    v
-NFS Client (built into macOS kernel)
-    |
-    v (localhost:2049)
-tcfs-nfsd (Rust userspace NFS server)
-    |
-    v
-tcfs storage layer (S3/SeaweedFS)
+User opens file in Finder / CLI
+       |
+       v
+macOS VFS (APFS dataless file detected)
+       |
+       v
+Kernel pauses the read, calls FileProvider extension
+       |
+       v
+NSFileProviderReplicatedExtension.fetchContents(
+    for: itemIdentifier,
+    version: currentVersion,
+    request: NSFileProviderRequest,
+    completionHandler: (URL?, NSFileProviderItem?, Error?) -> Void
+)
+       |
+       v
+tcfs-fileprovider Rust backend:
+  1. Fetch manifest from S3 (manifests/{file_hash})
+  2. Fetch chunks in parallel (chunks/{chunk_hash})
+  3. Decrypt chunks (XChaCha20-Poly1305)
+  4. Decompress chunks (zstd)
+  5. Write reassembled file to provided temporary URL
+       |
+       v
+completionHandler(temporaryFileURL, updatedItem, nil)
+       |
+       v
+Kernel delivers file content to the application
 ```
 
-**Implementation:**
+This is identical to how iCloud Drive, Dropbox, and OneDrive work.
+
+### Architecture
+
+```
+[Finder / CLI / Any App]
+       |
+       v
+[macOS Kernel -- APFS dataless files]
+       |  (on-demand hydration callback)
+       v
+[FileProvider Extension (.appex)]     ~200 LOC Swift
+       |  extern "C" function calls
+       v
+[tcfs-fileprovider (Rust static lib)]
+       |  uses existing tcfs crates
+       v
+[tcfs-chunks]  [tcfs-crypto]  [tcfs-storage]  [tcfs-sync]
+       |
+       v
+[SeaweedFS S3 / NATS JetStream]
+```
+
+### Swift Shim (Minimal)
+
+The FileProvider extension entry point must be Swift or Objective-C. The shim is
+approximately 200 lines implementing:
+
+| Protocol / Class | Methods | LOC (est.) |
+|-----------------|---------|------------|
+| `NSFileProviderReplicatedExtension` | `init(domain:)`, `invalidate()`, `item(for:)`, `fetchContents(for:)`, `enumerator(for:)` | ~50 |
+| `NSFileProviderItem` | Returns identifier, parent, filename, type, size, version | ~30 |
+| `NSFileProviderEnumerator` | `enumerateItems(for:startingAt:)`, `invalidate()` | ~40 |
+| C bridge declarations | `extern` function declarations for Rust backend | ~30 |
+
+All actual logic (S3 operations, chunking, encryption, sync) remains in Rust.
+The Swift shim is a pure translation layer.
+
+### Rust Backend Design
+
+The `tcfs-fileprovider` crate compiles as a `staticlib` exposing C-compatible
+functions:
 
 ```rust
-// Using nfs-server-rs or custom NFSv3/v4 implementation
-use nfs_server::{NfsServer, FileSystem};
-
-struct TcfsNfs {
-    storage: Arc<StorageOperator>,
-    cache: Arc<CacheManager>,
-}
-
-impl FileSystem for TcfsNfs {
-    fn read(&self, path: &Path, offset: u64, size: u32) -> Result<Vec<u8>> {
-        // Hydrate from SeaweedFS on demand
-        self.storage.hydrate_and_read(path, offset, size)
-    }
-
-    fn write(&self, path: &Path, offset: u64, data: &[u8]) -> Result<u32> {
-        // Write to local cache, queue sync
-        self.cache.write_through(path, offset, data)
-    }
-
-    fn readdir(&self, path: &Path) -> Result<Vec<DirEntry>> {
-        // Return .tc stubs + hydrated files
-        self.storage.list_with_stubs(path)
-    }
-}
-```
-
-**Mount via launchd:**
-
-```bash
-# No macFUSE needed — just mount NFS
-mkdir -p ~/tcfs
-mount -t nfs -o tcp,resvport,locallocks localhost:/tcfs ~/tcfs
-```
-
-**Pros:**
-
-- Zero third-party dependencies (NFS is built into macOS kernel)
-- No system extension approval needed
-- No reduced security mode needed
-- Works on all macOS versions (NFS is ancient and stable)
-- Can be notarized with our own Developer ID
-
-**Cons:**
-
-- NFS semantics differ from POSIX (stale caches, attribute caching)
-- NFSv3 has 4GB file size limits on some configurations
-- NFS loopback has overhead vs direct FUSE
-- Must implement full NFS server (complex protocol)
-- NFS port (2049) may require root or port >= 1024 workaround
-- File change notifications (FSEvents) don't work over NFS
-
-#### 2B: FSKit (macOS 15+ / Sequoia)
-
-Apple introduced FSKit in macOS 15 as the official replacement for kernel-based
-filesystems. It runs entirely in userspace with no kernel extension.
-
-**Architecture:**
-
-```
-Finder / CLI
-    |
-    v
-VFS Layer (macOS kernel)
-    |
-    v (XPC)
-tcfs-fskit (FSKit Extension, Rust + Swift bridge)
-    |
-    v
-tcfs storage layer (S3/SeaweedFS)
-```
-
-**Implementation:**
-
-FSKit requires a System Extension bundle (.systemextension) distributed inside an
-app bundle. The extension implements the `FSBlockDeviceFileSystem` or
-`FSUnaryFileSystem` protocol.
-
-```swift
-// Swift bridge (FSKit requires Objective-C/Swift entry points)
-import FSKit
-
-@objc class TcfsFileSystem: FSUnaryFileSystem {
-    let rustCore = TcfsRustBridge()
-
-    override func mount(options: FSMountOptions) async throws -> FSVolume {
-        try await rustCore.mount(options)
-    }
-
-    override func read(volume: FSVolume, node: FSNode,
-                       offset: UInt64, length: UInt32) async throws -> Data {
-        try await rustCore.read(node.path, offset, length)
-    }
-}
-```
-
-```rust
-// Rust core (called via C FFI from Swift)
+// Exported C API (auto-generated header via cbindgen)
 #[no_mangle]
-pub extern "C" fn tcfs_read(path: *const c_char, offset: u64, len: u32,
-                             buf: *mut u8) -> i32 {
-    // ... hydration logic
-}
+pub extern "C" fn tcfs_fp_enumerate_dir(
+    path: *const c_char,
+    out_items: *mut *mut FPItem,
+    out_count: *mut usize,
+) -> i32 { ... }
+
+#[no_mangle]
+pub extern "C" fn tcfs_fp_fetch_contents(
+    item_id: *const c_char,
+    dest_path: *const c_char,
+    progress_cb: extern "C" fn(f64),
+) -> i32 { ... }
+
+#[no_mangle]
+pub extern "C" fn tcfs_fp_get_item_metadata(
+    item_id: *const c_char,
+    out_item: *mut FPItem,
+) -> i32 { ... }
 ```
 
-**Code Signing & Notarization:**
+Internal dependencies (already written):
+- `tcfs-storage` --- S3/SeaweedFS access via OpenDAL
+- `tcfs-chunks` --- FastCDC chunking, BLAKE3 hashing, zstd compression
+- `tcfs-crypto` --- XChaCha20-Poly1305 encryption
+- `tcfs-sync` --- Vector clocks, state cache, conflict detection
 
-FSKit extensions require:
+### Build Pipeline
 
-1. **Apple Developer ID** ($99/year)
-   - Needed for: Developer ID Application certificate, notarization
-   - Entitlements: `com.apple.developer.fs-kit.user-space-driver`
-
-2. **Provisioning Profile**
-   - Must request `com.apple.developer.fs-kit.user-space-driver` entitlement
-     from Apple (may require justification)
-
-3. **Notarization**
-   - All code must be notarized via `notarytool`
-   - Includes the .systemextension bundle, the host app, and any helper tools
-
-4. **Distribution**
-   - Can be distributed outside App Store (Developer ID signed + notarized)
-   - App bundle structure required:
-     ```
-     TummyCrypt.app/
-       Contents/
-         Library/
-           SystemExtensions/
-             dev.tinyland.tcfs-fskit.systemextension/
-         MacOS/
-           tcfs-helper  # Host app that manages the extension lifecycle
-     ```
-
-**Pros:**
-
-- Apple-sanctioned API (future-proof)
-- No kernel extension, no reduced security mode
-- Full POSIX semantics (unlike NFS loopback)
-- FSEvents / Spotlight integration possible
-- Our own Developer ID (full control over signing)
-
-**Cons:**
-
-- macOS 15+ only (drops support for Ventura, Sonoma)
-- FSKit API is new and sparsely documented (as of 2026)
-- Requires Swift bridge layer (Rust cannot directly implement ObjC protocols)
-- Apple Developer ID enrollment ($99/year) + entitlement approval
-- .systemextension still requires user approval in System Settings (but lighter
-  than kernel extensions)
-- Test surface is small — few FSKit filesystems exist in the wild
-
-#### 2C: Zig FUSE Implementation
-
-Similar to 2A/2B but using Zig instead of Rust for the native layer.
-
-**Rationale for Zig:**
-
-- C ABI compatibility (no FFI overhead for calling macOS APIs)
-- Compiles to tiny binaries (important for system extension size limits)
-- `@cImport` directly imports macOS system headers
-- Zig's allocator model maps well to filesystem buffer management
-
-**Implementation would mirror 2A or 2B** but with Zig replacing Rust for the
-platform-specific layer. The core tcfs logic (storage, crypto, sync) would remain
-in Rust with a C FFI boundary.
-
-**Tradeoff:** Introduces a second systems language into the codebase. Only
-justified if the platform layer is small and well-bounded.
-
-## Option 3: Hybrid Strategy (Recommended)
-
-### Approach
-
-Use macFUSE for macOS 13-14 (Ventura/Sonoma) and FSKit for macOS 15+ (Sequoia).
-Runtime detection selects the backend.
-
-### Implementation
-
-```rust
-enum FuseBackend {
-    MacFuse,    // macOS 13-14
-    FSKit,      // macOS 15+
-    NfsLoopback, // Fallback (no FUSE/FSKit available)
-    None,       // Degraded mode (push/pull only, no mount)
-}
-
-fn detect_backend() -> FuseBackend {
-    let version = macos_version();
-    if version >= (15, 0) && fskit_entitlement_granted() {
-        FuseBackend::FSKit
-    } else if macfuse_installed() && macfuse_extension_approved() {
-        FuseBackend::MacFuse
-    } else if can_bind_nfs_port() {
-        FuseBackend::NfsLoopback
-    } else {
-        FuseBackend::None  // Graceful degradation
-    }
-}
+```
+cargo build --lib --target aarch64-apple-darwin  (Rust staticlib)
+       |
+       v
+cbindgen --lang c  (generate tcfs_fileprovider.h)
+       |
+       v
+Xcode project:
+  - Host app (minimal, manages extension lifecycle)
+  - FileProvider extension target (.appex)
+    - Links Rust static library
+    - Imports C header via module map
+    - Swift shim implements NSFileProviderReplicatedExtension
+       |
+       v
+codesign + notarytool  (Developer ID signing + notarization)
+       |
+       v
+Distribution: .dmg installer or Homebrew cask
 ```
 
-### Graceful Degradation Levels
+### Credential Storage
 
-| Level | Mount | Push/Pull | Sync | Status |
-|-------|-------|-----------|------|--------|
-| Full (FSKit/macFUSE) | Yes | Yes | Yes | Transparent file access |
-| NFS Loopback | Yes (limited) | Yes | Yes | Mount works, no FSEvents |
-| Degraded (no mount) | No | Yes | Yes | CLI-only file access |
+iOS/macOS sandbox prevents reading env vars or config files from the host.
+FileProvider extensions use:
 
-### ABR Integration (All Levels)
+1. **App Group container** --- shared preferences between host app and extension
+2. **Keychain** --- S3 credentials stored in a shared Keychain access group
+3. **App Group UserDefaults** --- configuration (endpoint URL, bucket, prefix)
 
-```rust
-/// Detect ABR and adapt privilege escalation strategy
-fn escalation_strategy() -> EscalationStrategy {
-    if cfg!(target_os = "macos") {
-        if abr_detected() {
-            EscalationStrategy::ABR {
-                // Use osascript to prompt for ABR elevation
-                prompt: "tcfs needs temporary admin for FUSE mount",
-                // Poll for elevation with exponential backoff
-                poll_interval: Duration::from_secs(10),
-                max_wait: Duration::from_secs(300),
-            }
-        } else {
-            EscalationStrategy::Standard {
-                // Use AuthorizationServices for sudo-like elevation
-                right: "dev.tinyland.tcfs.mount",
-            }
-        }
-    } else {
-        EscalationStrategy::None // Linux: no elevation needed for FUSE3
-    }
-}
+---
+
+## Part 3: Transitional macFUSE Support
+
+For users who prefer FUSE mount semantics or run older macOS versions without
+FileProvider, macFUSE remains available as an opt-in backend.
+
+### ABR (Admin By Request) Integration
+
+On managed machines, macFUSE requires privilege escalation for system extension
+approval. The daemon detects ABR and adapts:
+
+```
+if macFUSE available && extension approved:
+    mount via macFUSE (full FUSE semantics)
+elif FileProvider available:
+    register FileProvider domain (recommended)
+else:
+    run in degraded mode (CLI push/pull only, no mount)
 ```
 
-### Developer Key Strategy
+### Launchd Plist
 
-Regardless of which FUSE backend ships, we need Apple code signing for macOS
-distribution:
+macOS daemon startup via launchd (for both FileProvider and FUSE modes):
 
-1. **Enroll in Apple Developer Program** ($99/year, `developer.apple.com`)
-   - Organization: Tinyland Inc.
-   - Type: Developer ID (for distribution outside App Store)
+```
+dist/com.tummycrypt.tcfsd.plist
+  - RunAtLoad: true
+  - KeepAlive: true
+  - Logs: /tmp/tcfsd.stdout.log, /tmp/tcfsd.stderr.log
+```
 
-2. **Certificates needed:**
-   - `Developer ID Application` — signs the tcfs binaries and app bundle
-   - `Developer ID Installer` — signs .pkg installers
+See `docs/ops/fleet-deployment.md` for installation instructions.
 
-3. **Entitlements to request:**
-   - `com.apple.developer.fs-kit.user-space-driver` (for FSKit path)
-   - `com.apple.security.cs.allow-unsigned-executable-memory` (if needed for
-     Rust runtime)
+---
 
-4. **CI/CD Integration:**
-   ```yaml
-   # GitHub Actions: sign and notarize
-   - name: Sign tcfs binaries
-     run: |
-       codesign --sign "Developer ID Application: Tinyland Inc (TEAMID)" \
-         --options runtime \
-         --entitlements entitlements.plist \
-         target/release/tcfs
+## Part 4: FUSE-T Assessment
 
-   - name: Notarize
-     run: |
-       xcrun notarytool submit tcfs.zip \
-         --apple-id "$APPLE_ID" \
-         --team-id "$TEAM_ID" \
-         --password "$APP_SPECIFIC_PASSWORD" \
-         --wait
-   ```
+FUSE-T deserves mention as a kext-free alternative that uses NFSv4 loopback
+internally. Key findings:
 
-## Recommendation
+| Aspect | Detail |
+|--------|--------|
+| Mechanism | Userspace NFSv4 server on ephemeral port |
+| Kext/sysext | None required |
+| Root for mount | Not per-mount (installer needs root once) |
+| API | **libfuse2 only** --- fuse3 not supported (issue #93) |
+| FSEvents | Not supported (NFS loopback limitation) |
+| Spotlight | Not supported |
+| Notable users | rclone, Cryptomator, VeraCrypt |
+| Status | Active, v1.0.49 (Aug 2025), sole maintainer |
+| macOS 15 | Known Finder crash on file copy (issue #75) |
 
-**Short-term (v0.4.x):** Option 1 — macFUSE with ABR detection and guided setup.
-Ship `--no-mount` degraded mode as the default on Darwin until FUSE is confirmed
-working. This unblocks the fleet immediately.
+**FUSE-T is not viable for tcfs** because tcfs-fuse uses the `fuse3` Rust crate.
+FUSE-T only implements libfuse2. Switching to a fuse2-compatible crate (`fuser`)
+would require rewriting tcfs-fuse's entire callback layer.
 
-**Medium-term (v0.5.x):** Option 2A — NFS loopback as a zero-dependency fallback.
-This gives us a mount point on every Mac without any third-party software or
-system extension approval.
+FUSE-T validates the NFS loopback approach architecturally, but the FileProvider
+path is superior in every dimension (FSEvents, Spotlight, no root, native Finder
+integration, APFS dataless files).
 
-**Long-term (v1.0):** Option 2B — FSKit native filesystem. This is the
-Apple-sanctioned path and will be the most robust option as macOS evolves. Requires
-Apple Developer enrollment and entitlement approval.
+---
 
-## Decision Matrix
+## Part 5: FSKit Status and Future
 
-| Criteria | macFUSE (Opt 1) | NFS Loopback (2A) | FSKit (2B) | Hybrid (Opt 3) |
-|----------|-----------------|--------------------|-----------|----|
-| Time to ship | 1 week | 3-4 weeks | 8-12 weeks | 4-6 weeks |
-| macOS version support | 10.15+ | 10.15+ | 15+ only | All |
-| Third-party deps | macFUSE | None | None | macFUSE (old macOS) |
-| Kernel extension | Yes (sysext) | No | No | Varies |
-| Apple Developer ID | No | No | Yes ($99/yr) | Yes |
-| ABR compatible | With integration | Natively (no root for NFS?) | With sysext approval | Best coverage |
-| POSIX compliance | Full | Partial (NFS caching) | Full | Varies |
-| Spotlight/FSEvents | Yes | No | Yes | Varies |
-| Maintenance burden | Low (upstream) | Medium (NFS server) | High (new API, Swift) | Highest |
+FSKit (macOS 15.4+) is Apple's framework for custom *disk* filesystems. It is
+not currently suitable for tcfs but may be relevant in the future.
+
+### Current State
+
+| Aspect | Status |
+|--------|--------|
+| Public API | `FSUnaryFileSystem` only; `FSFileSystem` marked `FSKIT_API_UNAVAILABLE_V1` |
+| Cloud/network FS | **Not supported** (block devices only) |
+| Non-local FS | Deferred to **macOS 26** |
+| Mount restriction | `/Volumes` only |
+| Entitlement | `com.apple.developer.fskit.fsmodule` |
+| Extension type | Application extension (.appex), not system extension |
+| User approval | Required in System Settings > Extensions |
+| Third-party adoption | One sample project (KhaosT/FSKitSample); no production use |
+
+### macFUSE 5.x FSKit Backend
+
+macFUSE 5.0+ includes an experimental FSKit backend (`-o backend=fskit`):
+
+| Feature | FSKit Backend | Kext Backend |
+|---------|--------------|--------------|
+| Mount points | `/Volumes` only | Anywhere |
+| FUSE notifications | Not supported | Supported |
+| Minimum macOS | 15.4 | 12+ |
+| Non-local volumes | macOS 26+ | Now |
+| libfuse3 | macFUSE 5.1.0+ | macFUSE 5.1.0+ |
+
+### Future Relevance
+
+If Apple extends FSKit to support non-local filesystems in macOS 26+, it could
+become an alternative to FileProvider for tcfs. However, FileProvider is the
+established, production-proven path with 5+ years of maturity and broad macOS
+version support.
+
+---
+
+## Part 6: Language Choice for Platform Layer
+
+The initial draft proposed Zig as an alternative for the platform-specific layer.
+Research found this is not viable for the FileProvider use case:
+
+| Factor | Zig | Rust |
+|--------|-----|------|
+| ObjC header import | `@cImport` cannot parse ObjC syntax | `objc2` covers 16+ Apple frameworks |
+| .appex bundle output | Cannot produce MH\_BUNDLE Mach-O | Cargo + Xcode works |
+| FileProvider bindings | None exist | swift-bridge, cbindgen, UniFFI |
+| FSKit bindings | None exist | fskit-rs, objc2-fs-kit |
+| Existing codebase | Would add a 2nd systems language | Already 100% Rust |
+
+Zig's advantage (simpler C ABI, smaller binaries) would matter for a raw
+block-device filesystem driver. For a cloud storage client calling Apple
+frameworks through a Swift shim, Rust + cbindgen is the pragmatic choice.
+
+---
+
+## Implementation Roadmap
+
+### Phase 1: Transitional (v0.4.x)
+
+- macOS daemon starts in `--no-mount` degraded mode by default
+- Push/pull/sync work fully (S3 + NATS, no FUSE required)
+- macFUSE available as opt-in for users who install it
+- ABR detection and guided setup for managed machines
+- Launchd plist for automatic startup
+
+### Phase 2: FileProvider MVP (v0.5.x)
+
+- `tcfs-fileprovider` crate: Rust `staticlib` with C API
+- Minimal Xcode project with FileProvider extension
+- Swift shim (~200 LOC) implementing `NSFileProviderReplicatedExtension`
+- Read-only enumeration + on-demand hydration
+- Keychain credential storage
+- Apple Developer ID enrollment for code signing
+
+### Phase 3: FileProvider Full (v0.6.x)
+
+- Write support (upload via `createItem` / `modifyItem`)
+- Conflict resolution via `NSFileProviderItemVersion`
+- Background sync via `NSFileProviderManager.signalEnumerator`
+- Progress reporting during hydration
+- File pinning support
+- E2E encryption through the hydration path
+
+### Phase 4: Polish (v1.0)
+
+- Automatic eviction policy integration
+- Thumbnail / QuickLook preview generation
+- Share extension
+- Homebrew cask distribution
+- Deprecate macFUSE transitional path
+
+---
 
 ## Open Questions
 
-1. **FSKit entitlement timeline**: How long does Apple take to approve
-   `com.apple.developer.fs-kit.user-space-driver`? Is it automatic or review-gated?
+1. **Apple Developer enrollment**: Is Tinyland Inc already enrolled in the Apple
+   Developer Program ($99/year)? If not, who initiates enrollment?
 
-2. **NFS loopback root requirement**: Does `mount -t nfs localhost:/path` require
-   root on modern macOS? If yes, this negates the zero-privilege advantage.
+2. **App Group identifier**: What App Group and Keychain access group should we
+   register? Proposed: `group.com.tummycrypt.tcfs`
 
-3. **ABR API**: Does Admin By Request expose any programmatic API (beyond polling
-   group membership) for detecting elevation state?
+3. **Distribution format**: .dmg with drag-to-install? Homebrew cask? Both?
 
-4. **Zig vs Rust for platform layer**: Is the C ABI advantage of Zig worth adding
-   a second language? Could use `objc2` Rust crate for ObjC bridging instead.
+4. **macOS minimum version**: FileProvider is available since macOS 11, but
+   `NSFileProviderReplicatedExtension` matured significantly in macOS 13+.
+   Recommend targeting macOS 13 (Ventura) as minimum.
 
-5. **Apple Developer enrollment**: Is Tinyland Inc already enrolled? If not, who
-   initiates enrollment and manages the certificates?
+---
+
+## References
+
+- [Apple FileProvider documentation](https://developer.apple.com/documentation/fileprovider)
+- [NSFileProviderReplicatedExtension](https://developer.apple.com/documentation/fileprovider/nsfileproviderreplicatedextension)
+- [WWDC 2021: Sync files to the cloud with FileProvider on macOS](https://developer.apple.com/videos/play/wwdc2021/10182/)
+- [Apple FSKit documentation](https://developer.apple.com/documentation/fskit)
+- [FUSE-T](https://github.com/macos-fuse-t/fuse-t)
+- [macFUSE FSKit backend](https://github.com/macfuse/macfuse/wiki/FUSE-Backends)
+- [fskit-rs](https://github.com/debox-network/fskit-rs) --- Rust FSKit bindings
+- [KhaosT/FSKitSample](https://github.com/KhaosT/FSKitSample)
+- tcfs-cloudfilter: `crates/tcfs-cloudfilter/` --- Windows analog
+- tcfs-fuse: `crates/tcfs-fuse/` --- Linux FUSE3 implementation
 
 ---
 
