@@ -122,7 +122,7 @@ Build locally: `task docs:pdf` (outputs to `dist/docs/`)
 ### RFCs
 
 - [RFC 0001: Fleet Sync Integration](rfc/0001-fleet-sync-integration.md) — multi-machine sync design and rollout plan
-- [RFC 0002: Darwin File Integration](rfc/0002-darwin-file-integration.md) — FileProvider as primary macOS/iOS path
+- [RFC 0002: Darwin FUSE Strategy](rfc/0002-darwin-fuse-strategy.md) — FileProvider as primary macOS/iOS path
 - [RFC 0003: iOS File Provider](rfc/0003-ios-file-provider.md) — UniFFI bridge and .appex architecture
 
 ## Platform Support
