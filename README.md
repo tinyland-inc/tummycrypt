@@ -187,7 +187,7 @@ task infra:plan ENV=local    # Preview local k3s changes
 
 ## Peer Projects
 
-- **[remote-juggler](https://github.com/Jesssullivan/remote-juggler)**: Git identity management + KDBX credential resolution.
+- **[remote-juggler](https://github.com/tinyland-inc/remote-juggler)**: Git identity management + KDBX credential resolution.
   tcfs integrates with remote-juggler for credential fallback via KeePassXC.
 
 ## License
