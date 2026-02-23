@@ -1,0 +1,18 @@
+# gitleaks configuration for tummycrypt
+# Secret scanning — runs in CI (gitleaks-action) and can be run locally:
+#   gitleaks detect --source . --config .gitleaks.toml
+
+title = "tummycrypt gitleaks config"
+
+[allowlist]
+  # SOPS-encrypted credential files (values are ENC[AES256_GCM,...])
+  paths = [
+    '''credentials/.*\.yaml$''',
+    '''\.sops\.yaml$''',
+  ]
+
+  # Age recipient public keys are not secrets
+  regexTarget = "line"
+  regexes = [
+    '''age1[a-z0-9]{58}''',
+  ]
