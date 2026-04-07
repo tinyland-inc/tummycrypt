@@ -916,6 +916,24 @@ async fn cmd_pull(
     let mut state = tcfs_sync::state::StateCache::open(&state_path)
         .with_context(|| format!("opening state cache: {}", state_path.display()))?;
 
+    // Load master key for E2E decryption if configured
+    let master_key = config
+        .crypto
+        .master_key_file
+        .as_ref()
+        .and_then(|p| std::fs::read(p).ok())
+        .filter(|k| k.len() == 32)
+        .map(|bytes| {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            tcfs_crypto::MasterKey::from_bytes(key)
+        });
+    let enc_ctx = master_key
+        .as_ref()
+        .map(|mk| tcfs_sync::engine::EncryptionContext {
+            master_key: mk.clone(),
+        });
+
     let result = tcfs_sync::engine::download_file_with_device(
         &op,
         &resolved_manifest,
@@ -924,7 +942,7 @@ async fn cmd_pull(
         Some(&progress),
         &device_id,
         Some(&mut state),
-        None,
+        enc_ctx.as_ref(),
     )
     .await
     .with_context(|| format!("downloading {}", manifest_path))?;
