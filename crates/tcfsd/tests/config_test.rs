@@ -109,7 +109,7 @@ async fn crypto_enabled_config() {
         r#"
 [crypto]
 enabled = true
-key_derivation = "argon2id"
+kdf_salt = "a3f7b82e14d09c56deadbeef12345678"
 "#
     )
     .unwrap();

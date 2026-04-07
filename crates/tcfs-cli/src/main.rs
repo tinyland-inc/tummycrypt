@@ -1864,13 +1864,24 @@ async fn cmd_auth_unlock(
     passphrase_file: Option<&Path>,
 ) -> Result<()> {
     let key_bytes = if let Some(pf) = passphrase_file {
-        // Derive key from passphrase file using configured key_derivation method
+        // Derive key from passphrase file using Argon2id with per-vault salt
         let passphrase = std::fs::read_to_string(pf)
             .with_context(|| format!("reading passphrase file: {}", pf.display()))?;
         let passphrase = passphrase.trim();
+        let salt = config
+            .crypto
+            .kdf_salt
+            .as_deref()
+            .and_then(|s| (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .ok())
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            .ok_or_else(|| anyhow::anyhow!("crypto.kdf_salt not configured — required for passphrase-based key derivation"))?;
         let mk = tcfs_crypto::recovery::derive_from_passphrase(
             passphrase,
-            &config.crypto.key_derivation,
+            &salt,
         )
         .context("deriving key from passphrase")?;
         mk.as_bytes().to_vec()
