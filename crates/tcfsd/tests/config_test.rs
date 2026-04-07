@@ -63,7 +63,9 @@ enabled = false
     )
     .unwrap();
 
-    let config = load_config(f.path()).await.expect("valid TOML should parse");
+    let config = load_config(f.path())
+        .await
+        .expect("valid TOML should parse");
     assert_eq!(config.storage.bucket, "test-bucket");
     assert_eq!(
         config.daemon.socket,
@@ -95,7 +97,9 @@ bucket = "my-bucket"
     )
     .unwrap();
 
-    let config = load_config(f.path()).await.expect("partial config should parse");
+    let config = load_config(f.path())
+        .await
+        .expect("partial config should parse");
     assert_eq!(config.storage.bucket, "my-bucket");
     // Other sections should have defaults
     assert!(!config.crypto.enabled);
@@ -114,6 +118,8 @@ kdf_salt = "a3f7b82e14d09c56deadbeef12345678"
     )
     .unwrap();
 
-    let config = load_config(f.path()).await.expect("crypto config should parse");
+    let config = load_config(f.path())
+        .await
+        .expect("crypto config should parse");
     assert!(config.crypto.enabled);
 }

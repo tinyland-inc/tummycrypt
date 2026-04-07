@@ -11,7 +11,12 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "tcfs")]
 struct Cli {
-    #[arg(long, short = 'c', env = "TCFS_CONFIG", default_value = "/etc/tcfs/config.toml")]
+    #[arg(
+        long,
+        short = 'c',
+        env = "TCFS_CONFIG",
+        default_value = "/etc/tcfs/config.toml"
+    )]
     config: PathBuf,
 
     #[command(subcommand)]

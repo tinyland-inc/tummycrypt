@@ -14,9 +14,9 @@ use tempfile::TempDir;
 
 fn generate_test_master_key() -> tcfs_crypto::MasterKey {
     let key_bytes: [u8; 32] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
-        0x1d, 0x1e, 0x1f, 0x20,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f, 0x20,
     ];
     tcfs_crypto::MasterKey::from_bytes(key_bytes)
 }
@@ -31,8 +31,7 @@ async fn encrypted_push_pull_roundtrip() {
     let src = write_test_file(tmp.path(), "secret.txt", plaintext);
     let dst = tmp.path().join("decrypted.txt");
 
-    let mut state =
-        tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
+    let mut state = tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
 
     let master_key = generate_test_master_key();
     let enc_ctx = EncryptionContext {
@@ -57,10 +56,7 @@ async fn encrypted_push_pull_roundtrip() {
     assert_eq!(upload.bytes, plaintext.len() as u64);
 
     // Verify: remote chunks should NOT contain plaintext
-    let manifest_bytes = op
-        .read(&upload.remote_path)
-        .await
-        .expect("read manifest");
+    let manifest_bytes = op.read(&upload.remote_path).await.expect("read manifest");
     let manifest_raw = manifest_bytes.to_bytes();
     let manifest_str = String::from_utf8_lossy(&manifest_raw);
     let manifest: serde_json::Value =
@@ -123,8 +119,7 @@ async fn encrypted_large_file_multi_chunk() {
     let src = write_test_file(tmp.path(), "large-secret.bin", &plaintext);
     let dst = tmp.path().join("decrypted-large.bin");
 
-    let mut state =
-        tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
+    let mut state = tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
 
     let master_key = generate_test_master_key();
     let enc_ctx = EncryptionContext {
@@ -174,8 +169,7 @@ async fn pull_without_key_fails_on_encrypted_file() {
     let src = write_test_file(tmp.path(), "locked.txt", plaintext);
     let dst = tmp.path().join("should-fail.txt");
 
-    let mut state =
-        tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
+    let mut state = tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
 
     let master_key = generate_test_master_key();
     let enc_ctx = EncryptionContext {
@@ -225,8 +219,7 @@ async fn wrong_key_fails_decryption() {
     let src = write_test_file(tmp.path(), "mismatch.txt", plaintext);
     let dst = tmp.path().join("wrong-key.txt");
 
-    let mut state =
-        tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
+    let mut state = tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
 
     let key_a = generate_test_master_key();
     let enc_ctx_a = EncryptionContext {
@@ -266,8 +259,5 @@ async fn wrong_key_fails_decryption() {
     )
     .await;
 
-    assert!(
-        result.is_err(),
-        "pull with wrong master key should fail"
-    );
+    assert!(result.is_err(), "pull with wrong master key should fail");
 }

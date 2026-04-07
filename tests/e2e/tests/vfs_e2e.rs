@@ -25,10 +25,7 @@ async fn create_write_read_release_cycle() {
     let written = vfs.write(fh, 0, content).await.expect("write");
     assert_eq!(written as usize, content.len());
 
-    let data = vfs
-        .read(fh, 0, content.len() as u32)
-        .await
-        .expect("read");
+    let data = vfs.read(fh, 0, content.len() as u32).await.expect("read");
     assert_eq!(&data, content);
 
     vfs.release(fh).await.expect("release");
@@ -41,9 +38,15 @@ async fn directory_tree_operations() {
     let vfs = vfs_from_operator(op, "e2e-dirs", &tmp.path().join("cache"));
 
     // Build a directory tree
-    vfs.mkdir("/", OsStr::new("src"), 0o755).await.expect("mkdir src");
-    vfs.mkdir("/src", OsStr::new("lib"), 0o755).await.expect("mkdir lib");
-    vfs.mkdir("/src", OsStr::new("bin"), 0o755).await.expect("mkdir bin");
+    vfs.mkdir("/", OsStr::new("src"), 0o755)
+        .await
+        .expect("mkdir src");
+    vfs.mkdir("/src", OsStr::new("lib"), 0o755)
+        .await
+        .expect("mkdir lib");
+    vfs.mkdir("/src", OsStr::new("bin"), 0o755)
+        .await
+        .expect("mkdir bin");
 
     // Verify tree
     let root = vfs.readdir("/").await.expect("readdir /");
@@ -61,7 +64,9 @@ async fn create_file_in_subdirectory() {
     let op = memory_operator();
     let vfs = vfs_from_operator(op, "e2e-subdir", &tmp.path().join("cache"));
 
-    vfs.mkdir("/", OsStr::new("docs"), 0o755).await.expect("mkdir");
+    vfs.mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir");
 
     let (fh, _) = vfs
         .create("/docs", OsStr::new("README.md"), 0o644)

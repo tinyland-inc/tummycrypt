@@ -16,8 +16,7 @@ async fn small_file_roundtrip() {
     let src = write_test_file(tmp.path(), "test.txt", content);
     let dst = tmp.path().join("output.txt");
 
-    let mut state =
-        tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
+    let mut state = tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
 
     // Push
     let upload = tcfs_sync::engine::upload_file(&op, &src, prefix, &mut state, None)
@@ -27,10 +26,9 @@ async fn small_file_roundtrip() {
     assert_eq!(upload.bytes, content.len() as u64);
 
     // Pull
-    let download =
-        tcfs_sync::engine::download_file(&op, &upload.remote_path, &dst, prefix, None)
-            .await
-            .expect("pull");
+    let download = tcfs_sync::engine::download_file(&op, &upload.remote_path, &dst, prefix, None)
+        .await
+        .expect("pull");
     assert_eq!(download.bytes, content.len() as u64);
 
     // Byte-equal
@@ -49,18 +47,19 @@ async fn large_file_multi_chunk_roundtrip() {
     let src = write_test_file(tmp.path(), "large.bin", &content);
     let dst = tmp.path().join("output.bin");
 
-    let mut state =
-        tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
+    let mut state = tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
 
     let upload = tcfs_sync::engine::upload_file(&op, &src, prefix, &mut state, None)
         .await
         .expect("push large");
-    assert!(upload.chunks >= 1, "2MB file should produce at least 1 chunk");
+    assert!(
+        upload.chunks >= 1,
+        "2MB file should produce at least 1 chunk"
+    );
 
-    let download =
-        tcfs_sync::engine::download_file(&op, &upload.remote_path, &dst, prefix, None)
-            .await
-            .expect("pull large");
+    let download = tcfs_sync::engine::download_file(&op, &upload.remote_path, &dst, prefix, None)
+        .await
+        .expect("pull large");
     assert_eq!(download.bytes, content.len() as u64);
 
     let pulled = std::fs::read(&dst).unwrap();
@@ -76,8 +75,7 @@ async fn idempotent_push_skips_unchanged() {
     let content = b"unchanged";
     let src = write_test_file(tmp.path(), "same.txt", content);
 
-    let mut state =
-        tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
+    let mut state = tcfs_sync::state::StateCache::open(&tmp.path().join("state.db.json")).unwrap();
 
     let first = tcfs_sync::engine::upload_file(&op, &src, prefix, &mut state, None)
         .await

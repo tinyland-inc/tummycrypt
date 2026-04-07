@@ -95,9 +95,21 @@ mod tcfsd_test_helpers {
             storage_health: Gauge::default(),
         };
 
-        registry.register("tcfsd_files_pushed_total", "files pushed", m.files_pushed.clone());
-        registry.register("tcfsd_files_pulled_total", "files pulled", m.files_pulled.clone());
-        registry.register("tcfsd_sync_conflicts_total", "conflicts", m.sync_conflicts.clone());
+        registry.register(
+            "tcfsd_files_pushed_total",
+            "files pushed",
+            m.files_pushed.clone(),
+        );
+        registry.register(
+            "tcfsd_files_pulled_total",
+            "files pulled",
+            m.files_pulled.clone(),
+        );
+        registry.register(
+            "tcfsd_sync_conflicts_total",
+            "conflicts",
+            m.sync_conflicts.clone(),
+        );
         registry.register(
             "tcfsd_nats_events_published_total",
             "nats published",
@@ -108,7 +120,11 @@ mod tcfsd_test_helpers {
             "nats received",
             m.nats_events_received.clone(),
         );
-        registry.register("tcfsd_storage_health", "storage health", m.storage_health.clone());
+        registry.register(
+            "tcfsd_storage_health",
+            "storage health",
+            m.storage_health.clone(),
+        );
 
         m
     }

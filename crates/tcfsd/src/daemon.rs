@@ -148,10 +148,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                             warn!("no kdf_salt configured — generating ephemeral salt (key will differ across restarts!)");
                             tcfs_crypto::recovery::generate_passphrase_salt()
                         });
-                    match tcfs_crypto::recovery::derive_from_passphrase(
-                        passphrase.trim(),
-                        &salt,
-                    ) {
+                    match tcfs_crypto::recovery::derive_from_passphrase(passphrase.trim(), &salt) {
                         Ok(mk) => {
                             info!(
                                 path = %pf.display(),

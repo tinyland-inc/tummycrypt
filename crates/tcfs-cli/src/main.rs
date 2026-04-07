@@ -689,7 +689,10 @@ async fn cmd_push(
     let remote_prefix = prefix
         .map(|s| s.trim_end_matches('/').to_string())
         .unwrap_or_else(|| {
-            config.storage.remote_prefix.clone()
+            config
+                .storage
+                .remote_prefix
+                .clone()
                 .unwrap_or_else(|| config.storage.bucket.clone())
         });
 
@@ -874,11 +877,18 @@ async fn cmd_pull(
                     .rsplit_once("/manifests/")
                     .map(|(pfx, _)| pfx.to_string())
                     .unwrap_or_else(|| {
-                        manifest_path.split('/').next().unwrap_or("data").to_string()
+                        manifest_path
+                            .split('/')
+                            .next()
+                            .unwrap_or("data")
+                            .to_string()
                     })
             } else {
                 // File path: use config remote_prefix (matches FUSE daemon)
-                config.storage.remote_prefix.clone()
+                config
+                    .storage
+                    .remote_prefix
+                    .clone()
                     .unwrap_or_else(|| config.storage.bucket.clone())
             }
         });
@@ -1469,9 +1479,9 @@ async fn cmd_mount(
                         Ok(bytes) if bytes.len() == 32 => {
                             let mut key_bytes = [0u8; 32];
                             key_bytes.copy_from_slice(&bytes);
-                            Some(std::sync::Arc::new(tokio::sync::Mutex::new(
-                                Some(tcfs_crypto::MasterKey::from_bytes(key_bytes))
-                            )))
+                            Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(
+                                tcfs_crypto::MasterKey::from_bytes(key_bytes),
+                            ))))
                         }
                         _ => None,
                     }
@@ -1872,18 +1882,21 @@ async fn cmd_auth_unlock(
             .crypto
             .kdf_salt
             .as_deref()
-            .and_then(|s| (0..s.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
-                .collect::<Result<Vec<u8>, _>>()
-                .ok())
+            .and_then(|s| {
+                (0..s.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+                    .collect::<Result<Vec<u8>, _>>()
+                    .ok()
+            })
             .and_then(|b| <[u8; 16]>::try_from(b).ok())
-            .ok_or_else(|| anyhow::anyhow!("crypto.kdf_salt not configured — required for passphrase-based key derivation"))?;
-        let mk = tcfs_crypto::recovery::derive_from_passphrase(
-            passphrase,
-            &salt,
-        )
-        .context("deriving key from passphrase")?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "crypto.kdf_salt not configured — required for passphrase-based key derivation"
+                )
+            })?;
+        let mk = tcfs_crypto::recovery::derive_from_passphrase(passphrase, &salt)
+            .context("deriving key from passphrase")?;
         mk.as_bytes().to_vec()
     } else {
         // Resolve master key file path

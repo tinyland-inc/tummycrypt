@@ -28,8 +28,7 @@ fn live_enabled() -> bool {
 
 /// Get S3 endpoint from env or default to CIVO Tailscale IP
 fn s3_endpoint() -> String {
-    std::env::var("TCFS_S3_ENDPOINT")
-        .unwrap_or_else(|_| "http://100.120.66.67:8333".into())
+    std::env::var("TCFS_S3_ENDPOINT").unwrap_or_else(|_| "http://100.120.66.67:8333".into())
 }
 
 fn s3_bucket() -> String {
@@ -37,8 +36,7 @@ fn s3_bucket() -> String {
 }
 
 fn nats_url() -> String {
-    std::env::var("TCFS_NATS_URL")
-        .unwrap_or_else(|_| "nats://100.71.19.127:4222".into())
+    std::env::var("TCFS_NATS_URL").unwrap_or_else(|_| "nats://100.71.19.127:4222".into())
 }
 
 /// Build an opendal S3 operator from env credentials
@@ -68,7 +66,8 @@ async fn seaweedfs_health_check() {
         return;
     }
 
-    let op = live_operator().expect("S3 credentials required (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)");
+    let op = live_operator()
+        .expect("S3 credentials required (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)");
     let result = tcfs_storage::check_health(&op).await;
     assert!(result.is_ok(), "SeaweedFS health check failed: {result:?}");
 }
@@ -96,7 +95,10 @@ async fn nats_connect_and_jetstream() {
     while let Some(stream) = streams.next().await {
         match stream {
             Ok(s) => {
-                eprintln!("  stream: {} ({} messages)", s.config.name, s.state.messages);
+                eprintln!(
+                    "  stream: {} ({} messages)",
+                    s.config.name, s.state.messages
+                );
                 stream_count += 1;
             }
             Err(e) => eprintln!("  stream list error: {e}"),
@@ -143,10 +145,9 @@ async fn live_push_pull_roundtrip() {
     );
 
     // Pull
-    let download =
-        tcfs_sync::engine::download_file(&op, &upload.remote_path, &dst, &prefix, None)
-            .await
-            .expect("live pull from SeaweedFS");
+    let download = tcfs_sync::engine::download_file(&op, &upload.remote_path, &dst, &prefix, None)
+        .await
+        .expect("live pull from SeaweedFS");
 
     assert_eq!(download.bytes, content.len() as u64);
 
@@ -171,9 +172,7 @@ async fn live_nats_pubsub_roundtrip() {
     }
 
     let url = nats_url();
-    let client = async_nats::connect(&url)
-        .await
-        .expect("NATS connect");
+    let client = async_nats::connect(&url).await.expect("NATS connect");
 
     let test_id = uuid::Uuid::new_v4().to_string();
     let subject = format!("tcfs.e2e.test.{}", &test_id[..8]);
