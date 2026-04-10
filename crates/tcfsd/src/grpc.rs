@@ -1588,6 +1588,8 @@ impl TcfsDaemon for TcfsDaemonImpl {
         });
 
         // ── Live remote events via NATS STATE_UPDATES ───────────────────────
+        // Use an ephemeral consumer so Watch callers don't compete with
+        // the daemon's durable state_sync_loop consumer for messages.
         let nats_tx = async_tx;
         let nats_client = self.nats.clone();
         let device_id = self.device_id.clone();
@@ -1597,7 +1599,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
                 debug!("watch: NATS not connected, skipping remote events");
                 return;
             };
-            match nats.state_consumer(&device_id).await {
+            match nats.state_consumer_ephemeral().await {
                 Ok(mut consumer) => {
                     use futures::StreamExt;
                     while let Some(msg_result) = consumer.next().await {
