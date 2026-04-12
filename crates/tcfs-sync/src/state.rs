@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::conflict::VectorClock;
 
@@ -179,6 +179,18 @@ pub struct SyncState {
     pub status: FileSyncStatus,
 }
 
+/// On-disk format wrapping entries + metadata for forward-compatible persistence.
+/// Backwards-compatible: if the file is a raw HashMap (old format), we load it
+/// with default metadata.
+#[derive(Debug, Serialize, Deserialize)]
+struct StateCacheOnDisk {
+    #[serde(default)]
+    last_nats_seq: u64,
+    #[serde(default)]
+    device_id: String,
+    entries: HashMap<String, SyncState>,
+}
+
 /// In-memory state cache, persisted to a JSON file
 pub struct StateCache {
     /// Path to the JSON state file on disk
@@ -191,28 +203,70 @@ pub struct StateCache {
     pub last_nats_seq: u64,
     /// Device ID for this machine
     pub device_id: String,
+    /// When the cache was last flushed (for periodic flush)
+    last_flush: Instant,
 }
 
 impl StateCache {
     /// Load or create a state cache at the given path.
-    /// If the file doesn't exist, starts with an empty cache.
+    ///
+    /// Supports two on-disk formats:
+    /// - **New**: `{"last_nats_seq": N, "device_id": "...", "entries": {...}}`
+    /// - **Legacy**: raw `HashMap<String, SyncState>` (auto-migrated on next flush)
+    ///
+    /// If the main file is corrupt, falls back to `.bak` if available.
     pub fn open(db_path: &Path) -> Result<Self> {
-        let entries = if db_path.exists() {
-            let content = std::fs::read_to_string(db_path)
-                .with_context(|| format!("reading state cache: {}", db_path.display()))?;
-            serde_json::from_str(&content)
-                .with_context(|| format!("parsing state cache: {}", db_path.display()))?
+        let (entries, last_nats_seq, device_id) = if db_path.exists() {
+            match Self::load_from_file(db_path) {
+                Ok(data) => data,
+                Err(primary_err) => {
+                    // Try backup
+                    let bak_path = db_path.with_extension("json.bak");
+                    if bak_path.exists() {
+                        tracing::warn!(
+                            "state cache corrupt ({}), recovering from backup",
+                            primary_err
+                        );
+                        Self::load_from_file(&bak_path).with_context(|| {
+                            format!(
+                                "both state cache and backup corrupt: primary={}, backup",
+                                primary_err
+                            )
+                        })?
+                    } else {
+                        return Err(primary_err)
+                            .with_context(|| format!("reading state cache: {}", db_path.display()));
+                    }
+                }
+            }
         } else {
-            HashMap::new()
+            (HashMap::new(), 0, String::new())
         };
 
         Ok(StateCache {
             db_path: db_path.to_path_buf(),
             entries,
             dirty: false,
-            last_nats_seq: 0,
-            device_id: String::new(),
+            last_nats_seq,
+            device_id,
+            last_flush: Instant::now(),
         })
+    }
+
+    /// Parse a state cache file, supporting both new and legacy formats.
+    fn load_from_file(path: &Path) -> Result<(HashMap<String, SyncState>, u64, String)> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading: {}", path.display()))?;
+
+        // Try new format first
+        if let Ok(data) = serde_json::from_str::<StateCacheOnDisk>(&content) {
+            return Ok((data.entries, data.last_nats_seq, data.device_id));
+        }
+
+        // Fall back to legacy format (raw HashMap)
+        let entries: HashMap<String, SyncState> = serde_json::from_str(&content)
+            .with_context(|| format!("parsing state cache: {}", path.display()))?;
+        Ok((entries, 0, String::new()))
     }
 
     /// Reload entries from disk, merging any new entries written by other processes.
@@ -221,12 +275,13 @@ impl StateCache {
         if !self.db_path.exists() {
             return Ok(());
         }
-        let content = std::fs::read_to_string(&self.db_path)
-            .with_context(|| format!("reloading state cache: {}", self.db_path.display()))?;
-        let disk_entries: HashMap<String, SyncState> = serde_json::from_str(&content)
-            .with_context(|| format!("parsing state cache: {}", self.db_path.display()))?;
+        let (disk_entries, seq, _) = Self::load_from_file(&self.db_path)?;
         for (key, state) in disk_entries {
             self.entries.entry(key).or_insert(state);
+        }
+        // Only advance seq, never go backwards
+        if seq > self.last_nats_seq {
+            self.last_nats_seq = seq;
         }
         Ok(())
     }
@@ -285,6 +340,10 @@ impl StateCache {
     }
 
     /// Flush dirty changes to disk using an atomic write (write then rename).
+    ///
+    /// Persists `last_nats_seq` and `device_id` alongside entries so they
+    /// survive daemon restarts. Creates a `.bak` backup of the previous state
+    /// before overwriting.
     pub fn flush(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
@@ -296,8 +355,18 @@ impl StateCache {
                 .with_context(|| format!("creating state dir: {}", parent.display()))?;
         }
 
-        let json =
-            serde_json::to_string_pretty(&self.entries).context("serializing state cache")?;
+        // Rotate current file to .bak before overwriting
+        if self.db_path.exists() {
+            let bak_path = self.db_path.with_extension("json.bak");
+            let _ = std::fs::copy(&self.db_path, &bak_path);
+        }
+
+        let on_disk = StateCacheOnDisk {
+            last_nats_seq: self.last_nats_seq,
+            device_id: self.device_id.clone(),
+            entries: self.entries.clone(),
+        };
+        let json = serde_json::to_string_pretty(&on_disk).context("serializing state cache")?;
 
         // Atomic write: write to temp file, then rename
         let tmp_path = self.db_path.with_extension("tmp");
@@ -312,7 +381,20 @@ impl StateCache {
         }
 
         self.dirty = false;
+        self.last_flush = Instant::now();
         Ok(())
+    }
+
+    /// Flush if dirty and more than `interval` has elapsed since the last flush.
+    ///
+    /// Designed to be called from a periodic timer (e.g. every 30s from the
+    /// daemon's main loop) to prevent data loss on crash during long operations.
+    pub fn flush_if_stale(&mut self, interval: std::time::Duration) -> Result<()> {
+        if self.dirty && self.last_flush.elapsed() >= interval {
+            self.flush()
+        } else {
+            Ok(())
+        }
     }
 
     /// Transition a file's sync status without removing its metadata.
@@ -1322,5 +1404,163 @@ mod tests {
                 "status must be Synced after reload"
             );
         }
+    }
+
+    // ── Metadata persistence (last_nats_seq, device_id) ─────────────────
+
+    #[test]
+    fn nats_seq_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        {
+            let mut cache = StateCache::open(&path).unwrap();
+            cache.last_nats_seq = 42;
+            cache.device_id = "neo".into();
+            // Force dirty so flush actually writes
+            cache.dirty = true;
+            cache.flush().unwrap();
+        }
+
+        let cache = StateCache::open(&path).unwrap();
+        assert_eq!(cache.last_nats_seq, 42, "last_nats_seq must survive restart");
+        assert_eq!(cache.device_id, "neo", "device_id must survive restart");
+    }
+
+    #[test]
+    fn legacy_format_loads_with_default_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        // Write legacy format: raw HashMap
+        let mut entries = HashMap::new();
+        entries.insert(
+            "file.txt".to_string(),
+            SyncState {
+                blake3: "abc".into(),
+                size: 5,
+                mtime: 1000,
+                chunk_count: 1,
+                remote_path: "bucket/file.txt".into(),
+                last_synced: 100,
+                vclock: VectorClock::new(),
+                device_id: "test".into(),
+                conflict: None,
+                status: FileSyncStatus::Synced,
+            },
+        );
+        std::fs::write(&path, serde_json::to_string_pretty(&entries).unwrap()).unwrap();
+
+        let cache = StateCache::open(&path).unwrap();
+        assert_eq!(cache.len(), 1, "should load legacy entries");
+        assert_eq!(cache.last_nats_seq, 0, "legacy format has no seq");
+        assert!(cache.device_id.is_empty(), "legacy format has no device_id");
+    }
+
+    // ── Backup + recovery ───────────────────────────────────────────────
+
+    #[test]
+    fn flush_creates_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut cache = StateCache::open(&path).unwrap();
+        let file_path = dir.path().join("f.txt");
+        std::fs::write(&file_path, b"x").unwrap();
+        cache.set(
+            &file_path,
+            SyncState {
+                blake3: "aaa".into(),
+                size: 1,
+                mtime: 0,
+                chunk_count: 1,
+                remote_path: "idx/f.txt".into(),
+                last_synced: 0,
+                vclock: VectorClock::new(),
+                device_id: "d".into(),
+                conflict: None,
+                status: FileSyncStatus::Synced,
+            },
+        );
+        cache.flush().unwrap();
+
+        // Second flush should create .bak
+        cache.set(
+            &file_path,
+            SyncState {
+                blake3: "bbb".into(),
+                size: 2,
+                mtime: 1,
+                chunk_count: 1,
+                remote_path: "idx/f.txt".into(),
+                last_synced: 1,
+                vclock: VectorClock::new(),
+                device_id: "d".into(),
+                conflict: None,
+                status: FileSyncStatus::Synced,
+            },
+        );
+        cache.flush().unwrap();
+
+        let bak_path = dir.path().join("state.json.bak");
+        assert!(bak_path.exists(), ".bak file should exist after second flush");
+    }
+
+    #[test]
+    fn recover_from_corrupt_main_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let bak_path = dir.path().join("state.json.bak");
+
+        // Write a valid backup
+        let on_disk = StateCacheOnDisk {
+            last_nats_seq: 99,
+            device_id: "recovered".into(),
+            entries: HashMap::new(),
+        };
+        std::fs::write(&bak_path, serde_json::to_string(&on_disk).unwrap()).unwrap();
+
+        // Corrupt the main file
+        std::fs::write(&path, "NOT VALID JSON {{{{").unwrap();
+
+        let cache = StateCache::open(&path).unwrap();
+        assert_eq!(cache.last_nats_seq, 99, "should recover seq from backup");
+        assert_eq!(cache.device_id, "recovered");
+    }
+
+    #[test]
+    fn corrupt_main_no_backup_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "GARBAGE").unwrap();
+
+        let result = StateCache::open(&path);
+        assert!(result.is_err(), "should fail with no backup available");
+    }
+
+    // ── flush_if_stale ──────────────────────────────────────────────────
+
+    #[test]
+    fn flush_if_stale_skips_when_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+        cache.dirty = true;
+
+        // Just flushed — should skip with a long interval
+        cache.flush_if_stale(std::time::Duration::from_secs(3600)).unwrap();
+        assert!(cache.dirty, "should still be dirty (interval not elapsed)");
+    }
+
+    #[test]
+    fn flush_if_stale_flushes_when_overdue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+        cache.dirty = true;
+
+        // Zero interval — always stale
+        cache.flush_if_stale(std::time::Duration::ZERO).unwrap();
+        assert!(!cache.dirty, "should have flushed (zero interval)");
     }
 }
