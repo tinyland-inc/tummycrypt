@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description = "tcfs command-line interface"
 
+[lib]
+name = "tcfs_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tcfs"
 path = "src/main.rs"
@@ -45,6 +49,9 @@ rpassword = { workspace = true }
 
 [features]
 default = []
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [package.metadata.deb]
 maintainer = "TummyCrypt Contributors <jess@sulliwood.org>"

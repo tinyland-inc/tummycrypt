@@ -4,6 +4,15 @@
 
 Self-hosted encrypted file sync with on-demand hydration. Mounts SeaweedFS as a local directory — files appear as zero-byte `.tc` stubs until accessed, then transparently download and decrypt. FOSS odrive/Dropbox replacement.
 
+## Canonical Home
+
+`Jesssullivan/tummycrypt` is the canonical source repository for tcfs.
+If `tinyland-inc/tummycrypt` exists, treat it as a fork or downstream
+distribution surface rather than the source of truth for planning, issues,
+releases, or contributor workflow.
+
+Operational policy: [`docs/ops/remote-governance.md`](docs/ops/remote-governance.md).
+
 ## Features
 
 - **On-demand hydration**: Files appear as `.tc` stubs, hydrate transparently on open
@@ -11,15 +20,17 @@ Self-hosted encrypted file sync with on-demand hydration. Mounts SeaweedFS as a 
 - **Fleet sync**: Multi-machine sync via NATS JetStream with vector clock conflict detection
 - **Content-addressed storage**: FastCDC chunking, BLAKE3 hashing, zstd compression
 - **Git-safe**: Syncs `.git/` directories as atomic bundles with lock detection
-- **Cross-platform**: Linux (FUSE/NFS), macOS (FileProvider/NFS), Windows (Cloud Files API, planned)
+- **Cross-platform**: Linux is the best-supported runtime; macOS has packaged but still experimental desktop surfaces; Windows remains planned
 
 ## Quick Start
 
 ```bash
 # Nix devShell (recommended)
 nix develop
+# Or auto-load the committed devShell + env on cd
+direnv allow
 
-# Or manual: Rust 1.93+, protobuf compiler, fuse3 (Linux)
+# Or manual: install the pinned Rust 1.93.0 toolchain, protobuf compiler, fuse3 (Linux)
 
 # Start local dev infrastructure (SeaweedFS + NATS + Prometheus + Grafana)
 task dev
@@ -34,14 +45,20 @@ task check
 # Linux (installer script)
 curl -fsSL https://github.com/Jesssullivan/tummycrypt/releases/latest/download/install.sh | sh
 
-# macOS (Homebrew)
-brew install tinyland-inc/tap/tcfs
+# macOS (Homebrew, current manual tap flow)
+brew tap --custom-remote Jesssullivan/tummycrypt https://github.com/Jesssullivan/tummycrypt.git
+git -C "$(brew --repo Jesssullivan/tummycrypt)" fetch origin homebrew-tap
+git -C "$(brew --repo Jesssullivan/tummycrypt)" checkout homebrew-tap
+brew install Jesssullivan/tummycrypt/tcfs
 
 # Debian/Ubuntu
-sudo dpkg -i tcfs-*.deb
+sudo dpkg -i tcfsd-*.deb tcfs-*.deb
+
+# RPM (Fedora/RHEL/Rocky, daemon-only today)
+sudo rpm -i tcfsd-*.rpm
 
 # Container (K8s worker mode)
-podman pull ghcr.io/tinyland-inc/tcfsd:latest
+podman pull ghcr.io/jesssullivan/tcfsd:latest
 
 # Nix
 nix build github:Jesssullivan/tummycrypt
@@ -96,20 +113,25 @@ crates/
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system design.
 
+For packaged release proof across Homebrew, `.pkg`, `.deb`, `.rpm`, container,
+and Nix surfaces, see [docs/ops/distribution-smoke-matrix.md](docs/ops/distribution-smoke-matrix.md).
+
 ## Platform Support
 
 | Feature | Linux | macOS | Windows | iOS |
 |---------|-------|-------|---------|-----|
 | CLI (push/pull/reconcile) | Full | Full | Planned | - |
-| Daemon (gRPC + metrics) | systemd | launchd | Planned | - |
-| Filesystem mount | FUSE3 | NFS loopback | Cloud Files API (skeleton) | - |
-| FileProvider | - | Full (Finder integration) | - | Read-only |
-| Finder/Explorer badges | - | 6 states | - | - |
+| Daemon (gRPC + metrics) | Full | Available, lightly validated | Planned | - |
+| Filesystem mount | Full (FUSE3, NFS fallback) | Experimental | Cloud Files API (skeleton) | - |
+| FileProvider | - | Experimental | - | Proof-of-concept, read-only |
+| Finder/Explorer badges | - | Experimental | - | - |
 | D-Bus integration | Full | - | - | - |
-| Fleet sync (NATS) | Full | Full | Planned | - |
-| E2E encryption | Full | Full | Planned | Full |
+| Fleet sync (NATS) | Full | Core path available, not continuously acceptance-tested | Planned | - |
+| E2E encryption | Full | Full | Planned | Core crypto path available |
 
 See [docs/platform-support.md](docs/platform-support.md) for details.
+For the dated Apple posture, see
+[docs/ops/apple-surface-status.md](docs/ops/apple-surface-status.md).
 
 ## Development
 

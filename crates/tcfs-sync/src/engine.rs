@@ -15,10 +15,382 @@ use anyhow::{Context, Result};
 use opendal::Operator;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+use unicode_normalization::UnicodeNormalization;
+use uuid::Uuid;
 
 use crate::conflict::{compare_clocks, SyncOutcome};
+use crate::index_entry::{
+    manifest_key, read_index_entry_record_from_store, resolve_visible_index_entry,
+    write_committed_index_entry, write_preparing_index_entry, PendingIndexEntry, RemoteIndexEntry,
+};
 use crate::manifest::SyncManifest;
-use crate::state::{make_sync_state_full, StateCache};
+use crate::state::{make_sync_state_full, FileSyncStatus, StateCache};
+
+/// Maximum number of retry attempts for chunk upload/download operations.
+const CHUNK_MAX_RETRIES: u32 = 3;
+
+/// Base delay between retries (doubles each attempt: 100ms, 200ms, 400ms).
+const CHUNK_RETRY_BASE_MS: u64 = 100;
+
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(CHUNK_RETRY_BASE_MS * 2u64.saturating_pow(attempt))
+}
+
+async fn retry_with_backoff<T, E, Action, ActionFuture, Sleep, SleepFuture, OnRetry>(
+    max_attempts: u32,
+    mut action: Action,
+    mut on_retry: OnRetry,
+    mut sleep: Sleep,
+) -> std::result::Result<T, E>
+where
+    Action: FnMut(u32) -> ActionFuture,
+    ActionFuture: std::future::Future<Output = std::result::Result<T, E>>,
+    Sleep: FnMut(std::time::Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = ()>,
+    OnRetry: FnMut(u32, std::time::Duration, &E),
+{
+    assert!(
+        max_attempts > 0,
+        "retry_with_backoff requires at least one attempt"
+    );
+
+    let mut last_err = None;
+    for attempt in 0..max_attempts {
+        match action(attempt).await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if attempt + 1 < max_attempts {
+                    let delay = retry_delay(attempt);
+                    on_retry(attempt + 1, delay, &err);
+                    sleep(delay).await;
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(last_err.expect("retry_with_backoff must capture a final error"))
+}
+
+async fn write_chunk_with_retry_inner<Write, WriteFuture, Sleep, SleepFuture>(
+    key: &str,
+    chunk_idx: usize,
+    mut write: Write,
+    sleep: Sleep,
+) -> Result<()>
+where
+    Write: FnMut() -> WriteFuture,
+    WriteFuture: std::future::Future<Output = Result<()>>,
+    Sleep: FnMut(std::time::Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = ()>,
+{
+    retry_with_backoff(
+        CHUNK_MAX_RETRIES,
+        |_| write(),
+        |attempt, delay, err: &anyhow::Error| {
+            warn!(
+                chunk = chunk_idx,
+                attempt,
+                max = CHUNK_MAX_RETRIES,
+                delay_ms = delay.as_millis(),
+                error = %err,
+                "chunk upload failed, retrying"
+            );
+        },
+        sleep,
+    )
+    .await
+    .map_err(|err| err.context(format!("uploading chunk {chunk_idx}: {key}")))
+}
+
+/// Write a chunk to remote storage with exponential backoff retry.
+///
+/// Retries up to `CHUNK_MAX_RETRIES` times on transient failures.
+async fn write_chunk_with_retry(
+    op: &Operator,
+    key: &str,
+    data: Vec<u8>,
+    chunk_idx: usize,
+) -> Result<()> {
+    write_chunk_with_retry_inner(
+        key,
+        chunk_idx,
+        || {
+            let data = data.clone();
+            async move {
+                op.write(key, data)
+                    .await
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            }
+        },
+        tokio::time::sleep,
+    )
+    .await
+}
+
+/// Read a key from remote storage with exponential backoff retry.
+///
+/// Used for manifest/index reads so transient storage errors behave the same as
+/// chunk downloads instead of aborting the whole pull on the first failure.
+async fn read_with_retry_inner<Read, ReadFuture, Sleep, SleepFuture>(
+    key: &str,
+    mut read: Read,
+    sleep: Sleep,
+) -> Result<Vec<u8>>
+where
+    Read: FnMut() -> ReadFuture,
+    ReadFuture: std::future::Future<Output = Result<Vec<u8>>>,
+    Sleep: FnMut(std::time::Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = ()>,
+{
+    retry_with_backoff(
+        CHUNK_MAX_RETRIES,
+        |_| read(),
+        |attempt, delay, err: &anyhow::Error| {
+            warn!(
+                key = key,
+                attempt,
+                max = CHUNK_MAX_RETRIES,
+                delay_ms = delay.as_millis(),
+                error = %err,
+                "read failed, retrying"
+            );
+        },
+        sleep,
+    )
+    .await
+    .map_err(|err| err.context(format!("reading: {key}")))
+}
+
+async fn read_with_retry(op: &Operator, key: &str) -> Result<Vec<u8>> {
+    read_with_retry_inner(
+        key,
+        || async {
+            op.read(key)
+                .await
+                .map(|data| data.to_vec())
+                .map_err(anyhow::Error::from)
+        },
+        tokio::time::sleep,
+    )
+    .await
+}
+
+/// Read a chunk from remote storage with exponential backoff retry.
+///
+/// Retries up to `CHUNK_MAX_RETRIES` times on transient failures.
+/// After successful read, verifies the BLAKE3 hash matches the expected value.
+#[derive(Debug)]
+enum ChunkReadError {
+    Transport(anyhow::Error),
+    Integrity { expected: String, actual: String },
+}
+
+impl std::fmt::Display for ChunkReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(err) => write!(f, "{err}"),
+            Self::Integrity { expected, actual } => {
+                write!(
+                    f,
+                    "chunk integrity failed: expected {expected}, got {actual}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChunkReadError {}
+
+async fn read_chunk_with_retry_inner<Read, ReadFuture, Sleep, SleepFuture>(
+    key: &str,
+    expected_hash: &str,
+    chunk_idx: usize,
+    mut read: Read,
+    sleep: Sleep,
+) -> Result<Vec<u8>>
+where
+    Read: FnMut() -> ReadFuture,
+    ReadFuture: std::future::Future<Output = Result<Vec<u8>>>,
+    Sleep: FnMut(std::time::Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = ()>,
+{
+    retry_with_backoff(
+        CHUNK_MAX_RETRIES,
+        |_| {
+            let read_attempt = read();
+            async move {
+                let chunk_bytes = read_attempt.await.map_err(ChunkReadError::Transport)?;
+                let actual_hash = tcfs_chunks::hash_to_hex(&tcfs_chunks::hash_bytes(&chunk_bytes));
+                if actual_hash == expected_hash {
+                    Ok(chunk_bytes)
+                } else {
+                    Err(ChunkReadError::Integrity {
+                        expected: expected_hash.to_string(),
+                        actual: actual_hash,
+                    })
+                }
+            }
+        },
+        |attempt, delay, err| match err {
+            ChunkReadError::Transport(source) => {
+                warn!(
+                    chunk = chunk_idx,
+                    attempt,
+                    max = CHUNK_MAX_RETRIES,
+                    delay_ms = delay.as_millis(),
+                    error = %source,
+                    "chunk download failed, retrying"
+                );
+            }
+            ChunkReadError::Integrity { actual, .. } => {
+                warn!(
+                    chunk = chunk_idx,
+                    attempt,
+                    expected = expected_hash,
+                    actual = %actual,
+                    delay_ms = delay.as_millis(),
+                    "chunk integrity mismatch, retrying"
+                );
+            }
+        },
+        sleep,
+    )
+    .await
+    .map_err(|err| anyhow::Error::new(err).context(format!("downloading chunk {chunk_idx}: {key}")))
+}
+
+async fn read_chunk_with_retry(
+    op: &Operator,
+    key: &str,
+    expected_hash: &str,
+    chunk_idx: usize,
+) -> Result<Vec<u8>> {
+    read_chunk_with_retry_inner(
+        key,
+        expected_hash,
+        chunk_idx,
+        || async {
+            op.read(key)
+                .await
+                .map(|data| data.to_vec())
+                .map_err(anyhow::Error::from)
+        },
+        tokio::time::sleep,
+    )
+    .await
+}
+
+fn manifest_path_prefix(remote_prefix: &str) -> String {
+    format!("{}/manifests", remote_prefix.trim_end_matches('/'))
+}
+
+async fn publish_index_reference(
+    op: &Operator,
+    remote_prefix: &str,
+    rel_path: &str,
+    entry: RemoteIndexEntry,
+) -> Result<()> {
+    let prefix = remote_prefix.trim_end_matches('/');
+    let index_key = format!("{prefix}/index/{rel_path}");
+    let manifest_prefix = manifest_path_prefix(prefix);
+    let manifest_path = manifest_key(&manifest_prefix, &entry.manifest_hash);
+
+    anyhow::ensure!(
+        op.exists(&manifest_path).await.unwrap_or(false),
+        "cannot point index at missing manifest: {manifest_path}"
+    );
+
+    let _ = resolve_visible_index_entry(op, &index_key, &manifest_prefix).await?;
+    write_committed_index_entry(op, &index_key, &entry).await
+}
+
+/// Stages of the manifest/index publish pipeline.
+///
+/// Emitted via the `after_stage` hook in `publish_manifest_for_rel_path_with_hook`
+/// so tests can inject failures between steps (see `engine` test module).
+/// Each variant names the artifact that has **just been written**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishStage {
+    StagedManifest,
+    PreparingIndex,
+    FinalManifest,
+    CommittedIndex,
+}
+
+async fn publish_manifest_for_rel_path(
+    op: &Operator,
+    remote_prefix: &str,
+    rel_path: &str,
+    manifest_bytes: Vec<u8>,
+    entry: RemoteIndexEntry,
+) -> Result<()> {
+    publish_manifest_for_rel_path_with_hook(
+        op,
+        remote_prefix,
+        rel_path,
+        manifest_bytes,
+        entry,
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn publish_manifest_for_rel_path_with_hook<F>(
+    op: &Operator,
+    remote_prefix: &str,
+    rel_path: &str,
+    manifest_bytes: Vec<u8>,
+    entry: RemoteIndexEntry,
+    mut after_stage: F,
+) -> Result<()>
+where
+    F: FnMut(PublishStage) -> Result<()>,
+{
+    let prefix = remote_prefix.trim_end_matches('/');
+    let index_key = format!("{prefix}/index/{rel_path}");
+    let manifest_prefix = manifest_path_prefix(prefix);
+    let final_manifest_key = manifest_key(&manifest_prefix, &entry.manifest_hash);
+    let staged_manifest_key = format!(
+        "{prefix}/staging/manifests/{}-{}.json",
+        Uuid::new_v4(),
+        entry.manifest_hash
+    );
+
+    let current = resolve_visible_index_entry(op, &index_key, &manifest_prefix).await?;
+
+    op.write(&staged_manifest_key, manifest_bytes.clone())
+        .await
+        .with_context(|| format!("writing staged manifest: {staged_manifest_key}"))?;
+    after_stage(PublishStage::StagedManifest)?;
+
+    write_preparing_index_entry(
+        op,
+        &index_key,
+        current,
+        PendingIndexEntry::new(
+            entry.manifest_hash.clone(),
+            entry.size,
+            entry.chunks,
+            staged_manifest_key.clone(),
+        ),
+    )
+    .await?;
+    after_stage(PublishStage::PreparingIndex)?;
+
+    if !op.exists(&final_manifest_key).await.unwrap_or(false) {
+        op.write(&final_manifest_key, manifest_bytes)
+            .await
+            .with_context(|| format!("uploading manifest: {final_manifest_key}"))?;
+        after_stage(PublishStage::FinalManifest)?;
+    }
+
+    write_committed_index_entry(op, &index_key, &entry).await?;
+    after_stage(PublishStage::CommittedIndex)?;
+    let _ = op.delete(&staged_manifest_key).await;
+    Ok(())
+}
 
 /// Optional encryption context for E2E encrypted push/pull.
 ///
@@ -53,6 +425,8 @@ pub struct CollectConfig {
     pub exclude_patterns: Vec<String>,
     /// Whether to follow symlinks (default: false — skip with warning)
     pub follow_symlinks: bool,
+    /// Whether to sync empty directories via `.tcfs_dir` markers
+    pub sync_empty_dirs: bool,
 }
 
 impl Default for CollectConfig {
@@ -63,8 +437,18 @@ impl Default for CollectConfig {
             sync_hidden_dirs: false,
             exclude_patterns: Vec::new(),
             follow_symlinks: false,
+            sync_empty_dirs: true,
         }
     }
+}
+
+/// Result of collecting files and empty directories from a local tree.
+#[derive(Debug, Clone)]
+pub struct CollectResult {
+    /// Regular files to upload.
+    pub files: Vec<PathBuf>,
+    /// Empty directories (no files after exclusions) to create markers for.
+    pub empty_dirs: Vec<PathBuf>,
 }
 
 /// Result of uploading a single file
@@ -79,6 +463,93 @@ pub struct UploadResult {
     pub skipped: bool,
     /// Sync outcome if conflict detection was performed
     pub outcome: Option<SyncOutcome>,
+}
+
+#[derive(Debug)]
+enum UploadSourceSnapshot {
+    InMemory(Vec<u8>),
+    Streaming(Vec<tcfs_chunks::ChunkWithData>),
+}
+
+#[derive(Debug)]
+struct UploadSnapshot {
+    file_hash_hex: String,
+    file_size: u64,
+    source: UploadSourceSnapshot,
+}
+
+fn prepare_upload_snapshot(local_path: &Path, use_streaming: bool) -> Result<UploadSnapshot> {
+    if use_streaming {
+        let chunks = tcfs_chunks::chunk_file_streaming(local_path).with_context(|| {
+            format!(
+                "streaming chunk for upload snapshot: {}",
+                local_path.display()
+            )
+        })?;
+        let mut hasher = blake3::Hasher::new();
+        let mut file_size = 0u64;
+        for chunk in &chunks {
+            hasher.update(&chunk.data);
+            file_size += chunk.data.len() as u64;
+        }
+        let file_hash_hex = tcfs_chunks::hash_to_hex(&hasher.finalize());
+        Ok(UploadSnapshot {
+            file_hash_hex,
+            file_size,
+            source: UploadSourceSnapshot::Streaming(chunks),
+        })
+    } else {
+        let data = std::fs::read(local_path)
+            .with_context(|| format!("reading upload snapshot: {}", local_path.display()))?;
+        let file_hash_hex = tcfs_chunks::hash_to_hex(&tcfs_chunks::hash_bytes(&data));
+        Ok(UploadSnapshot {
+            file_hash_hex,
+            file_size: data.len() as u64,
+            source: UploadSourceSnapshot::InMemory(data),
+        })
+    }
+}
+
+fn ensure_source_matches_snapshot(
+    local_path: &Path,
+    snapshot: &UploadSnapshot,
+    stage: &str,
+) -> Result<()> {
+    let current_meta = std::fs::metadata(local_path)
+        .with_context(|| format!("stat during {stage}: {}", local_path.display()))?;
+    if current_meta.len() != snapshot.file_size {
+        anyhow::bail!(
+            "file changed during {stage}: size mismatch for {} (snapshot={} current={})",
+            local_path.display(),
+            snapshot.file_size,
+            current_meta.len()
+        );
+    }
+
+    let current_hash_hex = match snapshot.source {
+        UploadSourceSnapshot::InMemory(_) => {
+            let data = std::fs::read(local_path)
+                .with_context(|| format!("reading during {stage}: {}", local_path.display()))?;
+            tcfs_chunks::hash_to_hex(&tcfs_chunks::hash_bytes(&data))
+        }
+        UploadSourceSnapshot::Streaming(_) => {
+            let hash = tcfs_chunks::hash_file_streaming(local_path).with_context(|| {
+                format!("streaming hash during {stage}: {}", local_path.display())
+            })?;
+            tcfs_chunks::hash_to_hex(&hash)
+        }
+    };
+
+    if current_hash_hex != snapshot.file_hash_hex {
+        anyhow::bail!(
+            "file changed during {stage}: hash mismatch for {} (snapshot={} current={})",
+            local_path.display(),
+            snapshot.file_hash_hex,
+            current_hash_hex
+        );
+    }
+
+    Ok(())
 }
 
 /// Result of downloading a single file
@@ -121,6 +592,7 @@ pub async fn upload_file(
 
 /// Upload with device identity, vector clock awareness, and optional encryption.
 #[allow(unused_variables)]
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_file_with_device(
     op: &Operator,
     local_path: &Path,
@@ -131,8 +603,11 @@ pub async fn upload_file_with_device(
     rel_path: Option<&str>,
     encryption: OptionalEncryption<'_>,
 ) -> Result<UploadResult> {
+    let tracked_state = state.get(local_path).cloned();
+
     // Fast-path: check if file is already up-to-date
-    match state.needs_sync(local_path)? {
+    let sync_reason = state.needs_sync(local_path)?;
+    match sync_reason.as_deref() {
         None => {
             let cached = state.get(local_path).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -158,35 +633,31 @@ pub async fn upload_file_with_device(
     }
 
     // Tiered chunking: files below STREAMING_THRESHOLD are read into memory,
-    // larger files use streaming two-pass (hash, then chunk) to bound memory.
+    // larger files use streaming chunking. In both cases we derive the file
+    // hash from the same snapshot bytes that will be uploaded.
     let file_meta = std::fs::metadata(local_path)
         .with_context(|| format!("stat for chunking: {}", local_path.display()))?;
-    let file_size = file_meta.len();
-
-    let use_streaming = file_size >= tcfs_chunks::STREAMING_THRESHOLD;
-
-    // Pass 1: compute file hash
-    let file_hash_hex = if use_streaming {
-        let hash = tcfs_chunks::hash_file_streaming(local_path)
-            .with_context(|| format!("streaming hash: {}", local_path.display()))?;
-        tcfs_chunks::hash_to_hex(&hash)
-    } else {
-        // Small file: read fully, hash in memory
-        let data = std::fs::read(local_path)
-            .with_context(|| format!("reading for hash: {}", local_path.display()))?;
-        tcfs_chunks::hash_to_hex(&tcfs_chunks::hash_bytes(&data))
-    };
-
-    // Pass 2: chunk (deferred until after conflict check — may skip upload)
+    let use_streaming = file_meta.len() >= tcfs_chunks::STREAMING_THRESHOLD;
+    let snapshot = prepare_upload_snapshot(local_path, use_streaming)?;
+    let file_size = snapshot.file_size;
+    let file_hash_hex = snapshot.file_hash_hex.clone();
+    ensure_source_matches_snapshot(local_path, &snapshot, "upload preparation")?;
 
     // Build remote manifest path (using the file's content hash)
     let remote_manifest = format!("{remote_prefix}/manifests/{file_hash_hex}");
 
     // Get the local vclock from state (or start fresh)
-    let mut local_vclock = state
-        .get(local_path)
+    let mut local_vclock = tracked_state
+        .as_ref()
         .map(|s| s.vclock.clone())
         .unwrap_or_default();
+    let local_edit_inferred = !device_id.is_empty() && tracked_state.is_some();
+    if local_edit_inferred {
+        // The file changed relative to tracked local state, so model the
+        // pending upload as a descendant of the last synced version before
+        // comparing against the current rel_path index entry.
+        local_vclock.tick(device_id);
+    }
 
     // Conflict detection: find the current remote manifest for this rel_path.
     // First try the index entry (covers different-content conflicts), then
@@ -197,17 +668,12 @@ pub async fn upload_file_with_device(
         let remote_manifest_obj = if let Some(rp) = rel_path {
             // Look up the index entry to find what manifest is currently stored
             let index_key = format!("{}/index/{}", remote_prefix.trim_end_matches('/'), rp);
-            let idx_manifest = if let Ok(idx_bytes) = op.read(&index_key).await {
-                let idx_raw = idx_bytes.to_bytes();
-                let idx_str = String::from_utf8_lossy(&idx_raw);
-                // Parse "manifest_hash=<hash>\nsize=...\n"
-                idx_str
-                    .lines()
-                    .find_map(|l| l.strip_prefix("manifest_hash="))
-                    .map(|h| format!("{}/manifests/{}", remote_prefix.trim_end_matches('/'), h))
-            } else {
-                None
-            };
+            let manifest_prefix = manifest_path_prefix(remote_prefix);
+            let idx_manifest = resolve_visible_index_entry(op, &index_key, &manifest_prefix)
+                .await
+                .ok()
+                .flatten()
+                .map(|entry| manifest_key(&manifest_prefix, &entry.manifest_hash));
             // Read the manifest pointed to by the index entry
             if let Some(ref manifest_path) = idx_manifest {
                 if let Ok(remote_bytes) = op.read(manifest_path).await {
@@ -251,6 +717,7 @@ pub async fn upload_file_with_device(
 
             match &sync_outcome {
                 SyncOutcome::RemoteNewer => {
+                    ensure_source_matches_snapshot(local_path, &snapshot, "remote-newer skip")?;
                     return Ok(UploadResult {
                         path: local_path.to_path_buf(),
                         remote_path: remote_manifest.clone(),
@@ -262,6 +729,7 @@ pub async fn upload_file_with_device(
                     });
                 }
                 SyncOutcome::Conflict(ref conflict_info) => {
+                    ensure_source_matches_snapshot(local_path, &snapshot, "conflict skip")?;
                     // Record local state with conflict info so `tcfs resolve` can find it
                     let mut sync_state = make_sync_state_full(
                         local_path,
@@ -272,6 +740,7 @@ pub async fn upload_file_with_device(
                         device_id.to_string(),
                     )?;
                     sync_state.conflict = Some(conflict_info.clone());
+                    sync_state.status = FileSyncStatus::Conflict;
                     state.set(local_path, sync_state);
                     return Ok(UploadResult {
                         path: local_path.to_path_buf(),
@@ -284,6 +753,7 @@ pub async fn upload_file_with_device(
                     });
                 }
                 SyncOutcome::UpToDate => {
+                    ensure_source_matches_snapshot(local_path, &snapshot, "up-to-date skip")?;
                     // Content dedup — already up to date
                     let sync_state = make_sync_state_full(
                         local_path,
@@ -319,12 +789,31 @@ pub async fn upload_file_with_device(
         && op.exists(&remote_manifest).await.unwrap_or(false)
         && device_id.is_empty()
     {
+        ensure_source_matches_snapshot(local_path, &snapshot, "dedup skip")?;
         debug!(hash = %file_hash_hex, "dedup: manifest already exists");
+        let existing_manifest = op
+            .read(&remote_manifest)
+            .await
+            .with_context(|| format!("reading existing manifest for dedup: {remote_manifest}"))?;
+        let existing_manifest = SyncManifest::from_bytes(&existing_manifest.to_bytes())
+            .with_context(|| format!("parsing existing manifest for dedup: {remote_manifest}"))?;
+        let chunk_count = existing_manifest.chunk_hashes().len();
+
+        if let Some(rp) = rel_path {
+            publish_index_reference(
+                op,
+                remote_prefix,
+                rp,
+                RemoteIndexEntry::new(file_hash_hex.clone(), file_size, chunk_count),
+            )
+            .await?;
+        }
+
         let remote_path = remote_manifest.clone();
         let sync_state = make_sync_state_full(
             local_path,
             file_hash_hex.clone(),
-            0,
+            chunk_count,
             remote_path.clone(),
             local_vclock,
             device_id.to_string(),
@@ -334,7 +823,7 @@ pub async fn upload_file_with_device(
             path: local_path.to_path_buf(),
             remote_path,
             hash: file_hash_hex,
-            chunks: 0,
+            chunks: chunk_count,
             bytes: file_size,
             skipped: false,
             outcome: None,
@@ -342,12 +831,11 @@ pub async fn upload_file_with_device(
     }
 
     // Tick local vclock before writing
-    if !device_id.is_empty() {
+    if !device_id.is_empty() && !local_edit_inferred {
         local_vclock.tick(device_id);
     }
 
-    // Chunk the file (deferred until after conflict/dedup checks).
-    // Small files: read into memory. Large files: streaming chunker.
+    // Upload the prepared snapshot bytes after conflict/dedup checks.
     let mut chunk_hashes = Vec::new();
     let mut bytes_uploaded = 0u64;
     let num_chunks;
@@ -367,23 +855,11 @@ pub async fn upload_file_with_device(
     };
 
     if use_streaming {
-        // ── Streaming path: bounded memory for large files ─────────
+        // ── Streaming path: prepared snapshot chunks ─────────
         debug!(path = %local_path.display(), size = file_size, "using streaming chunker");
-
-        // Verify file hasn't changed between hash and chunk passes
-        let pre_chunk_meta = std::fs::metadata(local_path)
-            .with_context(|| format!("re-stat before streaming chunk: {}", local_path.display()))?;
-        if pre_chunk_meta.len() != file_size {
-            anyhow::bail!(
-                "file size changed between hash and chunk passes: {} ({} → {})",
-                local_path.display(),
-                file_size,
-                pre_chunk_meta.len()
-            );
-        }
-
-        let streaming_chunks = tcfs_chunks::chunk_file_streaming(local_path)
-            .with_context(|| format!("streaming chunk: {}", local_path.display()))?;
+        let UploadSourceSnapshot::Streaming(streaming_chunks) = &snapshot.source else {
+            unreachable!("streaming upload expected streaming snapshot")
+        };
 
         num_chunks = streaming_chunks.len();
         chunk_hashes.reserve(num_chunks);
@@ -410,9 +886,7 @@ pub async fn upload_file_with_device(
             let chunk_key = format!("{remote_prefix}/chunks/{chunk_hash_hex}");
 
             if !op.exists(&chunk_key).await.unwrap_or(false) {
-                op.write(&chunk_key, upload_data)
-                    .await
-                    .with_context(|| format!("uploading chunk {i}: {chunk_key}"))?;
+                write_chunk_with_retry(op, &chunk_key, upload_data, i).await?;
                 bytes_uploaded += chunk.data.len() as u64;
             }
 
@@ -427,9 +901,11 @@ pub async fn upload_file_with_device(
             }
         }
     } else {
-        // ── In-memory path: small files ───────────────────────────
-        let (chunks, data) = tcfs_chunks::chunk_file(local_path)
-            .with_context(|| format!("chunking: {}", local_path.display()))?;
+        // ── In-memory path: prepared snapshot bytes ───────────────
+        let UploadSourceSnapshot::InMemory(data) = &snapshot.source else {
+            unreachable!("in-memory upload expected in-memory snapshot")
+        };
+        let chunks = tcfs_chunks::chunk_data(data, tcfs_chunks::ChunkSizes::for_path(local_path));
 
         num_chunks = chunks.len();
         chunk_hashes.reserve(num_chunks);
@@ -468,9 +944,7 @@ pub async fn upload_file_with_device(
             let chunk_key = format!("{remote_prefix}/chunks/{chunk_hash_hex}");
 
             if !op.exists(&chunk_key).await.unwrap_or(false) {
-                op.write(&chunk_key, upload_data)
-                    .await
-                    .with_context(|| format!("uploading chunk {i}: {chunk_key}"))?;
+                write_chunk_with_retry(op, &chunk_key, upload_data, i).await?;
                 bytes_uploaded += chunk.length as u64;
             }
 
@@ -485,6 +959,8 @@ pub async fn upload_file_with_device(
             }
         }
     }
+
+    ensure_source_matches_snapshot(local_path, &snapshot, "manifest publish")?;
 
     // Wrap file key for manifest if encryption is enabled
     #[cfg(feature = "crypto")]
@@ -532,9 +1008,20 @@ pub async fn upload_file_with_device(
     };
 
     let manifest_bytes = manifest.to_bytes()?;
-    op.write(&remote_manifest, manifest_bytes)
-        .await
-        .with_context(|| format!("uploading manifest: {remote_manifest}"))?;
+    if let Some(rp) = rel_path {
+        publish_manifest_for_rel_path(
+            op,
+            remote_prefix,
+            rp,
+            manifest_bytes,
+            RemoteIndexEntry::new(file_hash_hex.clone(), file_size, num_chunks),
+        )
+        .await?;
+    } else {
+        op.write(&remote_manifest, manifest_bytes)
+            .await
+            .with_context(|| format!("uploading manifest: {remote_manifest}"))?;
+    }
 
     // Deferred vclock merge: only merge remote vclock after successful upload
     // to prevent stale vclocks if the upload had failed.
@@ -602,6 +1089,7 @@ pub async fn download_file(
 
 /// Download with device identity, vector clock merge, and optional decryption.
 #[allow(unused_variables)]
+#[allow(clippy::too_many_arguments)]
 pub async fn download_file_with_device(
     op: &Operator,
     remote_manifest: &str,
@@ -612,13 +1100,13 @@ pub async fn download_file_with_device(
     state: Option<&mut StateCache>,
     encryption: OptionalEncryption<'_>,
 ) -> Result<DownloadResult> {
-    // Read manifest
-    let manifest_bytes = op
-        .read(remote_manifest)
+    // Read manifest with retry so transient storage failures don't abort pull
+    // paths immediately while chunk reads already back off.
+    let manifest_bytes = read_with_retry(op, remote_manifest)
         .await
         .with_context(|| format!("reading manifest: {remote_manifest}"))?;
 
-    let manifest = SyncManifest::from_bytes(&manifest_bytes.to_bytes())
+    let manifest = SyncManifest::from_bytes(&manifest_bytes)
         .with_context(|| format!("parsing manifest: {remote_manifest}"))?;
 
     let chunk_hashes = manifest.chunk_hashes();
@@ -718,20 +1206,9 @@ pub async fn download_file_with_device(
 
     for (i, hash) in chunk_hashes.iter().enumerate() {
         let chunk_key = format!("{remote_prefix}/chunks/{hash}");
-        let chunk_data = op
-            .read(&chunk_key)
-            .await
-            .with_context(|| format!("downloading chunk {i}: {chunk_key}"))?;
 
-        let chunk_bytes = chunk_data.to_bytes();
-
-        // Verify chunk integrity: BLAKE3 hash must match the manifest entry
-        let actual_hash = tcfs_chunks::hash_to_hex(&tcfs_chunks::hash_bytes(&chunk_bytes));
-        if actual_hash != *hash {
-            anyhow::bail!(
-                "chunk integrity check failed for {chunk_key}: expected {hash}, got {actual_hash}"
-            );
-        }
+        // Download with retry + integrity verification
+        let chunk_bytes: Vec<u8> = read_chunk_with_retry(op, &chunk_key, hash, i).await?;
 
         // Decrypt chunk if file key is present
         #[cfg(feature = "crypto")]
@@ -739,11 +1216,11 @@ pub async fn download_file_with_device(
             tcfs_crypto::decrypt_chunk(fk, i as u64, fid, &chunk_bytes)
                 .with_context(|| format!("decrypting chunk {i}"))?
         } else {
-            chunk_bytes.to_vec()
+            chunk_bytes
         };
 
         #[cfg(not(feature = "crypto"))]
-        let plaintext = chunk_bytes.to_vec();
+        let plaintext = chunk_bytes;
 
         assembled.extend_from_slice(&plaintext);
 
@@ -854,6 +1331,7 @@ pub async fn push_tree(
 }
 
 /// Push tree with device identity, optional collection config, and optional encryption.
+#[allow(clippy::too_many_arguments)]
 pub async fn push_tree_with_device(
     op: &Operator,
     local_root: &Path,
@@ -869,12 +1347,12 @@ pub async fn push_tree_with_device(
     let mut bytes = 0u64;
 
     let cfg = collect_cfg.cloned().unwrap_or_default();
-    let files = collect_files(local_root, &cfg)?;
-    let total = files.len();
+    let result = collect_files(local_root, &cfg)?;
+    let total = result.files.len();
 
-    for (i, path) in files.iter().enumerate() {
+    for (i, path) in result.files.iter().enumerate() {
         let rel = path.strip_prefix(local_root).unwrap_or(path);
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let rel_str = normalize_rel_path_text(&rel.to_string_lossy());
 
         let msg = format!("[{}/{}] {}", i + 1, total, rel.display());
         if let Some(cb) = progress {
@@ -897,25 +1375,36 @@ pub async fn push_tree_with_device(
                 if result.skipped {
                     skipped += 1;
                 } else {
-                    // Write index entry only when the manifest was actually uploaded.
-                    // Skipped files (RemoteNewer, UpToDate, Conflict) already have
-                    // a valid index entry, and writing one with the local hash would
-                    // create an orphan pointing to a non-existent manifest.
-                    let index_key =
-                        format!("{}/index/{}", remote_path_prefix(remote_prefix), rel_str);
-                    let index_entry = format!(
-                        "manifest_hash={}\nsize={}\nchunks={}\n",
-                        result.hash, result.bytes, result.chunks
-                    );
-                    if let Err(e) = op.write(&index_key, index_entry.into_bytes()).await {
-                        warn!(path = %path.display(), "failed to write index entry: {e}");
-                    }
+                    // Path publication is owned by upload_file_with_device so
+                    // the manifest and index sequence stays crash-aware.
                     uploaded += 1;
                     bytes += result.bytes;
                 }
             }
             Err(e) => {
                 warn!(path = %path.display(), "upload failed: {e}");
+            }
+        }
+    }
+
+    // Write `.tcfs_dir` markers for empty directories
+    for dir in &result.empty_dirs {
+        // Skip the root itself — it's never "empty" in the sync sense
+        if dir == local_root {
+            continue;
+        }
+        if let Ok(rel) = dir.strip_prefix(local_root) {
+            let rel_str = normalize_rel_path_text(&rel.to_string_lossy());
+            let marker_key = format!(
+                "{}/index/{}/.tcfs_dir",
+                remote_path_prefix(remote_prefix),
+                rel_str
+            );
+            let marker_content = b"type=directory\n";
+            if let Err(e) = op.write(&marker_key, marker_content.to_vec()).await {
+                warn!(dir = %dir.display(), "failed to write empty dir marker: {e}");
+            } else {
+                debug!(dir = %rel_str, "wrote empty directory marker");
             }
         }
     }
@@ -927,8 +1416,13 @@ pub async fn push_tree_with_device(
 }
 
 /// Collect all regular files under `root` recursively, respecting config.
-pub fn collect_files(root: &Path, config: &CollectConfig) -> Result<Vec<PathBuf>> {
+///
+/// When `config.sync_empty_dirs` is true, also collects directories that
+/// contain no files (after exclusion rules) so callers can create `.tcfs_dir`
+/// marker objects in the remote index.
+pub fn collect_files(root: &Path, config: &CollectConfig) -> Result<CollectResult> {
     let mut files = Vec::new();
+    let mut empty_dirs = Vec::new();
     let exclude_matchers: Vec<glob::Pattern> = config
         .exclude_patterns
         .iter()
@@ -939,18 +1433,29 @@ pub fn collect_files(root: &Path, config: &CollectConfig) -> Result<Vec<PathBuf>
     if let Ok(canon) = std::fs::canonicalize(root) {
         visited.insert(canon);
     }
-    collect_files_inner(root, &mut files, config, &exclude_matchers, &mut visited)?;
+    collect_files_inner(
+        root,
+        &mut files,
+        &mut empty_dirs,
+        config,
+        &exclude_matchers,
+        &mut visited,
+    )?;
     files.sort(); // deterministic order
-    Ok(files)
+    empty_dirs.sort();
+    Ok(CollectResult { files, empty_dirs })
 }
 
 fn collect_files_inner(
     dir: &Path,
     out: &mut Vec<PathBuf>,
+    empty_dirs: &mut Vec<PathBuf>,
     config: &CollectConfig,
     excludes: &[glob::Pattern],
     visited: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<()> {
+    let before = out.len();
+
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("reading dir: {}", dir.display()))?
     {
@@ -992,7 +1497,9 @@ fn collect_files_inner(
                         // Check what the resolved target actually is
                         match std::fs::metadata(&real) {
                             Ok(meta) if meta.is_dir() => {
-                                collect_files_inner(&path, out, config, excludes, visited)?;
+                                collect_files_inner(
+                                    &path, out, empty_dirs, config, excludes, visited,
+                                )?;
                             }
                             Ok(meta) if meta.is_file() => {
                                 out.push(path);
@@ -1053,7 +1560,7 @@ fn collect_files_inner(
                             continue;
                         }
                         // In raw mode, recurse into .git
-                        collect_files_inner(&path, out, config, excludes, visited)?;
+                        collect_files_inner(&path, out, empty_dirs, config, excludes, visited)?;
                     }
                     continue;
                 }
@@ -1063,12 +1570,19 @@ fn collect_files_inner(
                     continue;
                 }
 
-                collect_files_inner(&path, out, config, excludes, visited)?;
+                collect_files_inner(&path, out, empty_dirs, config, excludes, visited)?;
             } else if ft.is_file() {
                 out.push(path);
             }
         }
     }
+
+    // If no files were collected from this directory (directly or via
+    // subdirectories) and we're tracking empty dirs, record it as empty.
+    if config.sync_empty_dirs && out.len() == before {
+        empty_dirs.push(dir.to_path_buf());
+    }
+
     Ok(())
 }
 
@@ -1077,6 +1591,14 @@ fn collect_files_inner(
 /// - If `sync_root` is provided and the path is under it, returns the relative path.
 /// - Otherwise strips the leading `/` from absolute paths, or returns relative paths as-is.
 /// - Replaces `\` with `/` for cross-platform consistency.
+pub(crate) fn normalize_rel_path_text(path: &str) -> String {
+    path.replace('\\', "/")
+        .split('/')
+        .map(|component| component.nfc().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 pub fn normalize_rel_path(path: &Path, sync_root: Option<&Path>) -> String {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
@@ -1096,7 +1618,7 @@ pub fn normalize_rel_path(path: &Path, sync_root: Option<&Path>) -> String {
         canonical
     };
 
-    rel.to_string_lossy().replace('\\', "/")
+    normalize_rel_path_text(&rel.to_string_lossy())
 }
 
 /// Resolve a file path or manifest path to the actual S3 manifest path.
@@ -1125,15 +1647,9 @@ pub async fn resolve_manifest_path(
     let rel = normalize_rel_path(Path::new(input), sync_root);
     let index_key = format!("{prefix}/index/{rel}");
 
-    if let Ok(idx_bytes) = op.read(&index_key).await {
-        let idx_raw = idx_bytes.to_bytes();
-        let idx_str = String::from_utf8_lossy(&idx_raw);
-        if let Some(manifest_hash) = idx_str
-            .lines()
-            .find_map(|l| l.strip_prefix("manifest_hash="))
-        {
-            return Ok(format!("{prefix}/manifests/{manifest_hash}"));
-        }
+    let manifest_prefix = manifest_path_prefix(prefix);
+    if let Ok(Some(entry)) = resolve_visible_index_entry(op, &index_key, &manifest_prefix).await {
+        return Ok(manifest_key(&manifest_prefix, &entry.manifest_hash));
     }
 
     // Try 2: Search index entries for a matching filename.
@@ -1143,6 +1659,7 @@ pub async fn resolve_manifest_path(
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| input.to_string());
+    let filename = normalize_rel_path_text(&filename);
 
     let index_prefix = format!("{prefix}/index/");
     let entries = op
@@ -1153,15 +1670,10 @@ pub async fn resolve_manifest_path(
     for entry in entries {
         let entry_path = entry.path();
         if entry_path.ends_with(&format!("/{filename}")) || entry_path.ends_with(&filename) {
-            if let Ok(idx_bytes) = op.read(entry_path).await {
-                let idx_raw = idx_bytes.to_bytes();
-                let idx_str = String::from_utf8_lossy(&idx_raw);
-                if let Some(manifest_hash) = idx_str
-                    .lines()
-                    .find_map(|l| l.strip_prefix("manifest_hash="))
-                {
-                    return Ok(format!("{prefix}/manifests/{manifest_hash}"));
-                }
+            if let Ok(Some(entry)) =
+                resolve_visible_index_entry(op, entry_path, &manifest_prefix).await
+            {
+                return Ok(manifest_key(&manifest_prefix, &entry.manifest_hash));
             }
         }
     }
@@ -1186,43 +1698,42 @@ pub async fn delete_remote_file(
     state: &mut StateCache,
     sync_root: Option<&Path>,
 ) -> Result<()> {
+    let rel_path = normalize_rel_path_text(rel_path.trim_start_matches('/'));
     let prefix = remote_prefix.trim_end_matches('/');
     let index_key = format!("{prefix}/index/{rel_path}");
-
-    // Read index to find manifest hash
-    let idx_raw = op
-        .read(&index_key)
-        .await
-        .with_context(|| format!("reading index entry: {index_key}"))?
-        .to_bytes();
-
-    let idx_str = String::from_utf8_lossy(&idx_raw);
-    let manifest_hash = idx_str
-        .lines()
-        .find_map(|l| l.strip_prefix("manifest_hash="))
-        .ok_or_else(|| anyhow::anyhow!("index entry missing manifest_hash: {index_key}"))?
-        .to_string();
-
-    let manifest_key = format!("{prefix}/manifests/{manifest_hash}");
+    let manifest_prefix = manifest_path_prefix(prefix);
+    let parsed = read_index_entry_record_from_store(op, &index_key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing index entry: {index_key}"))?;
+    let current_manifest = parsed
+        .visible_entry()
+        .map(|entry| manifest_key(&manifest_prefix, &entry.manifest_hash));
+    let referenced_keys = parsed.referenced_object_keys(&manifest_prefix);
 
     // Delete index entry and manifest
     op.delete(&index_key)
         .await
         .with_context(|| format!("deleting index entry: {index_key}"))?;
-    op.delete(&manifest_key)
-        .await
-        .with_context(|| format!("deleting manifest: {manifest_key}"))?;
+    for object_key in referenced_keys {
+        if Some(object_key.as_str()) == current_manifest.as_deref() {
+            op.delete(&object_key)
+                .await
+                .with_context(|| format!("deleting manifest: {object_key}"))?;
+        } else if let Err(e) = op.delete(&object_key).await {
+            debug!(rel_path = %rel_path, object = %object_key, "best-effort delete failed: {e}");
+        }
+    }
 
-    info!(rel_path = %rel_path, manifest = %manifest_hash, "deleted remote file");
+    info!(rel_path = %rel_path, "deleted remote file");
 
     // Remove from state cache
     let local_path = sync_root
-        .map(|r| r.join(rel_path))
-        .unwrap_or_else(|| PathBuf::from(rel_path));
+        .map(|r| r.join(&rel_path))
+        .unwrap_or_else(|| PathBuf::from(&rel_path));
     state.remove(&local_path);
 
     // Also try to remove by searching the cache (handles path normalization mismatches)
-    if let Some((key, _)) = state.get_by_rel_path(rel_path) {
+    if let Some((key, _)) = state.get_by_rel_path(&rel_path) {
         let key_owned = key.to_string();
         state.remove(Path::new(&key_owned));
     }
@@ -1235,4 +1746,1021 @@ pub async fn delete_remote_file(
 /// Normalize a remote prefix: ensure it doesn't have trailing slash
 fn remote_path_prefix(prefix: &str) -> String {
     prefix.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index_entry::{
+        parse_index_entry_record, write_committed_index_entry, IndexEntryState, ParsedIndexEntry,
+    };
+    use opendal::services::Memory;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn memory_op() -> Operator {
+        Operator::new(Memory::default()).unwrap().finish()
+    }
+
+    fn default_config() -> CollectConfig {
+        CollectConfig::default()
+    }
+
+    fn no_empty_dirs_config() -> CollectConfig {
+        CollectConfig {
+            sync_empty_dirs: false,
+            ..Default::default()
+        }
+    }
+
+    fn test_manifest_bytes(file_hash: &str, file_size: u64) -> Vec<u8> {
+        format!(
+            r#"{{"version":2,"file_hash":"{file_hash}","file_size":{file_size},"chunks":[],"vclock":{{"clocks":{{}}}},"written_by":"tester","written_at":0}}"#
+        )
+        .into_bytes()
+    }
+
+    async fn staging_manifest_keys(op: &Operator) -> Vec<String> {
+        op.list("data/staging/manifests/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path().to_string())
+            .collect()
+    }
+
+    // ── collect_files (empty dir detection) ──────────────────────────────
+    #[test]
+    fn collect_finds_empty_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create structure: root/a/file.txt, root/empty/, root/nested/also_empty/
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/file.txt"), b"content").unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("nested/also_empty")).unwrap();
+
+        let result = collect_files(root, &default_config()).unwrap();
+
+        assert_eq!(result.files.len(), 1);
+        assert!(result.files[0].ends_with("a/file.txt"));
+
+        // empty/ and nested/also_empty/ should be detected as empty dirs
+        // nested/ itself also has no files (its only child is also_empty/ which is empty)
+        let empty_names: Vec<String> = result
+            .empty_dirs
+            .iter()
+            .map(|d| d.strip_prefix(root).unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            empty_names.contains(&"empty".to_string()),
+            "should detect empty/ as empty dir, got: {:?}",
+            empty_names
+        );
+        assert!(
+            empty_names.contains(&"nested/also_empty".to_string()),
+            "should detect nested/also_empty/ as empty dir, got: {:?}",
+            empty_names
+        );
+    }
+
+    #[test]
+    fn collect_skips_empty_dirs_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(root.join("file.txt"), b"data").unwrap();
+
+        let result = collect_files(root, &no_empty_dirs_config()).unwrap();
+
+        assert_eq!(result.files.len(), 1);
+        assert!(
+            result.empty_dirs.is_empty(),
+            "empty_dirs should be empty when sync_empty_dirs=false"
+        );
+    }
+
+    #[test]
+    fn collect_dir_with_file_not_marked_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("has_file")).unwrap();
+        std::fs::write(root.join("has_file/doc.txt"), b"hello").unwrap();
+
+        let result = collect_files(root, &default_config()).unwrap();
+
+        assert_eq!(result.files.len(), 1);
+        // has_file/ contains a file, so it should NOT appear in empty_dirs
+        assert!(
+            !result.empty_dirs.iter().any(|d| d.ends_with("has_file")),
+            "directory with files should not be in empty_dirs"
+        );
+    }
+
+    #[test]
+    fn collect_root_not_marked_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Completely empty root
+        let result = collect_files(root, &default_config()).unwrap();
+
+        assert!(result.files.is_empty());
+        // Root itself should be in empty_dirs (it's empty), but push_tree
+        // skips it. The collector doesn't special-case root.
+        // Actually root IS recorded — push_tree_with_device skips it.
+    }
+
+    #[test]
+    fn collect_excluded_dir_not_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create structure: root/target/ (excluded by hardcoded rule)
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::create_dir_all(root.join("real_empty")).unwrap();
+        std::fs::write(root.join("file.txt"), b"data").unwrap();
+
+        let result = collect_files(root, &default_config()).unwrap();
+
+        let empty_names: Vec<String> = result
+            .empty_dirs
+            .iter()
+            .map(|d| d.strip_prefix(root).unwrap().to_string_lossy().to_string())
+            .collect();
+
+        // target/ is excluded entirely, so it shouldn't appear
+        assert!(
+            !empty_names.contains(&"target".to_string()),
+            "excluded dirs should not appear in empty_dirs"
+        );
+        // real_empty/ should appear
+        assert!(
+            empty_names.contains(&"real_empty".to_string()),
+            "real empty dir should be detected"
+        );
+    }
+
+    // ── normalize_rel_path ───────────────────────────────────────────────
+
+    #[test]
+    fn normalize_rel_path_relative_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        // With sync_root set, file under root → relative
+        let result = normalize_rel_path(&file, Some(dir.path()));
+        assert_eq!(result, "doc.txt");
+    }
+
+    #[test]
+    fn normalize_rel_path_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        let file = dir.path().join("a/b/deep.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let result = normalize_rel_path(&file, Some(dir.path()));
+        assert_eq!(result, "a/b/deep.txt");
+    }
+
+    #[test]
+    fn normalize_rel_path_no_sync_root_strips_leading_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let result = normalize_rel_path(&file, None);
+        // Absolute path should have leading / stripped
+        assert!(!result.starts_with('/'), "should strip leading /: {result}");
+        assert!(result.ends_with("file.txt"));
+    }
+
+    #[test]
+    fn normalize_rel_path_normalizes_decomposed_unicode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cafe\u{301}.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let result = normalize_rel_path(&file, Some(dir.path()));
+        assert_eq!(result, "caf\u{e9}.txt");
+    }
+
+    // ── resolve_manifest_path ─────────────────────────────────────────��──
+
+    #[tokio::test]
+    async fn resolve_manifest_passthrough() {
+        let op = memory_op();
+        let result = resolve_manifest_path(&op, "data/manifests/abc123", "data", None)
+            .await
+            .unwrap();
+        assert_eq!(result, "data/manifests/abc123");
+    }
+
+    #[tokio::test]
+    async fn resolve_manifest_from_index() {
+        let op = memory_op();
+        // Write an index entry
+        op.write(
+            "data/index/doc.txt",
+            RemoteIndexEntry::new("abc123", 100, 1).to_legacy_bytes(),
+        )
+        .await
+        .unwrap();
+        op.write(
+            "data/manifests/abc123",
+            br#"{"version":2,"file_hash":"abc123","file_size":100,"chunks":[],"vclock":{"clocks":{}},"written_by":"neo","written_at":0}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_manifest_path(&op, "doc.txt", "data", None)
+            .await
+            .unwrap();
+        assert_eq!(result, "data/manifests/abc123");
+    }
+
+    #[tokio::test]
+    async fn resolve_manifest_filename_search_normalizes_unicode() {
+        let op = memory_op();
+        op.write(
+            "data/index/caf\u{e9}.txt",
+            RemoteIndexEntry::new("abc123", 100, 1).to_legacy_bytes(),
+        )
+        .await
+        .unwrap();
+        op.write(
+            "data/manifests/abc123",
+            br#"{"version":2,"file_hash":"abc123","file_size":100,"chunks":[],"vclock":{"clocks":{}},"written_by":"neo","written_at":0}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let host_a = tempfile::tempdir().unwrap();
+        let host_b = tempfile::tempdir().unwrap();
+        let input = host_a.path().join("cafe\u{301}.txt");
+
+        let result =
+            resolve_manifest_path(&op, &input.to_string_lossy(), "data", Some(host_b.path()))
+                .await
+                .unwrap();
+        assert_eq!(result, "data/manifests/abc123");
+    }
+
+    #[tokio::test]
+    async fn resolve_manifest_missing_errors() {
+        let op = memory_op();
+        let result = resolve_manifest_path(&op, "nonexistent.txt", "data", None).await;
+        assert!(result.is_err());
+    }
+
+    // ── delete_remote_file ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_remote_file_removes_index_and_manifest() {
+        let op = memory_op();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = StateCache::open(&state_path).unwrap();
+
+        // Write index and manifest
+        op.write(
+            "data/index/file.txt",
+            RemoteIndexEntry::new("abc123", 100, 1).to_legacy_bytes(),
+        )
+        .await
+        .unwrap();
+        op.write(
+            "data/manifests/abc123",
+            br#"{"version":2,"file_hash":"abc123","file_size":100,"chunks":[],"vclock":{"clocks":{}},"written_by":"neo","written_at":0}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+
+        delete_remote_file(&op, "file.txt", "data", &mut state, None)
+            .await
+            .unwrap();
+
+        // Both should be gone
+        assert!(op.read("data/index/file.txt").await.is_err());
+        assert!(op.read("data/manifests/abc123").await.is_err());
+    }
+
+    // ── upload + download roundtrip (memory operator) ────────────────────
+
+    #[tokio::test]
+    async fn upload_download_roundtrip_small_file() {
+        let op = memory_op();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = StateCache::open(&state_path).unwrap();
+
+        // Write a small local file
+        let local = dir.path().join("hello.txt");
+        std::fs::write(&local, b"hello world").unwrap();
+
+        // Upload
+        let up = upload_file(&op, &local, "data", &mut state, None)
+            .await
+            .unwrap();
+        assert!(!up.skipped);
+        assert_eq!(up.bytes, 11);
+        assert!(!up.hash.is_empty());
+
+        // Download to a different location
+        let dl_path = dir.path().join("downloaded.txt");
+        let dl = download_file(&op, &up.remote_path, &dl_path, "data", None)
+            .await
+            .unwrap();
+        assert_eq!(dl.bytes, 11);
+
+        // Verify content matches
+        let content = std::fs::read_to_string(&dl_path).unwrap();
+        assert_eq!(content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn upload_file_with_device_publishes_committed_v2_index() {
+        let op = memory_op();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = StateCache::open(&state_path).unwrap();
+
+        let local = dir.path().join("hello.txt");
+        std::fs::write(&local, b"hello index").unwrap();
+
+        let upload = upload_file_with_device(
+            &op,
+            &local,
+            "data",
+            &mut state,
+            None,
+            "device-1",
+            Some("hello.txt"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index_bytes = op.read("data/index/hello.txt").await.unwrap().to_vec();
+        match crate::index_entry::parse_index_entry_record(&index_bytes).unwrap() {
+            crate::index_entry::ParsedIndexEntry::Legacy(_) => {
+                panic!("expected committed v2 index entry")
+            }
+            crate::index_entry::ParsedIndexEntry::V2(entry) => {
+                assert_eq!(entry.state, crate::index_entry::IndexEntryState::Committed);
+                let current = entry.current.expect("current committed entry");
+                assert_eq!(current.manifest_hash, upload.hash);
+                assert_eq!(current.size, upload.bytes);
+                assert_eq!(current.chunks, upload.chunks);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_file_with_device_marks_conflict_status() {
+        let op = memory_op();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = StateCache::open(&state_path).unwrap();
+
+        let local = dir.path().join("hello.txt");
+        std::fs::write(&local, b"hello base").unwrap();
+
+        let mut local_vclock = crate::conflict::VectorClock::new();
+        local_vclock.tick("device-1");
+        state.set(
+            &local,
+            crate::state::SyncState {
+                blake3: "basehash123".into(),
+                size: 10,
+                mtime: 0,
+                chunk_count: 0,
+                remote_path: "data/manifests/basehash123".into(),
+                last_synced: 0,
+                vclock: local_vclock,
+                device_id: "device-1".into(),
+                conflict: None,
+                status: FileSyncStatus::Synced,
+            },
+        );
+
+        std::fs::write(&local, b"hello local").unwrap();
+
+        let remote_manifest_hash = "remotehash123";
+        op.write(
+            &format!("data/manifests/{remote_manifest_hash}"),
+            br#"{"version":2,"file_hash":"remotehash123","file_size":12,"chunks":[],"vclock":{"clocks":{"device-2":1}},"written_by":"device-2","written_at":1}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+        write_committed_index_entry(
+            &op,
+            "data/index/hello.txt",
+            &crate::index_entry::RemoteIndexEntry::new(remote_manifest_hash, 12, 0),
+        )
+        .await
+        .unwrap();
+
+        let result = upload_file_with_device(
+            &op,
+            &local,
+            "data",
+            &mut state,
+            None,
+            "device-1",
+            Some("hello.txt"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.skipped);
+        assert!(matches!(result.outcome, Some(SyncOutcome::Conflict(_))));
+
+        let entry = state.get(&local).expect("conflicted state entry");
+        assert_eq!(entry.status, FileSyncStatus::Conflict);
+        assert!(
+            entry.conflict.is_some(),
+            "conflict payload should be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_upload_retry_succeeds_after_transient_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delays = Arc::new(Mutex::new(Vec::new()));
+
+        write_chunk_with_retry_inner(
+            "data/chunks/abc123",
+            0,
+            {
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            anyhow::bail!("transient write failure");
+                        }
+                        Ok(())
+                    }
+                }
+            },
+            {
+                let delays = delays.clone();
+                move |delay| {
+                    delays.lock().unwrap().push(delay);
+                    std::future::ready(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *delays.lock().unwrap(),
+            vec![std::time::Duration::from_millis(100)]
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_upload_retry_exhausts_without_sleeping_after_last_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delays = Arc::new(Mutex::new(Vec::new()));
+
+        let err = write_chunk_with_retry_inner(
+            "data/chunks/abc123",
+            0,
+            {
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        anyhow::bail!("persistent write failure");
+                    }
+                }
+            },
+            {
+                let delays = delays.clone();
+                move |delay| {
+                    delays.lock().unwrap().push(delay);
+                    std::future::ready(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("uploading chunk 0: data/chunks/abc123"));
+        assert_eq!(attempts.load(Ordering::SeqCst), CHUNK_MAX_RETRIES as usize);
+        assert_eq!(
+            *delays.lock().unwrap(),
+            vec![
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(200),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_read_retry_succeeds_after_transient_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delays = Arc::new(Mutex::new(Vec::new()));
+
+        let bytes = read_with_retry_inner(
+            "data/manifests/doc.json",
+            {
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            anyhow::bail!("transient read failure");
+                        }
+                        Ok(b"manifest".to_vec())
+                    }
+                }
+            },
+            {
+                let delays = delays.clone();
+                move |delay| {
+                    delays.lock().unwrap().push(delay);
+                    std::future::ready(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, b"manifest".to_vec());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *delays.lock().unwrap(),
+            vec![std::time::Duration::from_millis(100)]
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_read_retry_exhausts_after_expected_attempts() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delays = Arc::new(Mutex::new(Vec::new()));
+
+        let err = read_with_retry_inner(
+            "data/manifests/doc.json",
+            {
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        anyhow::bail!("persistent read failure");
+                    }
+                }
+            },
+            {
+                let delays = delays.clone();
+                move |delay| {
+                    delays.lock().unwrap().push(delay);
+                    std::future::ready(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("reading: data/manifests/doc.json"));
+        assert_eq!(attempts.load(Ordering::SeqCst), CHUNK_MAX_RETRIES as usize);
+        assert_eq!(
+            *delays.lock().unwrap(),
+            vec![
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(200),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_download_retry_succeeds_after_transient_transport_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let payload = b"hello retry".to_vec();
+        let expected_hash = tcfs_chunks::hash_to_hex(&tcfs_chunks::hash_bytes(&payload));
+
+        let bytes = read_chunk_with_retry_inner(
+            "data/chunks/abc123",
+            &expected_hash,
+            0,
+            {
+                let attempts = attempts.clone();
+                let payload = payload.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    let payload = payload.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            anyhow::bail!("transient transport failure");
+                        }
+                        Ok(payload)
+                    }
+                }
+            },
+            {
+                let delays = delays.clone();
+                move |delay| {
+                    delays.lock().unwrap().push(delay);
+                    std::future::ready(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, payload);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *delays.lock().unwrap(),
+            vec![std::time::Duration::from_millis(100)]
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_download_retry_recovers_after_integrity_mismatch() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let good = b"hello integrity".to_vec();
+        let expected_hash = tcfs_chunks::hash_to_hex(&tcfs_chunks::hash_bytes(&good));
+
+        let bytes = read_chunk_with_retry_inner(
+            "data/chunks/abc123",
+            &expected_hash,
+            0,
+            {
+                let attempts = attempts.clone();
+                let good = good.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    let good = good.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            return Ok(b"corrupted".to_vec());
+                        }
+                        Ok(good)
+                    }
+                }
+            },
+            {
+                let delays = delays.clone();
+                move |delay| {
+                    delays.lock().unwrap().push(delay);
+                    std::future::ready(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, good);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *delays.lock().unwrap(),
+            vec![std::time::Duration::from_millis(100)]
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_crash_after_staged_write_preserves_existing_visible_manifest() {
+        let op = memory_op();
+        let old = RemoteIndexEntry::new("old123", 10, 1);
+        let old_manifest_key = manifest_key("data/manifests", &old.manifest_hash);
+        op.write(
+            &old_manifest_key,
+            test_manifest_bytes(&old.manifest_hash, old.size),
+        )
+        .await
+        .unwrap();
+        write_committed_index_entry(&op, "data/index/doc.txt", &old)
+            .await
+            .unwrap();
+
+        let err = publish_manifest_for_rel_path_with_hook(
+            &op,
+            "data",
+            "doc.txt",
+            test_manifest_bytes("new456", 11),
+            RemoteIndexEntry::new("new456", 11, 1),
+            |stage| {
+                if stage == PublishStage::StagedManifest {
+                    return Err(anyhow::anyhow!("injected crash after staged manifest"));
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("injected crash"));
+
+        assert_eq!(
+            resolve_manifest_path(&op, "doc.txt", "data", None)
+                .await
+                .unwrap(),
+            "data/manifests/old123"
+        );
+        assert!(!op.exists("data/manifests/new456").await.unwrap());
+        assert_eq!(staging_manifest_keys(&op).await.len(), 1);
+
+        match parse_index_entry_record(&op.read("data/index/doc.txt").await.unwrap().to_vec())
+            .unwrap()
+        {
+            ParsedIndexEntry::Legacy(_) => panic!("expected committed v2 index entry"),
+            ParsedIndexEntry::V2(entry) => {
+                assert_eq!(entry.state, IndexEntryState::Committed);
+                assert_eq!(entry.current.unwrap().manifest_hash, "old123");
+                assert!(entry.pending.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_crash_after_preparing_write_rolls_forward_new_path_on_read() {
+        let op = memory_op();
+
+        let err = publish_manifest_for_rel_path_with_hook(
+            &op,
+            "data",
+            "doc.txt",
+            test_manifest_bytes("new456", 11),
+            RemoteIndexEntry::new("new456", 11, 1),
+            |stage| {
+                if stage == PublishStage::PreparingIndex {
+                    return Err(anyhow::anyhow!("injected crash after preparing index"));
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("injected crash"));
+        assert!(!op.exists("data/manifests/new456").await.unwrap());
+        assert_eq!(staging_manifest_keys(&op).await.len(), 1);
+
+        match parse_index_entry_record(&op.read("data/index/doc.txt").await.unwrap().to_vec())
+            .unwrap()
+        {
+            ParsedIndexEntry::Legacy(_) => panic!("expected preparing v2 index entry"),
+            ParsedIndexEntry::V2(entry) => {
+                assert_eq!(entry.state, IndexEntryState::Preparing);
+                assert!(entry.current.is_none());
+                assert_eq!(entry.pending.unwrap().manifest_hash, "new456");
+            }
+        }
+
+        assert_eq!(
+            resolve_manifest_path(&op, "doc.txt", "data", None)
+                .await
+                .unwrap(),
+            "data/manifests/new456"
+        );
+        assert!(op.exists("data/manifests/new456").await.unwrap());
+        assert!(staging_manifest_keys(&op).await.is_empty());
+
+        match parse_index_entry_record(&op.read("data/index/doc.txt").await.unwrap().to_vec())
+            .unwrap()
+        {
+            ParsedIndexEntry::Legacy(_) => panic!("expected committed v2 index entry"),
+            ParsedIndexEntry::V2(entry) => {
+                assert_eq!(entry.state, IndexEntryState::Committed);
+                assert_eq!(entry.current.unwrap().manifest_hash, "new456");
+                assert!(entry.pending.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_crash_after_final_manifest_write_commits_pending_on_read() {
+        let op = memory_op();
+        let old = RemoteIndexEntry::new("old123", 10, 1);
+        let old_manifest_key = manifest_key("data/manifests", &old.manifest_hash);
+        op.write(
+            &old_manifest_key,
+            test_manifest_bytes(&old.manifest_hash, old.size),
+        )
+        .await
+        .unwrap();
+        write_committed_index_entry(&op, "data/index/doc.txt", &old)
+            .await
+            .unwrap();
+
+        let err = publish_manifest_for_rel_path_with_hook(
+            &op,
+            "data",
+            "doc.txt",
+            test_manifest_bytes("new456", 11),
+            RemoteIndexEntry::new("new456", 11, 1),
+            |stage| {
+                if stage == PublishStage::FinalManifest {
+                    return Err(anyhow::anyhow!("injected crash after final manifest"));
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("injected crash"));
+        assert!(op.exists("data/manifests/new456").await.unwrap());
+        assert_eq!(staging_manifest_keys(&op).await.len(), 1);
+
+        match parse_index_entry_record(&op.read("data/index/doc.txt").await.unwrap().to_vec())
+            .unwrap()
+        {
+            ParsedIndexEntry::Legacy(_) => panic!("expected preparing v2 index entry"),
+            ParsedIndexEntry::V2(entry) => {
+                assert_eq!(entry.state, IndexEntryState::Preparing);
+                assert_eq!(entry.current.unwrap().manifest_hash, "old123");
+                assert_eq!(entry.pending.unwrap().manifest_hash, "new456");
+            }
+        }
+
+        assert_eq!(
+            resolve_manifest_path(&op, "doc.txt", "data", None)
+                .await
+                .unwrap(),
+            "data/manifests/new456"
+        );
+        assert!(staging_manifest_keys(&op).await.is_empty());
+
+        match parse_index_entry_record(&op.read("data/index/doc.txt").await.unwrap().to_vec())
+            .unwrap()
+        {
+            ParsedIndexEntry::Legacy(_) => panic!("expected committed v2 index entry"),
+            ParsedIndexEntry::V2(entry) => {
+                assert_eq!(entry.state, IndexEntryState::Committed);
+                assert_eq!(entry.current.unwrap().manifest_hash, "new456");
+                assert!(entry.pending.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_crash_after_committed_write_keeps_new_manifest_visible() {
+        let op = memory_op();
+
+        let err = publish_manifest_for_rel_path_with_hook(
+            &op,
+            "data",
+            "doc.txt",
+            test_manifest_bytes("new456", 11),
+            RemoteIndexEntry::new("new456", 11, 1),
+            |stage| {
+                if stage == PublishStage::CommittedIndex {
+                    return Err(anyhow::anyhow!("injected crash after committed index"));
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("injected crash"));
+
+        assert_eq!(
+            resolve_manifest_path(&op, "doc.txt", "data", None)
+                .await
+                .unwrap(),
+            "data/manifests/new456"
+        );
+        assert!(op.exists("data/manifests/new456").await.unwrap());
+        assert_eq!(staging_manifest_keys(&op).await.len(), 1);
+
+        match parse_index_entry_record(&op.read("data/index/doc.txt").await.unwrap().to_vec())
+            .unwrap()
+        {
+            ParsedIndexEntry::Legacy(_) => panic!("expected committed v2 index entry"),
+            ParsedIndexEntry::V2(entry) => {
+                assert_eq!(entry.state, IndexEntryState::Committed);
+                assert_eq!(entry.current.unwrap().manifest_hash, "new456");
+                assert!(entry.pending.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_skips_when_already_synced() {
+        let op = memory_op();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = StateCache::open(&state_path).unwrap();
+
+        let local = dir.path().join("file.txt");
+        std::fs::write(&local, b"content").unwrap();
+
+        // First upload
+        let up1 = upload_file(&op, &local, "data", &mut state, None)
+            .await
+            .unwrap();
+        assert!(!up1.skipped);
+
+        // Second upload of same file — should skip (dedup)
+        let up2 = upload_file(&op, &local, "data", &mut state, None)
+            .await
+            .unwrap();
+        assert!(up2.skipped, "second upload of unchanged file should skip");
+    }
+
+    #[tokio::test]
+    async fn upload_fails_if_file_changes_during_chunk_upload() {
+        let op = memory_op();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = StateCache::open(&state_path).unwrap();
+
+        let original = b"hello world";
+        let local = dir.path().join("file.txt");
+        std::fs::write(&local, original).unwrap();
+
+        let mutated = b"jello world";
+        let expected_manifest = format!(
+            "data/manifests/{}",
+            tcfs_chunks::hash_to_hex(&tcfs_chunks::hash_bytes(original))
+        );
+        let local_for_progress = local.clone();
+        let mutated_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mutated_once_for_progress = mutated_once.clone();
+        let progress: ProgressFn = Box::new(move |current, _total, _message| {
+            if current == 1
+                && !mutated_once_for_progress.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                std::fs::write(&local_for_progress, mutated).unwrap();
+            }
+        });
+
+        let err = upload_file(&op, &local, "data", &mut state, Some(&progress))
+            .await
+            .unwrap_err();
+        let err_text = format!("{err:#}");
+
+        assert!(
+            err_text.contains("file changed during manifest publish"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            op.read(&expected_manifest).await.is_err(),
+            "manifest must not be published after a detected write race"
+        );
+        assert!(
+            state.get(&local).is_none(),
+            "state cache must not be updated after a detected write race"
+        );
+    }
+
+    // ── remote_path_prefix ───────────────────────────────────────────────
+
+    #[test]
+    fn remote_path_prefix_strips_trailing_slash() {
+        assert_eq!(remote_path_prefix("data/"), "data");
+        assert_eq!(remote_path_prefix("data"), "data");
+        assert_eq!(remote_path_prefix("a/b/c/"), "a/b/c");
+    }
+}
+
+#[cfg(test)]
+mod proptest_suite {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// normalize_rel_path must never panic on arbitrary path strings.
+        #[test]
+        fn normalize_never_panics(input in ".*") {
+            let _ = normalize_rel_path(Path::new(&input), None);
+        }
+
+        /// Output never contains backslashes (Windows path separators).
+        #[test]
+        fn normalize_no_backslash(input in ".*") {
+            let result = normalize_rel_path(Path::new(&input), None);
+            prop_assert!(!result.contains('\\'), "backslash in output: {result}");
+        }
+
+        /// With a real tempdir as sync_root, file paths under it are relativized.
+        #[test]
+        fn normalize_under_root_is_relative(filename in "[a-zA-Z][a-zA-Z0-9._-]{0,63}") {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join(&filename);
+            std::fs::write(&file, b"x").unwrap();
+
+            let result = normalize_rel_path(&file, Some(dir.path()));
+            prop_assert_eq!(result, filename);
+        }
+    }
 }

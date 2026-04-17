@@ -3,6 +3,7 @@
 use anyhow::Result;
 use secrecy::ExposeSecret;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tcfs_core::config::TcfsConfig;
 use tcfs_sync::conflict::ConflictResolver;
 use tracing::{debug, error, info, warn};
@@ -11,6 +12,62 @@ use tcfs_crypto::MasterKey;
 
 use crate::cred_store::{new_shared as new_cred_store, SharedCredStore};
 use crate::grpc::TcfsDaemonImpl;
+
+/// Record a watcher-detected conflict in the state cache, inserting a synthetic
+/// entry when the cache has no prior record for `path`.
+///
+/// `StateCache::mark_conflict` returns `false` when the entry is missing. The
+/// watcher path sees files that were never registered (e.g. created and
+/// conflict-detected in a single tick), so we must compensate by inserting a
+/// minimal `SyncState` carrying the conflict payload. Without this, the
+/// conflict metadata is silently lost — the metric increments but the file
+/// never surfaces in conflict UIs or gRPC status queries.
+///
+/// Mirrors the compensating logic used on the gRPC push path.
+pub fn watcher_record_conflict(
+    cache: &mut tcfs_sync::state::StateCache,
+    path: &std::path::Path,
+    info: tcfs_sync::conflict::ConflictInfo,
+) {
+    if cache.mark_conflict(path, info.clone()) {
+        return;
+    }
+
+    warn!(
+        path = %path.display(),
+        "watcher: mark_conflict found no cache entry; inserting synthetic Conflict record"
+    );
+
+    let remote_path = info.rel_path.clone();
+    let local_blake3 = info.local_blake3.clone();
+    let local_vclock = info.local_vclock.clone();
+    let local_device = info.local_device.clone();
+    let detected_at = info.detected_at;
+
+    let synthetic = tcfs_sync::state::SyncState {
+        blake3: local_blake3,
+        size: 0,
+        mtime: 0,
+        chunk_count: 0,
+        remote_path,
+        last_synced: detected_at,
+        vclock: local_vclock,
+        device_id: local_device,
+        conflict: Some(info),
+        status: tcfs_sync::state::FileSyncStatus::Conflict,
+    };
+    cache.set(path, synthetic);
+}
+
+/// Re-export of watcher helpers intended for tests.
+///
+/// Integration tests under `crates/tcfsd/tests/` compile as external crates
+/// and need a stable, public path to the helpers they exercise. Keep this
+/// namespace intentionally narrow — add new items only when a test demands
+/// them.
+pub mod test_support {
+    pub use super::watcher_record_conflict;
+}
 
 pub async fn run(config: TcfsConfig) -> Result<()> {
     info!("daemon starting");
@@ -41,7 +98,9 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
     let device_id = if let Some(dev) = registry.find(&device_name) {
         if dev.device_id.is_empty() {
             // Backfill device_id for entries created before UUID generation was added
-            let new_id = registry.backfill_device_id(&device_name).unwrap();
+            let new_id = registry
+                .backfill_device_id(&device_name)
+                .expect("backfill_device_id with valid device name");
             if let Err(e) = registry.save(&registry_path) {
                 warn!("failed to save backfilled device registry: {e}");
             }
@@ -228,11 +287,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
         });
 
     // Purge entries with wrong remote prefix or stale tmp paths
-    let resolved_prefix = config
-        .storage
-        .remote_prefix
-        .as_deref()
-        .unwrap_or(&config.storage.bucket);
+    let resolved_prefix = config.storage.resolved_prefix();
     let purged = state_cache_inner.purge_stale(resolved_prefix);
     if purged > 0 {
         info!(
@@ -387,8 +442,21 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
     // ── File Watcher + Scheduler ─────────────────────────────────────
     // If sync_root is configured, start watching for local file changes
     // and feed them through the priority scheduler for automatic sync.
+    //
+    // On macOS with FileProvider active, the watcher is skipped because
+    // ~/Library/CloudStorage/TCFSProvider-TCFS/ is the primary interface.
+    // The FileProvider extension handles uploads/downloads via gRPC RPCs.
+    let fileprovider_active =
+        cfg!(target_os = "macos") && config.daemon.fileprovider_socket.is_some();
+
     let _watcher_handle = if let Some(ref sync_root) = config.sync.sync_root {
-        if sync_root.exists() {
+        if fileprovider_active {
+            info!(
+                dir = %sync_root.display(),
+                "FileProvider active — sync_root watcher disabled. Use CloudStorage."
+            );
+            None
+        } else if sync_root.exists() {
             let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(256);
             let watcher_config = tcfs_sync::watcher::WatcherConfig::default();
 
@@ -460,7 +528,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                     // Scheduler run loop: dispatch tasks to sync engine
                     let sched_operator = operator.clone();
                     let sched_state = state_cache.clone();
-                    let sched_prefix = config.storage.bucket.clone();
+                    let sched_prefix = config.storage.resolved_prefix().to_string();
                     let sched_device = device_id.clone();
                     let sched_sync_root = sync_root.clone();
                     let sched_status_tx = status_tx.clone();
@@ -547,15 +615,11 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                                                         "watcher: conflict detected"
                                                     );
                                                     metrics.sync_conflicts.inc();
-                                                    if let Some(entry) =
-                                                        cache.get(&task.path).cloned()
-                                                    {
-                                                        let updated = tcfs_sync::state::SyncState {
-                                                            conflict: Some(info.clone()),
-                                                            ..entry
-                                                        };
-                                                        cache.set(&task.path, updated);
-                                                    }
+                                                    watcher_record_conflict(
+                                                        &mut cache,
+                                                        &task.path,
+                                                        info.clone(),
+                                                    );
                                                     // Emit status change for D-Bus listeners
                                                     let _ = status_tx.try_send((
                                                         task.path.to_string_lossy().to_string(),
@@ -563,55 +627,60 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                                                     ));
                                                 }
 
-                                                // Set status = Synced after successful upload
-                                                if let Some(entry) = cache.get(&task.path).cloned() {
-                                                    let synced = tcfs_sync::state::SyncState {
-                                                        status: tcfs_sync::state::FileSyncStatus::Synced,
-                                                        ..entry
-                                                    };
-                                                    cache.set(&task.path, synced);
+                                                if !upload_result.skipped {
+                                                    // Set status = Synced after a committed upload
+                                                    if let Some(entry) = cache.get(&task.path).cloned() {
+                                                        let synced = tcfs_sync::state::SyncState {
+                                                            status: tcfs_sync::state::FileSyncStatus::Synced,
+                                                            ..entry
+                                                        };
+                                                        cache.set(&task.path, synced);
+                                                    }
                                                 }
 
                                                 if let Err(e) = cache.flush() {
                                                     warn!(error = %e, "state cache flush failed");
                                                 }
-                                                info!(
-                                                    path = %task.path.display(),
-                                                    "watcher: auto-pushed"
-                                                );
-                                                metrics.files_pushed.inc();
 
-                                                // Publish NATS event so other hosts learn about the change
-                                                let rel_path = task
-                                                    .path
-                                                    .strip_prefix(&root)
-                                                    .unwrap_or(&task.path)
-                                                    .to_string_lossy()
-                                                    .to_string();
-                                                let nats_device = device.clone();
-                                                let nats_hash = upload_result.hash.clone();
-                                                let nats_size = upload_result.bytes;
-                                                let nats_remote = upload_result.remote_path.clone();
-                                                let nats_handle = nats.clone();
-                                                let pub_metrics = metrics.clone();
-                                                tokio::spawn(async move {
-                                                    if let Some(client) = nats_handle.lock().await.as_ref() {
-                                                        let event = tcfs_sync::StateEvent::FileSynced {
-                                                            device_id: nats_device,
-                                                            rel_path,
-                                                            blake3: nats_hash,
-                                                            size: nats_size,
-                                                            vclock: Default::default(),
-                                                            manifest_path: nats_remote,
-                                                            timestamp: tcfs_sync::StateEvent::now(),
-                                                        };
-                                                        if let Err(e) = client.publish_state_event(&event).await {
-                                                            tracing::warn!("watcher: failed to publish NATS event: {e}");
-                                                        } else {
-                                                            pub_metrics.nats_events_published.inc();
+                                                if !upload_result.skipped {
+                                                    info!(
+                                                        path = %task.path.display(),
+                                                        "watcher: auto-pushed"
+                                                    );
+                                                    metrics.files_pushed.inc();
+
+                                                    // Publish NATS event so other hosts learn about the change
+                                                    let rel_path = task
+                                                        .path
+                                                        .strip_prefix(&root)
+                                                        .unwrap_or(&task.path)
+                                                        .to_string_lossy()
+                                                        .to_string();
+                                                    let nats_device = device.clone();
+                                                    let nats_hash = upload_result.hash.clone();
+                                                    let nats_size = upload_result.bytes;
+                                                    let nats_remote = upload_result.remote_path.clone();
+                                                    let nats_handle = nats.clone();
+                                                    let pub_metrics = metrics.clone();
+                                                    tokio::spawn(async move {
+                                                        if let Some(client) = nats_handle.lock().await.as_ref() {
+                                                            let event = tcfs_sync::StateEvent::FileSynced {
+                                                                device_id: nats_device,
+                                                                rel_path,
+                                                                blake3: nats_hash,
+                                                                size: nats_size,
+                                                                vclock: Default::default(),
+                                                                manifest_path: nats_remote,
+                                                                timestamp: tcfs_sync::StateEvent::now(),
+                                                            };
+                                                            if let Err(e) = client.publish_state_event(&event).await {
+                                                                tracing::warn!("watcher: failed to publish NATS event: {e}");
+                                                            } else {
+                                                                pub_metrics.nats_events_published.inc();
+                                                            }
                                                         }
-                                                    }
-                                                });
+                                                    });
+                                                }
 
                                                 Ok(())
                                             }
@@ -803,6 +872,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
         config.storage.endpoint.clone(),
         state_cache,
         operator.clone(),
+        path_locks.clone(),
         device_id.clone(),
         device_name.clone(),
         master_key,
@@ -872,7 +942,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                     let sync_device_id = device_id.clone();
                     let sync_conflict_mode = config.sync.conflict_mode.clone();
                     let sync_root = config.sync.sync_root.clone();
-                    let storage_prefix = config.storage.bucket.clone();
+                    let storage_prefix = config.storage.resolved_prefix().to_string();
                     let policy_path = data_dir.join("folder-policies.json");
                     let download_threshold = config.sync.auto_download_threshold;
                     spawn_state_sync_loop(
@@ -973,6 +1043,191 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
         });
     }
 
+    // ── Periodic reconciliation ────────────────────────────────────────
+    // Reconciles local sync_root against remote index on a timer.
+    // Respects per-folder policies (Always/OnDemand/Never).
+    if config.sync.reconcile_interval_secs > 0 {
+        if let Some(ref sync_root) = config.sync.sync_root {
+            let recon_interval = config.sync.reconcile_interval_secs;
+            let recon_root = sync_root.clone();
+            let recon_prefix = config.storage.resolved_prefix().to_string();
+            let recon_state = impl_.state_cache_handle();
+            let recon_op = operator.clone();
+            let recon_device = device_id.clone();
+            let recon_master_key = impl_.master_key_handle();
+            let orphan_chunk_cleanup_grace_secs = config.sync.orphan_chunk_cleanup_grace_secs;
+            let orphan_chunk_cleanup_sweep_interval_secs = if orphan_chunk_cleanup_grace_secs > 0 {
+                orphan_chunk_cleanup_grace_secs
+                    .min(3600)
+                    .max(recon_interval)
+            } else {
+                0
+            };
+            let _recon_policy_path = data_dir.join("folder-policies.json");
+
+            info!(
+                interval_secs = recon_interval,
+                prefix = %recon_prefix,
+                root = %recon_root.display(),
+                "periodic reconciliation enabled"
+            );
+            if orphan_chunk_cleanup_sweep_interval_secs > 0 {
+                info!(
+                    grace_secs = orphan_chunk_cleanup_grace_secs,
+                    sweep_interval_secs = orphan_chunk_cleanup_sweep_interval_secs,
+                    "periodic orphan chunk cleanup enabled"
+                );
+            }
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(recon_interval));
+                let orphan_chunk_cleanup_grace =
+                    Duration::from_secs(orphan_chunk_cleanup_grace_secs);
+                let orphan_chunk_cleanup_sweep_interval =
+                    Duration::from_secs(orphan_chunk_cleanup_sweep_interval_secs);
+                let mut last_orphan_chunk_sweep = None;
+                // Skip the first immediate tick — startup index discovery covers it
+                interval.tick().await;
+
+                loop {
+                    interval.tick().await;
+
+                    let op_guard = recon_op.lock().await;
+                    let op = match op_guard.as_ref() {
+                        Some(op) => op.clone(),
+                        None => {
+                            debug!("reconcile: no storage operator, skipping");
+                            continue;
+                        }
+                    };
+                    drop(op_guard);
+
+                    let blacklist = tcfs_sync::blacklist::Blacklist::default();
+                    let recon_config = tcfs_sync::reconcile::ReconcileConfig::default();
+
+                    let cache = recon_state.lock().await;
+                    let plan = match tcfs_sync::reconcile::reconcile(
+                        &op,
+                        &recon_root,
+                        &recon_prefix,
+                        &cache,
+                        &recon_device,
+                        &blacklist,
+                        &recon_config,
+                    )
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("periodic reconcile failed: {e}");
+                            continue;
+                        }
+                    };
+                    drop(cache);
+
+                    let s = &plan.summary;
+                    if s.pushes == 0 && s.pulls == 0 && s.conflicts == 0 {
+                        debug!(up_to_date = s.up_to_date, "reconcile: nothing to do");
+                    } else {
+                        info!(
+                            pushes = s.pushes,
+                            pulls = s.pulls,
+                            conflicts = s.conflicts,
+                            up_to_date = s.up_to_date,
+                            "reconcile: executing plan"
+                        );
+
+                        // Build encryption context from master key (if loaded)
+                        let mk_guard = recon_master_key.lock().await;
+                        let enc_ctx =
+                            mk_guard
+                                .as_ref()
+                                .map(|k| tcfs_sync::engine::EncryptionContext {
+                                    master_key: k.clone(),
+                                });
+                        drop(mk_guard);
+
+                        let mut cache = recon_state.lock().await;
+                        match tcfs_sync::reconcile::execute_plan(
+                            &plan,
+                            &op,
+                            &recon_root,
+                            &recon_prefix,
+                            &mut cache,
+                            &recon_device,
+                            enc_ctx.as_ref(),
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                info!(
+                                    pushed = result.pushed,
+                                    pulled = result.pulled,
+                                    errors = result.errors.len(),
+                                    bytes_up = result.bytes_uploaded,
+                                    bytes_down = result.bytes_downloaded,
+                                    "reconcile: plan executed"
+                                );
+                                if let Err(e) = cache.flush() {
+                                    warn!("reconcile: state cache flush failed: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("reconcile: plan execution failed: {e}");
+                            }
+                        }
+                    }
+
+                    let now = SystemTime::now();
+                    let should_sweep_orphan_chunks = orphan_chunk_cleanup_sweep_interval_secs > 0
+                        && last_orphan_chunk_sweep
+                            .and_then(|last| now.duration_since(last).ok())
+                            .map(|elapsed| elapsed >= orphan_chunk_cleanup_sweep_interval)
+                            .unwrap_or(true);
+
+                    if should_sweep_orphan_chunks {
+                        match tcfs_sync::reconcile::cleanup_orphaned_chunks(
+                            &op,
+                            &recon_prefix,
+                            orphan_chunk_cleanup_grace,
+                            now,
+                        )
+                        .await
+                        {
+                            Ok(report) => {
+                                last_orphan_chunk_sweep = Some(now);
+                                if report.orphaned_chunks_found == 0
+                                    && report.delete_errors.is_empty()
+                                {
+                                    debug!(
+                                        scanned = report.scanned_chunks,
+                                        "reconcile: no orphaned chunks found"
+                                    );
+                                } else {
+                                    info!(
+                                        orphaned_found = report.orphaned_chunks_found,
+                                        deleted = report.deleted_chunks.len(),
+                                        within_grace = report.skipped_within_grace.len(),
+                                        missing_last_modified =
+                                            report.skipped_missing_last_modified.len(),
+                                        delete_errors = report.delete_errors.len(),
+                                        scanned = report.scanned_chunks,
+                                        referenced = report.referenced_chunks,
+                                        "reconcile: orphan chunk sweep completed"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("reconcile: orphan chunk cleanup failed: {e}");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     // Auto-unsync sweep with dehydration (if configured)
     if config.sync.auto_unsync_max_age_secs > 0 {
         let unsync_state = impl_.state_cache_handle();
@@ -1001,7 +1256,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                 interval.tick().await;
 
                 // Check disk pressure — if under threshold and not time-based, skip
-                let under_pressure = sync_root.as_ref().map_or(false, |root| {
+                let under_pressure = sync_root.as_ref().is_some_and(|root| {
                     tcfs_sync::auto_unsync::disk_pressure_check(root, disk_pressure_pct)
                 });
 
@@ -1175,23 +1430,23 @@ async fn spawn_state_sync_loop(
                                     }
 
                                     // OnDemand mode: only auto-pull if size ≤ threshold
-                                    if effective_mode == tcfs_sync::policy::SyncMode::OnDemand {
-                                        if !policy_store.should_auto_download(
+                                    if effective_mode == tcfs_sync::policy::SyncMode::OnDemand
+                                        && !policy_store.should_auto_download(
                                             &file_path,
                                             *size,
                                             auto_download_threshold,
-                                        ) {
-                                            debug!(
-                                                path = %rel_path,
-                                                size,
-                                                threshold = auto_download_threshold,
-                                                "skipping auto-pull: OnDemand file exceeds download threshold"
-                                            );
-                                            if let Err(e) = msg.ack().await {
-                                                warn!("ack failed: {e}");
-                                            }
-                                            continue;
+                                        )
+                                    {
+                                        debug!(
+                                            path = %rel_path,
+                                            size,
+                                            threshold = auto_download_threshold,
+                                            "skipping auto-pull: OnDemand file exceeds download threshold"
+                                        );
+                                        if let Err(e) = msg.ack().await {
+                                            warn!("ack failed: {e}");
                                         }
+                                        continue;
                                     }
 
                                     // Always mode: unconditional auto-pull
@@ -1207,6 +1462,7 @@ async fn spawn_state_sync_loop(
                                                 manifest_path,
                                                 &operator,
                                                 &state_cache,
+                                                &path_locks,
                                                 sync_root.as_deref(),
                                                 &storage_prefix,
                                             )
@@ -1263,7 +1519,7 @@ async fn spawn_state_sync_loop(
                                 }
                                 tcfs_sync::StateEvent::FileDeleted {
                                     rel_path,
-                                    vclock: remote_vclock,
+                                    vclock: _remote_vclock,
                                     ..
                                 } => {
                                     info!(
@@ -1363,6 +1619,7 @@ async fn handle_auto_pull(
     manifest_path: &str,
     operator: &Arc<tokio::sync::Mutex<Option<opendal::Operator>>>,
     state_cache: &Arc<tokio::sync::Mutex<tcfs_sync::state::StateCache>>,
+    path_locks: &tcfs_sync::state::PathLocks,
     sync_root: Option<&std::path::Path>,
     storage_prefix: &str,
 ) {
@@ -1384,6 +1641,7 @@ async fn handle_auto_pull(
             }
         }
     };
+    let _lock_guard = path_locks.lock(&local_path).await;
 
     // Compare vector clocks
     let (local_blake3, local_vclock) = {
@@ -1491,7 +1749,7 @@ async fn handle_auto_pull(
 ///
 /// We only update the state cache so vector clocks stay in sync.
 async fn do_auto_download(
-    device_id: &str,
+    _device_id: &str,
     manifest_path: &str,
     local_path: &std::path::Path,
     operator: &Arc<tokio::sync::Mutex<Option<opendal::Operator>>>,

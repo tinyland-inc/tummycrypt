@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::conflict::VectorClock;
 
@@ -25,10 +25,11 @@ use crate::conflict::VectorClock;
 ///
 /// Unlike `SyncState` (which is persisted), this is a transient runtime status
 /// that reflects what is happening to a file *right now*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileSyncStatus {
     /// File exists only as a stub/placeholder (not hydrated).
+    #[default]
     NotSynced,
     /// File content matches remote — fully synchronized.
     Synced,
@@ -38,12 +39,6 @@ pub enum FileSyncStatus {
     Locked,
     /// Local and remote versions diverged (vector clock conflict).
     Conflict,
-}
-
-impl Default for FileSyncStatus {
-    fn default() -> Self {
-        FileSyncStatus::NotSynced
-    }
 }
 
 impl std::fmt::Display for FileSyncStatus {
@@ -93,9 +88,10 @@ impl PathLocks {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        let guard = mutex.lock_owned().await;
+        let guard = mutex.clone().lock_owned().await;
         PathLockGuard {
-            _guard: guard,
+            guard: Some(guard),
+            mutex,
             key,
             inner: self.inner.clone(),
         }
@@ -110,9 +106,10 @@ impl PathLocks {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        match mutex.try_lock_owned() {
+        match mutex.clone().try_lock_owned() {
             Ok(guard) => Some(PathLockGuard {
-                _guard: guard,
+                guard: Some(guard),
+                mutex,
                 key,
                 inner: self.inner.clone(),
             }),
@@ -134,19 +131,45 @@ impl PathLocks {
 
 /// RAII guard for a per-path lock. Cleans up the lock entry when no other
 /// references exist to avoid unbounded memory growth.
+///
+/// Cleanup is scheduled after the underlying mutex guard is released, so entry
+/// removal does not depend on winning a synchronous `try_lock()` race on the
+/// path-lock map.
 pub struct PathLockGuard {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    mutex: Arc<tokio::sync::Mutex<()>>,
     key: String,
     inner: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Drop for PathLockGuard {
     fn drop(&mut self) {
-        // Best-effort cleanup: remove the entry if we're the last holder.
-        if let Ok(mut map) = self.inner.try_lock() {
-            if let Some(mutex) = map.get(&self.key) {
-                // strong_count == 2: the map entry + this guard's clone.
-                if Arc::strong_count(mutex) <= 2 {
+        // Release the per-path mutex before checking whether the entry can be
+        // removed from the path-lock map.
+        drop(self.guard.take());
+
+        let key = self.key.clone();
+        let inner = self.inner.clone();
+        let mutex = self.mutex.clone();
+
+        let cleanup = async move {
+            let mut map = inner.lock().await;
+            if let Some(current) = map.get(&key) {
+                // strong_count == 2 means only the map entry and this cleanup task
+                // still reference the mutex, so no holder or waiter remains.
+                if Arc::ptr_eq(current, &mutex) && Arc::strong_count(&mutex) == 2 {
+                    map.remove(&key);
+                }
+            }
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(cleanup);
+        } else if let Ok(mut map) = self.inner.try_lock() {
+            if let Some(current) = map.get(&self.key) {
+                // strong_count == 2 means only the map entry and this guard still
+                // reference the mutex in this synchronous fallback path.
+                if Arc::ptr_eq(current, &self.mutex) && Arc::strong_count(&self.mutex) == 2 {
                     map.remove(&self.key);
                 }
             }
@@ -184,6 +207,19 @@ pub struct SyncState {
     pub status: FileSyncStatus,
 }
 
+/// On-disk format wrapping entries plus metadata that must survive restarts.
+///
+/// Backwards-compatible: if the file is a raw `HashMap<String, SyncState>`, we
+/// still load it and default the metadata.
+#[derive(Debug, Serialize, Deserialize)]
+struct StateCacheOnDisk {
+    #[serde(default)]
+    last_nats_seq: u64,
+    #[serde(default)]
+    device_id: String,
+    entries: HashMap<String, SyncState>,
+}
+
 /// In-memory state cache, persisted to a JSON file
 pub struct StateCache {
     /// Path to the JSON state file on disk
@@ -193,31 +229,71 @@ pub struct StateCache {
     /// Whether there are unsaved changes
     dirty: bool,
     /// Last NATS JetStream sequence processed (for catch-up on restart)
-    pub last_nats_seq: u64,
+    last_nats_seq: u64,
     /// Device ID for this machine
-    pub device_id: String,
+    device_id: String,
+    /// When the cache was last flushed, used by periodic best-effort flushing.
+    last_flush: Instant,
 }
 
 impl StateCache {
     /// Load or create a state cache at the given path.
-    /// If the file doesn't exist, starts with an empty cache.
+    ///
+    /// Supports two on-disk formats:
+    /// - new: `{"last_nats_seq": N, "device_id": "...", "entries": {...}}`
+    /// - legacy: raw `HashMap<String, SyncState>`
+    ///
+    /// If the primary file is corrupt, falls back to `.bak` when present.
     pub fn open(db_path: &Path) -> Result<Self> {
-        let entries = if db_path.exists() {
-            let content = std::fs::read_to_string(db_path)
-                .with_context(|| format!("reading state cache: {}", db_path.display()))?;
-            serde_json::from_str(&content)
-                .with_context(|| format!("parsing state cache: {}", db_path.display()))?
+        let (entries, last_nats_seq, device_id) = if db_path.exists() {
+            match Self::load_from_file(db_path) {
+                Ok(data) => data,
+                Err(primary_err) => {
+                    let bak_path = db_path.with_extension("json.bak");
+                    if bak_path.exists() {
+                        tracing::warn!(
+                            path = %db_path.display(),
+                            error = %primary_err,
+                            "state cache corrupt, recovering from backup"
+                        );
+                        Self::load_from_file(&bak_path).with_context(|| {
+                            format!(
+                                "both state cache and backup failed to load: {}",
+                                db_path.display()
+                            )
+                        })?
+                    } else {
+                        return Err(primary_err).with_context(|| {
+                            format!("reading state cache: {}", db_path.display())
+                        });
+                    }
+                }
+            }
         } else {
-            HashMap::new()
+            (HashMap::new(), 0, String::new())
         };
 
         Ok(StateCache {
             db_path: db_path.to_path_buf(),
             entries,
             dirty: false,
-            last_nats_seq: 0,
-            device_id: String::new(),
+            last_nats_seq,
+            device_id,
+            last_flush: Instant::now(),
         })
+    }
+
+    fn load_from_file(path: &Path) -> Result<(HashMap<String, SyncState>, u64, String)> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading: {}", path.display()))?;
+
+        if let Ok(data) = serde_json::from_str::<StateCacheOnDisk>(&content) {
+            return Ok((data.entries, data.last_nats_seq, data.device_id));
+        }
+
+        let entries: HashMap<String, SyncState> = serde_json::from_str(&content)
+            .with_context(|| format!("parsing state cache: {}", path.display()))?;
+        Ok((entries, 0, String::new()))
     }
 
     /// Reload entries from disk, merging any new entries written by other processes.
@@ -226,12 +302,15 @@ impl StateCache {
         if !self.db_path.exists() {
             return Ok(());
         }
-        let content = std::fs::read_to_string(&self.db_path)
-            .with_context(|| format!("reloading state cache: {}", self.db_path.display()))?;
-        let disk_entries: HashMap<String, SyncState> = serde_json::from_str(&content)
-            .with_context(|| format!("parsing state cache: {}", self.db_path.display()))?;
+        let (disk_entries, seq, device_id) = Self::load_from_file(&self.db_path)?;
         for (key, state) in disk_entries {
             self.entries.entry(key).or_insert(state);
+        }
+        if seq > self.last_nats_seq {
+            self.last_nats_seq = seq;
+        }
+        if self.device_id.is_empty() && !device_id.is_empty() {
+            self.device_id = device_id;
         }
         Ok(())
     }
@@ -266,6 +345,28 @@ impl StateCache {
         self.entries.is_empty()
     }
 
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub fn set_device_id(&mut self, id: String) {
+        if self.device_id != id {
+            self.device_id = id;
+            self.dirty = true;
+        }
+    }
+
+    pub fn last_nats_seq(&self) -> u64 {
+        self.last_nats_seq
+    }
+
+    pub fn set_last_nats_seq(&mut self, seq: u64) {
+        if self.last_nats_seq != seq {
+            self.last_nats_seq = seq;
+            self.dirty = true;
+        }
+    }
+
     /// Find a state entry by relative path (for NATS auto-pull lookups).
     ///
     /// Searches cache keys (canonical local paths) by suffix match, then
@@ -274,22 +375,31 @@ impl StateCache {
     /// the normalized rel_path (`dir/file.txt`) handles cross-host home
     /// directory differences.
     pub fn get_by_rel_path(&self, rel_path: &str) -> Option<(&str, &SyncState)> {
-        let normalized = rel_path.trim_start_matches('/');
+        let normalized = crate::engine::normalize_rel_path_text(rel_path.trim_start_matches('/'));
         // Primary: match cache keys (canonical local paths) by suffix
         self.entries
             .iter()
-            .find(|(key, _)| key.ends_with(&format!("/{}", normalized)) || *key == normalized)
+            .find(|(key, _)| {
+                let normalized_key = crate::engine::normalize_rel_path_text(key);
+                normalized_key.ends_with(&format!("/{}", normalized))
+                    || normalized_key == normalized
+            })
             // Fallback: match remote_path (manifest path) for backward compat
             .or_else(|| {
                 self.entries.iter().find(|(_, state)| {
-                    state.remote_path.ends_with(&format!("/{}", normalized))
-                        || state.remote_path == normalized
+                    let normalized_remote =
+                        crate::engine::normalize_rel_path_text(&state.remote_path);
+                    normalized_remote.ends_with(&format!("/{}", normalized))
+                        || normalized_remote == normalized
                 })
             })
             .map(|(k, v)| (k.as_str(), v))
     }
 
     /// Flush dirty changes to disk using an atomic write (write then rename).
+    ///
+    /// Persists cache metadata alongside entries so restart recovery does not
+    /// replay stale NATS state or forget the current device identity.
     pub fn flush(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
@@ -301,8 +411,17 @@ impl StateCache {
                 .with_context(|| format!("creating state dir: {}", parent.display()))?;
         }
 
-        let json =
-            serde_json::to_string_pretty(&self.entries).context("serializing state cache")?;
+        if self.db_path.exists() {
+            let bak_path = self.db_path.with_extension("json.bak");
+            let _ = std::fs::copy(&self.db_path, &bak_path);
+        }
+
+        let on_disk = StateCacheOnDisk {
+            last_nats_seq: self.last_nats_seq,
+            device_id: self.device_id.clone(),
+            entries: self.entries.clone(),
+        };
+        let json = serde_json::to_string_pretty(&on_disk).context("serializing state cache")?;
 
         // Atomic write: write to temp file, then rename
         let tmp_path = self.db_path.with_extension("tmp");
@@ -317,7 +436,17 @@ impl StateCache {
         }
 
         self.dirty = false;
+        self.last_flush = Instant::now();
         Ok(())
+    }
+
+    /// Flush dirty state when the last successful flush is older than `interval`.
+    pub fn flush_if_stale(&mut self, interval: Duration) -> Result<()> {
+        if self.dirty && self.last_flush.elapsed() >= interval {
+            self.flush()
+        } else {
+            Ok(())
+        }
     }
 
     /// Transition a file's sync status without removing its metadata.
@@ -329,6 +458,44 @@ impl StateCache {
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.status = status;
             self.dirty = true;
+        }
+    }
+
+    /// Mark an entry as conflicted while preserving its existing metadata.
+    ///
+    /// Conflict payload and status must move together. Setting only the conflict
+    /// info leaves callers with an internally inconsistent entry that still
+    /// appears synced.
+    pub fn mark_conflict(
+        &mut self,
+        local_path: &Path,
+        conflict: crate::conflict::ConflictInfo,
+    ) -> bool {
+        let key = path_key(local_path);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.conflict = Some(conflict);
+            entry.status = FileSyncStatus::Conflict;
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear conflict state after successful resolution.
+    ///
+    /// Sets `conflict` to `None` and `status` to `Synced`. Both fields
+    /// must be updated together — clearing only `conflict` leaves the file
+    /// flagged as conflicted in UI badges and FileProvider decorations.
+    pub fn resolve_conflict(&mut self, local_path: &Path) -> bool {
+        let key = path_key(local_path);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.conflict = None;
+            entry.status = FileSyncStatus::Synced;
+            self.dirty = true;
+            true
+        } else {
+            false
         }
     }
 
@@ -670,7 +837,7 @@ impl StateBackend {
     /// Get the device_id.
     pub fn device_id(&self) -> &str {
         match self {
-            StateBackend::Json(c) => &c.device_id,
+            StateBackend::Json(c) => c.device_id(),
             #[cfg(feature = "full")]
             StateBackend::Rocks(c) => &c.device_id,
         }
@@ -679,7 +846,7 @@ impl StateBackend {
     /// Set the device_id.
     pub fn set_device_id(&mut self, id: String) {
         match self {
-            StateBackend::Json(c) => c.device_id = id,
+            StateBackend::Json(c) => c.set_device_id(id),
             #[cfg(feature = "full")]
             StateBackend::Rocks(c) => c.device_id = id,
         }
@@ -688,7 +855,7 @@ impl StateBackend {
     /// Get the last NATS sequence.
     pub fn last_nats_seq(&self) -> u64 {
         match self {
-            StateBackend::Json(c) => c.last_nats_seq,
+            StateBackend::Json(c) => c.last_nats_seq(),
             #[cfg(feature = "full")]
             StateBackend::Rocks(c) => c.last_nats_seq,
         }
@@ -697,7 +864,7 @@ impl StateBackend {
     /// Set the last NATS sequence.
     pub fn set_last_nats_seq(&mut self, seq: u64) {
         match self {
-            StateBackend::Json(c) => c.last_nats_seq = seq,
+            StateBackend::Json(c) => c.set_last_nats_seq(seq),
             #[cfg(feature = "full")]
             StateBackend::Rocks(c) => c.last_nats_seq = seq,
         }
@@ -777,10 +944,20 @@ impl StateCacheBackend for StateBackend {
     }
 }
 
-/// Convert a path to a normalized string key for the HashMap
+/// Convert a path to a normalized string key for the HashMap.
+///
+/// Uses `canonicalize` to resolve symlinks (for example `/var` ->
+/// `/private/var` on macOS). When the file itself is gone, fall back to
+/// canonicalizing the parent directory and reattaching the filename so remove
+/// and lookup still hit the same key that was used while the file existed.
 fn path_key(path: &Path) -> String {
-    // Use the canonicalized absolute path as the key
     std::fs::canonicalize(path)
+        .or_else(|_| {
+            path.parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok())
+                .map(|parent| parent.join(path.file_name().unwrap_or_default()))
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no parent"))
+        })
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned()
@@ -915,6 +1092,48 @@ mod tests {
         cache.remove(&fake_path);
         assert_eq!(cache.len(), 0);
         assert!(cache.get(&fake_path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_entry_after_delete_through_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        let real_dir = dir.path().join("real");
+        let link_dir = dir.path().join("link");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        symlink(&real_dir, &link_dir).unwrap();
+
+        let linked_path = link_dir.join("to_remove.txt");
+        let real_path = real_dir.join("to_remove.txt");
+        std::fs::write(&linked_path, b"data").unwrap();
+
+        cache.set(
+            &linked_path,
+            SyncState {
+                blake3: "hash1".into(),
+                size: 4,
+                mtime: 1000,
+                chunk_count: 1,
+                remote_path: "bucket/to_remove.txt".into(),
+                last_synced: 9999,
+                vclock: VectorClock::new(),
+                device_id: String::new(),
+                conflict: None,
+                status: Default::default(),
+            },
+        );
+        assert_eq!(cache.len(), 1);
+
+        std::fs::remove_file(&real_path).unwrap();
+        cache.remove(&linked_path);
+
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get(&linked_path).is_none());
     }
 
     #[test]
@@ -1062,6 +1281,76 @@ mod tests {
         assert!(!locks.is_locked(&path).await);
     }
 
+    async fn wait_for_lock_entry_count(locks: &PathLocks, expected: usize) {
+        for _ in 0..50 {
+            if locks.inner.lock().await.len() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let actual = locks.inner.lock().await.len();
+        panic!("expected {expected} path-lock entries, found {actual}");
+    }
+
+    #[tokio::test]
+    async fn test_path_lock_cleanup_survives_map_contention() {
+        let locks = PathLocks::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contended.txt");
+        std::fs::write(&path, b"data").unwrap();
+
+        let guard = locks.lock(&path).await;
+        assert_eq!(locks.inner.lock().await.len(), 1);
+
+        let map_guard = locks.inner.lock().await;
+        drop(guard);
+
+        assert_eq!(map_guard.len(), 1, "entry remains while cleanup waits");
+        drop(map_guard);
+
+        wait_for_lock_entry_count(&locks, 0).await;
+        assert!(!locks.is_locked(&path).await);
+    }
+
+    #[tokio::test]
+    async fn test_path_lock_entry_persists_for_waiter_then_cleans_up() {
+        let locks = PathLocks::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued.txt");
+        std::fs::write(&path, b"data").unwrap();
+
+        let guard = locks.lock(&path).await;
+        let acquired = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let locks_clone = locks.clone();
+        let path_clone = path.clone();
+        let acquired_clone = acquired.clone();
+        let release_clone = release.clone();
+
+        let waiter = tokio::spawn(async move {
+            let _guard = locks_clone.lock(&path_clone).await;
+            acquired_clone.notify_one();
+            release_clone.notified().await;
+        });
+
+        tokio::task::yield_now().await;
+        drop(guard);
+
+        acquired.notified().await;
+        assert_eq!(
+            locks.inner.lock().await.len(),
+            1,
+            "entry must remain while another task still holds the path lock"
+        );
+
+        release.notify_waiters();
+        waiter.await.unwrap();
+
+        wait_for_lock_entry_count(&locks, 0).await;
+        assert!(!locks.is_locked(&path).await);
+    }
+
     #[test]
     fn set_status_preserves_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -1126,5 +1415,378 @@ mod tests {
         cache.set_status(&file_path, FileSyncStatus::NotSynced);
         // Should be dirty after set_status
         assert!(cache.dirty);
+    }
+
+    // ── Conflict resolution tests ──────────────────────────────────────
+
+    #[test]
+    fn resolve_conflict_clears_both_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        let file_path = dir.path().join("conflicted.txt");
+        std::fs::write(&file_path, b"data").unwrap();
+
+        let conflict_info = crate::conflict::ConflictInfo {
+            rel_path: "conflicted.txt".into(),
+            local_vclock: VectorClock::new(),
+            remote_vclock: VectorClock::new(),
+            local_blake3: "aaa".into(),
+            remote_blake3: "bbb".into(),
+            local_device: "neo".into(),
+            remote_device: "honey".into(),
+            detected_at: 1700000000,
+        };
+
+        cache.set(
+            &file_path,
+            SyncState {
+                blake3: "aaa".into(),
+                size: 4,
+                mtime: 0,
+                chunk_count: 1,
+                remote_path: "data/index/conflicted.txt".into(),
+                last_synced: 0,
+                vclock: VectorClock::new(),
+                device_id: "neo".into(),
+                conflict: Some(conflict_info),
+                status: FileSyncStatus::Conflict,
+            },
+        );
+
+        // Verify conflict is set
+        let entry = cache.get(&file_path).unwrap();
+        assert!(entry.conflict.is_some());
+        assert_eq!(entry.status, FileSyncStatus::Conflict);
+
+        // Resolve it
+        let resolved = cache.resolve_conflict(&file_path);
+        assert!(
+            resolved,
+            "resolve_conflict should return true for existing entry"
+        );
+
+        // Both fields must be cleared
+        let entry = cache.get(&file_path).unwrap();
+        assert!(
+            entry.conflict.is_none(),
+            "conflict must be None after resolve"
+        );
+        assert_eq!(
+            entry.status,
+            FileSyncStatus::Synced,
+            "status must be Synced after resolve"
+        );
+
+        // Metadata preserved
+        assert_eq!(entry.blake3, "aaa");
+        assert_eq!(entry.remote_path, "data/index/conflicted.txt");
+        assert_eq!(entry.device_id, "neo");
+    }
+
+    #[test]
+    fn resolve_conflict_marks_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        let file_path = dir.path().join("file.txt");
+        std::fs::write(&file_path, b"x").unwrap();
+
+        cache.set(
+            &file_path,
+            SyncState {
+                blake3: "abc".into(),
+                size: 1,
+                mtime: 0,
+                chunk_count: 1,
+                remote_path: "data/index/file.txt".into(),
+                last_synced: 0,
+                vclock: VectorClock::new(),
+                device_id: "neo".into(),
+                conflict: Some(crate::conflict::ConflictInfo {
+                    rel_path: "file.txt".into(),
+                    local_vclock: VectorClock::new(),
+                    remote_vclock: VectorClock::new(),
+                    local_blake3: "abc".into(),
+                    remote_blake3: "def".into(),
+                    local_device: "neo".into(),
+                    remote_device: "honey".into(),
+                    detected_at: 0,
+                }),
+                status: FileSyncStatus::Conflict,
+            },
+        );
+        cache.flush().unwrap();
+
+        cache.resolve_conflict(&file_path);
+        assert!(cache.dirty, "cache must be dirty after resolve_conflict");
+    }
+
+    #[test]
+    fn resolve_conflict_returns_false_for_missing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        let nonexistent = dir.path().join("nope.txt");
+        assert!(
+            !cache.resolve_conflict(&nonexistent),
+            "should return false for missing entry"
+        );
+    }
+
+    #[test]
+    fn resolve_conflict_roundtrip_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let file_path = dir.path().join("rt.txt");
+        std::fs::write(&file_path, b"roundtrip").unwrap();
+
+        // Write conflicted state and flush
+        {
+            let mut cache = StateCache::open(&path).unwrap();
+            cache.set(
+                &file_path,
+                SyncState {
+                    blake3: "rt".into(),
+                    size: 9,
+                    mtime: 0,
+                    chunk_count: 1,
+                    remote_path: "data/index/rt.txt".into(),
+                    last_synced: 0,
+                    vclock: VectorClock::new(),
+                    device_id: "neo".into(),
+                    conflict: Some(crate::conflict::ConflictInfo {
+                        rel_path: "rt.txt".into(),
+                        local_vclock: VectorClock::new(),
+                        remote_vclock: VectorClock::new(),
+                        local_blake3: "rt".into(),
+                        remote_blake3: "xx".into(),
+                        local_device: "neo".into(),
+                        remote_device: "honey".into(),
+                        detected_at: 0,
+                    }),
+                    status: FileSyncStatus::Conflict,
+                },
+            );
+            cache.flush().unwrap();
+        }
+
+        // Reload, resolve, flush
+        {
+            let mut cache = StateCache::open(&path).unwrap();
+            let entry = cache.get(&file_path).unwrap();
+            assert!(entry.conflict.is_some(), "conflict should persist on disk");
+            assert_eq!(entry.status, FileSyncStatus::Conflict);
+
+            cache.resolve_conflict(&file_path);
+            cache.flush().unwrap();
+        }
+
+        // Reload again — verify resolved state persisted
+        {
+            let cache = StateCache::open(&path).unwrap();
+            let entry = cache.get(&file_path).unwrap();
+            assert!(
+                entry.conflict.is_none(),
+                "conflict must be None after reload"
+            );
+            assert_eq!(
+                entry.status,
+                FileSyncStatus::Synced,
+                "status must be Synced after reload"
+            );
+        }
+    }
+
+    #[test]
+    fn mark_conflict_sets_payload_and_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        let file_path = dir.path().join("conflicted.txt");
+        std::fs::write(&file_path, b"data").unwrap();
+
+        cache.set(
+            &file_path,
+            SyncState {
+                blake3: "abc".into(),
+                size: 4,
+                mtime: 0,
+                chunk_count: 1,
+                remote_path: "data/index/conflicted.txt".into(),
+                last_synced: 0,
+                vclock: VectorClock::new(),
+                device_id: "neo".into(),
+                conflict: None,
+                status: FileSyncStatus::Synced,
+            },
+        );
+
+        let conflict = crate::conflict::ConflictInfo {
+            rel_path: "conflicted.txt".into(),
+            local_vclock: VectorClock::new(),
+            remote_vclock: VectorClock::new(),
+            local_blake3: "abc".into(),
+            remote_blake3: "def".into(),
+            local_device: "neo".into(),
+            remote_device: "honey".into(),
+            detected_at: 0,
+        };
+
+        assert!(cache.mark_conflict(&file_path, conflict.clone()));
+
+        let entry = cache.get(&file_path).unwrap();
+        assert_eq!(entry.status, FileSyncStatus::Conflict);
+        let stored = entry.conflict.as_ref().expect("conflict payload");
+        assert_eq!(stored.rel_path, conflict.rel_path);
+        assert_eq!(stored.local_device, conflict.local_device);
+        assert_eq!(stored.remote_device, conflict.remote_device);
+    }
+
+    #[test]
+    fn metadata_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        {
+            let mut cache = StateCache::open(&path).unwrap();
+            cache.set_last_nats_seq(42);
+            cache.set_device_id("neo".into());
+            cache.flush().unwrap();
+        }
+
+        let cache = StateCache::open(&path).unwrap();
+        assert_eq!(cache.last_nats_seq(), 42);
+        assert_eq!(cache.device_id(), "neo");
+    }
+
+    #[test]
+    fn legacy_format_loads_with_default_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "file.txt".to_string(),
+            SyncState {
+                blake3: "abc".into(),
+                size: 5,
+                mtime: 1000,
+                chunk_count: 1,
+                remote_path: "bucket/file.txt".into(),
+                last_synced: 100,
+                vclock: VectorClock::new(),
+                device_id: "test".into(),
+                conflict: None,
+                status: FileSyncStatus::Synced,
+            },
+        );
+        std::fs::write(&path, serde_json::to_string_pretty(&entries).unwrap()).unwrap();
+
+        let cache = StateCache::open(&path).unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.last_nats_seq(), 0);
+        assert!(cache.device_id().is_empty());
+    }
+
+    #[test]
+    fn flush_creates_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let file_path = dir.path().join("f.txt");
+        std::fs::write(&file_path, b"x").unwrap();
+
+        let mut cache = StateCache::open(&path).unwrap();
+        cache.set(
+            &file_path,
+            SyncState {
+                blake3: "aaa".into(),
+                size: 1,
+                mtime: 0,
+                chunk_count: 1,
+                remote_path: "idx/f.txt".into(),
+                last_synced: 0,
+                vclock: VectorClock::new(),
+                device_id: "d".into(),
+                conflict: None,
+                status: FileSyncStatus::Synced,
+            },
+        );
+        cache.flush().unwrap();
+
+        cache.set(
+            &file_path,
+            SyncState {
+                blake3: "bbb".into(),
+                size: 2,
+                mtime: 1,
+                chunk_count: 1,
+                remote_path: "idx/f.txt".into(),
+                last_synced: 1,
+                vclock: VectorClock::new(),
+                device_id: "d".into(),
+                conflict: None,
+                status: FileSyncStatus::Synced,
+            },
+        );
+        cache.flush().unwrap();
+
+        assert!(dir.path().join("state.json.bak").exists());
+    }
+
+    #[test]
+    fn recover_from_corrupt_main_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let bak_path = dir.path().join("state.json.bak");
+
+        let on_disk = StateCacheOnDisk {
+            last_nats_seq: 99,
+            device_id: "recovered".into(),
+            entries: HashMap::new(),
+        };
+        std::fs::write(&bak_path, serde_json::to_string(&on_disk).unwrap()).unwrap();
+        std::fs::write(&path, "NOT VALID JSON {{{{").unwrap();
+
+        let cache = StateCache::open(&path).unwrap();
+        assert_eq!(cache.last_nats_seq(), 99);
+        assert_eq!(cache.device_id(), "recovered");
+    }
+
+    #[test]
+    fn corrupt_main_no_backup_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "GARBAGE").unwrap();
+
+        let result = StateCache::open(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn flush_if_stale_skips_when_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        cache.set_last_nats_seq(1);
+        cache.flush_if_stale(Duration::from_secs(3600)).unwrap();
+        assert!(cache.dirty);
+    }
+
+    #[test]
+    fn flush_if_stale_flushes_when_overdue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        cache.set_last_nats_seq(1);
+        cache.flush_if_stale(Duration::ZERO).unwrap();
+        assert!(!cache.dirty);
+        assert!(path.exists());
     }
 }

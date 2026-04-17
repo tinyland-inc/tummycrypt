@@ -1,6 +1,6 @@
 # Release pipeline for tummycrypt/tcfs
 #
-# Triggered by git tag push (v*.*.*) or manual dispatch.
+# Triggered by git tag push (v*.*.*) or manual dispatch with an explicit tag.
 # Builds cross-platform binaries, .deb/.rpm packages, container images,
 # creates GitHub Release with installers and Homebrew formula.
 #
@@ -37,6 +37,7 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: tcfsd  # Prefixed with lowercase $REGISTRY/$GITHUB_REPOSITORY_OWNER in tags
+  RUST_TOOLCHAIN: 1.93.0
 
 permissions:
   contents: write
@@ -52,18 +53,25 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      image_repo: ${{ steps.version.outputs.image_repo }}
     steps:
       - name: Determine version
         id: version
         run: |
+          if [[ "${GITHUB_REPOSITORY}" != "Jesssullivan/tummycrypt" ]]; then
+            echo "::error::Release workflow is canonical-only and must run from Jesssullivan/tummycrypt"
+            exit 1
+          fi
           if [[ "${{ github.event_name }}" == "push" ]]; then
             TAG="${GITHUB_REF_NAME}"
           else
             TAG="${{ github.event.inputs.tag }}"
           fi
           VERSION="${TAG#v}"  # strip leading v
+          OWNER_LOWER="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_repo=${{ env.REGISTRY }}/${OWNER_LOWER}/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
           echo "Building release: ${TAG} (version ${VERSION})"
 
   # ── Build client binaries ─────────────────────────────────────────────────
@@ -120,6 +128,7 @@ jobs:
             deb: false
             rpm: false
             sign: true
+            vendored-ssl: true
 
           # Windows x86_64 — disabled until tcfs-cli compiles on Windows
           # (connect_daemon uses Unix sockets, needs cfg(windows) TCP fallback)
@@ -138,6 +147,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
@@ -172,7 +182,10 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install protobuf
-          # Native target uses system OpenSSL; cross targets use vendored (openssl-vendored feature)
+          # Only install Homebrew OpenSSL for targets that intentionally link it.
+          # Release artifacts that ship signed binaries should prefer vendored
+          # OpenSSL so they do not depend on a Homebrew dylib being present and
+          # accepted by macOS library validation on the destination machine.
           if [[ "${{ matrix.vendored-ssl }}" != "true" ]]; then
             brew install openssl@3
             echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
@@ -204,7 +217,8 @@ jobs:
           if [[ "${{ matrix.fuse }}" == "true" ]]; then
             FEATURES=""  # use default features (includes fuse)
           fi
-          # Vendor OpenSSL for cross-compilation targets (no system libssl available)
+          # Vendor OpenSSL for release targets that should not depend on a
+          # Homebrew libssl runtime on the destination machine.
           EXTRA_FEATURES=""
           if [[ "${{ matrix.vendored-ssl }}" == "true" ]]; then
             EXTRA_FEATURES="--features openssl-vendored"
@@ -214,6 +228,24 @@ jobs:
             ${FEATURES} \
             ${EXTRA_FEATURES} \
             -p tcfsd
+
+      - name: Validate tcfsd OpenSSL linkage (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/tcfsd"
+          if [ ! -f "$BIN" ]; then
+            echo "::error::expected tcfsd at ${BIN}"
+            exit 1
+          fi
+
+          echo "Inspecting ${BIN} linkage..."
+          otool -L "$BIN"
+
+          if otool -L "$BIN" | grep -E 'libssl\.3\.dylib|libcrypto\.3\.dylib' >/dev/null; then
+            echo "::error::macOS release tcfsd still links a dynamic OpenSSL dylib"
+            exit 1
+          fi
 
       # ── Build tcfs-tui ────────────────────────────────────────────────────
 
@@ -421,6 +453,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push image
+        id: build_image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -428,9 +461,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/jesssullivan/${{ env.IMAGE_NAME }}:${{ needs.plan.outputs.tag }}
-            ghcr.io/jesssullivan/${{ env.IMAGE_NAME }}:${{ needs.plan.outputs.version }}
-            ghcr.io/jesssullivan/${{ env.IMAGE_NAME }}:latest
+            ${{ needs.plan.outputs.image_repo }}:${{ needs.plan.outputs.tag }}
+            ${{ needs.plan.outputs.image_repo }}:${{ needs.plan.outputs.version }}
+            ${{ needs.plan.outputs.image_repo }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: |
@@ -447,13 +480,15 @@ jobs:
         env:
           COSIGN_EXPERIMENTAL: "1"
         run: |
-          # Sign each tag with keyless (OIDC-based) signing
-          for TAG in \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.plan.outputs.tag }}" \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.plan.outputs.version }}" \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"; do
-            cosign sign --yes "${TAG}"
-          done
+          # Sign the pushed image digest once. The tags above all resolve to the
+          # same manifest, so signing mutable tags individually is unnecessary
+          # and more failure-prone than signing the immutable digest directly.
+          IMAGE_DIGEST="${{ steps.build_image.outputs.digest }}"
+          if [ -z "$IMAGE_DIGEST" ]; then
+            echo "::error::docker/build-push-action did not return an image digest"
+            exit 1
+          fi
+          cosign sign --yes "${{ needs.plan.outputs.image_repo }}@${IMAGE_DIGEST}"
 
   # ── Nix build + Attic cache push ─────────────────────────────────────────
 
@@ -636,11 +671,13 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build staticlib
-        run: cargo build -p tcfs-file-provider --release
+        run: cargo build -p tcfs-file-provider --release --no-default-features --features grpc
 
       - name: Import signing certificate
         env:
@@ -716,7 +753,8 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
         run: |
-          swift/fileprovider/notarize.sh build/TCFSProvider.app
+          swift/fileprovider/notarize.sh build/TCFSProvider.app \
+            || echo "::warning::FileProvider notarization failed (non-fatal)"
 
       - name: Create artifact archive
         run: |
@@ -745,7 +783,11 @@ jobs:
     name: Build macOS installer (.pkg)
     runs-on: macos-14
     needs: [plan, build-binaries, build-fileprovider]
-    if: startsWith(github.ref, 'refs/tags/v') && !cancelled()
+    if: |
+      !cancelled() && (
+        startsWith(github.ref, 'refs/tags/v') ||
+        (github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v'))
+      )
     steps:
       - uses: actions/checkout@v4
 
@@ -905,12 +947,16 @@ jobs:
           VERSION="${{ needs.plan.outputs.version }}"
           PKG="tcfs-${VERSION}-macos-aarch64.pkg"
           echo "Submitting .pkg for notarization..."
-          xcrun notarytool submit "$PKG" \
+          if xcrun notarytool submit "$PKG" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_NOTARIZE_PASSWORD" \
-            --wait
-          xcrun stapler staple "$PKG"
+            --wait; then
+            xcrun stapler staple "$PKG" \
+              || echo "::warning::.pkg stapling failed (non-fatal)"
+          else
+            echo "::warning::.pkg notarization failed (non-fatal)"
+          fi
 
       - name: Upload .pkg artifact
         uses: actions/upload-artifact@v4
@@ -932,7 +978,11 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [plan, build-binaries, build-image, generate-installers, build-fileprovider, build-pkg]
-    if: startsWith(github.ref, 'refs/tags/v') && !cancelled()
+    if: |
+      !cancelled() && (
+        startsWith(github.ref, 'refs/tags/v') ||
+        (github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v'))
+      )
 
     steps:
       - name: Download all artifacts
@@ -973,6 +1023,8 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.plan.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: tcfs ${{ needs.plan.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -995,21 +1047,25 @@ jobs:
 
             **Homebrew:**
             ```bash
-            brew install tinyland-inc/tap/tcfs
+            brew tap --custom-remote ${{ github.repository }} https://github.com/${{ github.repository }}.git
+            git -C "$(brew --repo ${{ github.repository }})" fetch origin homebrew-tap
+            git -C "$(brew --repo ${{ github.repository }})" checkout homebrew-tap
+            brew install ${{ github.repository }}/tcfs
             ```
 
             **Container image:**
             ```bash
-            podman pull ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.plan.outputs.tag }}
+            podman pull ${{ needs.plan.outputs.image_repo }}:${{ needs.plan.outputs.tag }}
             ```
 
             **Debian/Ubuntu:**
             ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/tcfsd-${{ needs.plan.outputs.version }}-amd64.deb
             curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/tcfs-${{ needs.plan.outputs.version }}-amd64.deb
-            sudo dpkg -i tcfs-${{ needs.plan.outputs.version }}-amd64.deb
+            sudo dpkg -i tcfsd-${{ needs.plan.outputs.version }}-amd64.deb tcfs-${{ needs.plan.outputs.version }}-amd64.deb
             ```
 
-            **RPM (Fedora/RHEL/Rocky):**
+            **RPM (Fedora/RHEL/Rocky, daemon-only today):**
             ```bash
             curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/tcfsd-${{ needs.plan.outputs.version }}-x86_64.rpm
             sudo rpm -i tcfsd-${{ needs.plan.outputs.version }}-x86_64.rpm
@@ -1029,13 +1085,14 @@ jobs:
               --signature SHA256SUMS.txt.sig \
               --certificate SHA256SUMS.txt.pem \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              --certificate-identity-regexp 'github.com/tinyland-inc/tummycrypt' \
+              --certificate-identity-regexp 'github.com/${{ github.repository }}' \
               SHA256SUMS.txt
             ```
 
-            ### macOS binaries
-            All macOS binaries are signed with Developer ID and notarized by Apple.
-            The FileProvider extension (`TCFSProvider.app`) is stapled for offline verification.
+            ### macOS artifacts
+            macOS CLI binaries are Developer ID signed when Apple credentials are configured.
+            FileProvider and `.pkg` notarization is attempted for Apple artifacts, but release
+            publication does not fail if Apple's notarization service or account agreements are unavailable.
 
             ### Binaries included
             | Binary | Purpose |
@@ -1051,7 +1108,11 @@ jobs:
     name: Update Homebrew formula
     runs-on: ubuntu-latest
     needs: [plan, create-release]
-    if: startsWith(github.ref, 'refs/tags/v') && !cancelled()
+    if: |
+      !cancelled() && (
+        startsWith(github.ref, 'refs/tags/v') ||
+        (github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v'))
+      )
 
     steps:
       - uses: actions/checkout@v4
@@ -1109,15 +1170,17 @@ jobs:
           cp tcfs.rb Formula/tcfs.rb
 
           cat > README.md << 'EOF'
-          # tinyland-inc/homebrew-tap
+          # Canonical tcfs homebrew-tap
 
           Homebrew formulae for [TummyCrypt/tcfs](https://github.com/${{ github.repository }}).
 
           ## Usage
 
           ```bash
-          brew tap tinyland-inc/tap https://github.com/${{ github.repository }} --branch homebrew-tap
-          brew install tcfs
+          brew tap --custom-remote ${{ github.repository }} https://github.com/${{ github.repository }}.git
+          git -C "$(brew --repo ${{ github.repository }})" fetch origin homebrew-tap
+          git -C "$(brew --repo ${{ github.repository }})" checkout homebrew-tap
+          brew install ${{ github.repository }}/tcfs
           ```
           EOF
 

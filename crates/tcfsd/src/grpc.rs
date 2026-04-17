@@ -33,6 +33,7 @@ pub struct TcfsDaemonImpl {
     nats_ok: std::sync::atomic::AtomicBool,
     nats: Arc<TokioMutex<Option<tcfs_sync::NatsClient>>>,
     active_mounts: Arc<TokioMutex<std::collections::HashMap<String, tokio::process::Child>>>,
+    path_locks: tcfs_sync::state::PathLocks,
     /// VFS handle from active FUSE mount — used to invalidate negative cache
     /// on NATS events so remote files appear in readdir immediately.
     pub vfs_handle: tokio::sync::watch::Receiver<Option<std::sync::Arc<tcfs_vfs::TcfsVfs>>>,
@@ -44,6 +45,31 @@ pub struct TcfsDaemonImpl {
     rate_limiter: tcfs_auth::RateLimiter,
 }
 
+/// Validate a client-provided relative path before joining it under a tempdir.
+fn sanitize_rel_path(path: &str) -> std::result::Result<String, String> {
+    use std::path::Component;
+
+    if path.is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+
+    let rel_path = Path::new(path);
+    if rel_path.is_absolute() {
+        return Err(format!("absolute path not allowed: {path}"));
+    }
+
+    for component in rel_path.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(format!("path traversal not allowed: {path}"));
+        }
+    }
+
+    Ok(path.to_string())
+}
+
 impl TcfsDaemonImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -53,6 +79,7 @@ impl TcfsDaemonImpl {
         storage_endpoint: String,
         state_cache: Arc<TokioMutex<tcfs_sync::state::StateCache>>,
         operator: Arc<TokioMutex<Option<opendal::Operator>>>,
+        path_locks: tcfs_sync::state::PathLocks,
         device_id: String,
         device_name: String,
         master_key: Option<tcfs_crypto::MasterKey>,
@@ -101,6 +128,7 @@ impl TcfsDaemonImpl {
             nats_ok: std::sync::atomic::AtomicBool::new(false),
             nats: Arc::new(TokioMutex::new(None)),
             active_mounts: Arc::new(TokioMutex::new(std::collections::HashMap::new())),
+            path_locks,
             vfs_handle: vfs_rx,
             vfs_tx,
             session_store: tcfs_auth::SessionStore::new(),
@@ -140,14 +168,18 @@ impl TcfsDaemonImpl {
     /// Returns Ok(Session) if the session is valid, or a gRPC UNAUTHENTICATED
     /// error if auth is required and the token is missing/invalid/expired.
     ///
-    /// When `config.auth.require_session` is false (default for alpha), this
-    /// returns a synthetic session with full permissions (bypass mode).
+    /// When `config.auth.require_session` is false, this returns a synthetic
+    /// session with full permissions (bypass mode). A warning is logged on
+    /// each bypassed request.
     async fn require_session<T>(
         &self,
         request: &tonic::Request<T>,
     ) -> Result<tcfs_auth::Session, tonic::Status> {
-        // Alpha bypass: if auth is not required, allow all requests with full permissions
         if !self.config.auth.require_session {
+            tracing::warn!(
+                "AUTH BYPASS: request granted full permissions — \
+                 set auth.require_session=true for production"
+            );
             return Ok(tcfs_auth::Session::new(&self.device_id, "local", "bypass"));
         }
 
@@ -202,6 +234,21 @@ impl TcfsDaemonImpl {
     /// Get a handle to the NATS client for shutdown notification.
     pub fn nats_handle(&self) -> Arc<TokioMutex<Option<tcfs_sync::NatsClient>>> {
         self.nats.clone()
+    }
+
+    /// Get a handle to the master key for background tasks (e.g., periodic reconciliation).
+    pub fn master_key_handle(&self) -> Arc<TokioMutex<Option<tcfs_crypto::MasterKey>>> {
+        self.master_key.clone()
+    }
+
+    fn lock_path_for_request(&self, path: &Path) -> std::path::PathBuf {
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        if let Some(root) = self.config.sync.sync_root.as_deref() {
+            return root.join(path);
+        }
+        path.to_path_buf()
     }
 
     /// Publish a ConflictResolved event via NATS (best-effort).
@@ -347,7 +394,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
 
         let mp = mountpoint.clone();
         let cache_dir = self.config.fuse.cache_dir.clone();
-        let cache_max = self.config.fuse.cache_max_mb as u64 * 1024 * 1024;
+        let cache_max = self.config.fuse.cache_max_mb * 1024 * 1024;
         let neg_ttl = self.config.fuse.negative_cache_ttl_secs;
         let mountpoint_key = req.mountpoint.clone();
         let active_mounts_watcher = self.active_mounts.clone();
@@ -571,12 +618,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
         let op = op.clone();
 
         let state_cache = self.state_cache.clone();
-        let prefix = self
-            .config
-            .storage
-            .remote_prefix
-            .clone()
-            .unwrap_or_else(|| self.config.storage.bucket.clone());
+        let prefix = self.config.storage.resolved_prefix().to_string();
 
         let mut stream = request.into_inner();
 
@@ -597,6 +639,10 @@ impl TcfsDaemon for TcfsDaemonImpl {
                 "no path provided in push stream",
             ));
         }
+
+        let path = sanitize_rel_path(&path).map_err(tonic::Status::invalid_argument)?;
+        let lock_path = self.lock_path_for_request(Path::new(&path));
+        let _lock_guard = self.path_locks.lock(&lock_path).await;
 
         // Write to a temp file and upload via sync engine
         let tmp_dir =
@@ -649,28 +695,14 @@ impl TcfsDaemon for TcfsDaemonImpl {
                         "push: conflict detected"
                     );
                     let mut cache = state_cache.lock().await;
-                    if let Some(entry) = cache.get(&local_path).cloned() {
-                        let updated = tcfs_sync::state::SyncState {
-                            conflict: Some(info.clone()),
-                            ..entry
-                        };
-                        cache.set(&local_path, updated);
+                    if cache.mark_conflict(&local_path, info.clone()) {
                         let _ = cache.flush();
                     }
                 }
 
-                // Write index entry for discoverability (same as CLI push)
-                if !upload.skipped {
-                    let index_key =
-                        format!("{}/index/{}", prefix.trim_end_matches('/'), &normalized_rel);
-                    let index_entry = format!(
-                        "manifest_hash={}\nsize={}\nchunks={}\n",
-                        upload.hash, total_bytes, upload.chunks
-                    );
-                    if let Err(e) = op.write(&index_key, index_entry.into_bytes()).await {
-                        tracing::warn!("failed to write index entry: {e}");
-                    }
-                }
+                // Rel-path publication is owned by upload_file_with_device so
+                // the daemon follows the same crash-aware manifest/index flow
+                // as CLI and tree push.
 
                 // Publish state event if NATS is connected and file was actually uploaded
                 if !upload.skipped {
@@ -759,16 +791,12 @@ impl TcfsDaemon for TcfsDaemonImpl {
             .ok_or_else(|| tonic::Status::unavailable("no storage operator — check credentials"))?;
         let op = op.clone();
 
-        let prefix = self
-            .config
-            .storage
-            .remote_prefix
-            .clone()
-            .unwrap_or_else(|| self.config.storage.bucket.clone());
+        let prefix = self.config.storage.resolved_prefix().to_string();
         let local_path = std::path::PathBuf::from(&req.local_path);
         let state_cache = self.state_cache.clone();
 
         let sync_root = self.config.sync.sync_root.as_deref();
+        let _lock_guard = self.path_locks.lock(&local_path).await;
 
         let resolved_manifest =
             tcfs_sync::engine::resolve_manifest_path(&op, &req.remote_path, &prefix, sync_root)
@@ -858,12 +886,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
         let blake3_hex = meta
             .blake3_hex()
             .ok_or_else(|| tonic::Status::invalid_argument("stub oid missing blake3: prefix"))?;
-        let prefix = self
-            .config
-            .storage
-            .remote_prefix
-            .clone()
-            .unwrap_or_else(|| self.config.storage.bucket.clone());
+        let prefix = self.config.storage.resolved_prefix().to_string();
         let manifest_path = format!("{prefix}/manifests/{blake3_hex}");
 
         let op = self.operator.lock().await;
@@ -874,6 +897,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
         drop(self.operator.lock().await);
 
         let total_bytes = meta.size;
+        let _lock_guard = self.path_locks.lock(&real_path).await;
 
         let result = {
             let mut cache = self.state_cache.lock().await;
@@ -943,6 +967,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
         Self::check_permission(&session, "mount")?;
         let req = request.into_inner();
         let path = std::path::PathBuf::from(&req.path);
+        let _lock_guard = self.path_locks.lock(&path).await;
 
         info!(path = %req.path, force = req.force, "unsync requested");
 
@@ -1044,13 +1069,32 @@ impl TcfsDaemon for TcfsDaemonImpl {
         let cache = self.state_cache.lock().await;
 
         match cache.get(&path) {
-            Some(entry) => Ok(tonic::Response::new(SyncStatusResponse {
-                path: req.path,
-                state: "synced".into(),
-                blake3: entry.blake3.clone(),
-                size: entry.size,
-                last_synced: entry.last_synced as i64,
-            })),
+            Some(entry) => {
+                let state = if entry.status == tcfs_sync::state::FileSyncStatus::Synced {
+                    match cache.needs_sync(&path) {
+                        Ok(Some(_)) => "pending".to_string(),
+                        Ok(None) => entry.status.to_string(),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %path.display(),
+                                "needs_sync failed during sync_status; reporting unknown"
+                            );
+                            "unknown".to_string()
+                        }
+                    }
+                } else {
+                    entry.status.to_string()
+                };
+
+                Ok(tonic::Response::new(SyncStatusResponse {
+                    path: req.path,
+                    state,
+                    blake3: entry.blake3.clone(),
+                    size: entry.size,
+                    last_synced: entry.last_synced as i64,
+                }))
+            }
             None => {
                 // Check if it needs sync
                 let state = match cache.needs_sync(&path) {
@@ -1098,15 +1142,30 @@ impl TcfsDaemon for TcfsDaemonImpl {
         let mut dirs_seen = std::collections::HashSet::new();
         let mut files: Vec<FileEntry> = Vec::new();
 
+        let storage_prefix = self.config.storage.resolved_prefix();
+
         for (key, state) in &all {
             // Compute logical relative path from cache key (local abs path).
-            // Skip entries not under sync_root (e.g., /private/tmp/ test artifacts).
+            // Primary: strip sync_root from local path.
+            // Fallback: extract rel_path from remote_path (e.g., "data/manifests/hash"
+            //   → look up original rel_path from the index key pattern).
+            // Skip entries that can't be mapped (e.g., /private/tmp/ test artifacts
+            //   with no usable remote_path).
             let rel_path = match key
                 .strip_prefix(&sync_root_prefix)
                 .or_else(|| key.strip_prefix(&sync_root_str))
             {
                 Some(r) => r.trim_start_matches('/'),
-                None => continue,
+                None => {
+                    // Fallback: derive rel_path from remote_path for entries not
+                    // keyed under sync_root (e.g., FileProvider container temps).
+                    let index_prefix = format!("{}/index/", storage_prefix);
+                    if let Some(rel) = state.remote_path.strip_prefix(&index_prefix) {
+                        rel.trim_start_matches('/')
+                    } else {
+                        continue;
+                    }
+                }
             };
 
             if rel_path.is_empty() {
@@ -1159,10 +1218,18 @@ impl TcfsDaemon for TcfsDaemonImpl {
                         last_synced: 0,
                         is_directory: true,
                         blake3: String::new(),
+                        hydration_state: String::new(),
                     });
                 }
             } else {
                 // Immediate child file
+                let hydration = match state.status {
+                    tcfs_sync::state::FileSyncStatus::NotSynced => "not_synced",
+                    tcfs_sync::state::FileSyncStatus::Synced => "synced",
+                    tcfs_sync::state::FileSyncStatus::Active => "active",
+                    tcfs_sync::state::FileSyncStatus::Locked => "locked",
+                    tcfs_sync::state::FileSyncStatus::Conflict => "conflict",
+                };
                 files.push(FileEntry {
                     path: rel_path.to_string(),
                     filename: remainder.clone(),
@@ -1170,6 +1237,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
                     last_synced: state.last_synced as i64,
                     is_directory: false,
                     blake3: state.blake3.clone(),
+                    hydration_state: hydration.to_string(),
                 });
             }
         }
@@ -1275,7 +1343,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
                 }
                 drop(op);
 
-                // Update state cache (clear conflict)
+                // Update state cache (clear conflict + status)
                 {
                     let mut cache = self.state_cache.lock().await;
                     if let Some(entry) = cache.get(&path).cloned() {
@@ -1283,6 +1351,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
                             vclock,
                             last_synced: tcfs_sync::StateEvent::now(),
                             conflict: None,
+                            status: tcfs_sync::state::FileSyncStatus::Synced,
                             ..entry
                         };
                         cache.set(&path, updated);
@@ -1306,12 +1375,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
                     let cache = self.state_cache.lock().await;
                     let entry = cache.get(&path);
                     let remote = entry.map(|e| e.remote_path.clone()).unwrap_or_default();
-                    let prefix = self
-                        .config
-                        .storage
-                        .remote_prefix
-                        .clone()
-                        .unwrap_or_else(|| self.config.storage.bucket.clone());
+                    let prefix = self.config.storage.resolved_prefix().to_string();
                     (remote, prefix)
                 };
 
@@ -1347,6 +1411,13 @@ impl TcfsDaemon for TcfsDaemonImpl {
 
                 match result {
                     Ok(_dl) => {
+                        // Ensure conflict is fully cleared (download_file_with_device
+                        // creates fresh state, but belt-and-suspenders)
+                        {
+                            let mut cache = self.state_cache.lock().await;
+                            cache.resolve_conflict(&path);
+                            let _ = cache.flush();
+                        }
                         self.publish_conflict_resolved(&req.path, "keep_remote")
                             .await;
                         Ok(tonic::Response::new(ResolveConflictResponse {
@@ -1368,12 +1439,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
                     let cache = self.state_cache.lock().await;
                     let entry = cache.get(&path);
                     let remote = entry.map(|e| e.remote_path.clone()).unwrap_or_default();
-                    let prefix = self
-                        .config
-                        .storage
-                        .remote_prefix
-                        .clone()
-                        .unwrap_or_else(|| self.config.storage.bucket.clone());
+                    let prefix = self.config.storage.resolved_prefix().to_string();
                     (remote, prefix)
                 };
 
@@ -1456,6 +1522,13 @@ impl TcfsDaemon for TcfsDaemonImpl {
                             }
                         }
 
+                        // Ensure conflict is fully cleared on the original path
+                        {
+                            let mut cache = self.state_cache.lock().await;
+                            cache.resolve_conflict(&path);
+                            let _ = cache.flush();
+                        }
+
                         self.publish_conflict_resolved(&req.path, "keep_both").await;
                         Ok(tonic::Response::new(ResolveConflictResponse {
                             success: true,
@@ -1474,7 +1547,11 @@ impl TcfsDaemon for TcfsDaemonImpl {
                     }
                 }
             }
-            _ => unreachable!("already validated"),
+            _ => {
+                return Err(tonic::Status::invalid_argument(
+                    "unsupported resolution strategy",
+                ))
+            }
         }
     }
 
@@ -1625,7 +1702,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
         // the daemon's durable state_sync_loop consumer for messages.
         let nats_tx = async_tx;
         let nats_client = self.nats.clone();
-        let device_id = self.device_id.clone();
+        let _device_id = self.device_id.clone();
         tokio::spawn(async move {
             let client = nats_client.lock().await;
             let Some(nats) = client.as_ref() else {
@@ -2183,7 +2260,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
         Ok(tonic::Response::new(DiagnosticsResponse {
             state_cache_entries: StateCacheBackend::len(&*cache) as i32,
             conflict_count,
-            last_nats_seq: cache.last_nats_seq as i64,
+            last_nats_seq: cache.last_nats_seq() as i64,
             nats_connected: self.nats_ok.load(std::sync::atomic::Ordering::Relaxed),
             auto_unsync_eligible: eligible,
             auto_unsync_max_age_secs: max_age as i64,
@@ -2268,4 +2345,616 @@ pub async fn serve(
     }
 
     result
+}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opendal::services::Memory;
+    use opendal::Operator;
+    use tcfs_core::proto::tcfs_daemon_client::TcfsDaemonClient;
+    use tonic::transport::{Channel, Endpoint, Uri};
+    use tower::service_fn;
+
+    /// Build a TcfsDaemonImpl with in-memory components for testing.
+    fn test_daemon_with_operator(operator_value: Option<Operator>) -> TcfsDaemonImpl {
+        let mut config = TcfsConfig::default();
+        config.auth.require_session = false;
+        config.storage.bucket = "data".into();
+        config.storage.remote_prefix = Some("data".into());
+        let config = Arc::new(config);
+        let cred_store = crate::cred_store::new_shared();
+        let state_dir = tempfile::tempdir().unwrap().keep();
+        let state_path = state_dir.join("state.json");
+        let state_cache = Arc::new(TokioMutex::new(
+            tcfs_sync::state::StateCache::open(&state_path).unwrap(),
+        ));
+        let operator = Arc::new(TokioMutex::new(operator_value.clone()));
+
+        TcfsDaemonImpl::new(
+            cred_store,
+            config,
+            operator_value.is_some(),
+            "http://test:8333".into(),
+            state_cache,
+            operator,
+            tcfs_sync::state::PathLocks::new(),
+            "test-device-id".into(),
+            "test-device".into(),
+            None,
+        )
+    }
+
+    fn test_daemon() -> TcfsDaemonImpl {
+        test_daemon_with_operator(None)
+    }
+
+    fn memory_operator() -> Operator {
+        Operator::new(Memory::default()).unwrap().finish()
+    }
+
+    async fn connect_test_client(socket_path: &Path) -> TcfsDaemonClient<Channel> {
+        let path = socket_path.to_path_buf();
+        let mut last_err = None;
+
+        for _ in 0..50 {
+            match Endpoint::from_static("http://[::]:0")
+                .connect_with_connector(service_fn({
+                    let path = path.clone();
+                    move |_: Uri| {
+                        let path = path.clone();
+                        async move {
+                            let stream = tokio::net::UnixStream::connect(&path).await?;
+                            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                        }
+                    }
+                }))
+                .await
+            {
+                Ok(channel) => return TcfsDaemonClient::new(channel),
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        panic!(
+            "failed to connect test client to {}: {}",
+            socket_path.display(),
+            last_err.unwrap()
+        );
+    }
+
+    async fn spawn_test_server(
+        daemon: TcfsDaemonImpl,
+    ) -> (
+        tempfile::TempDir,
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("tcfsd.sock");
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_for_server = shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            serve(&socket_path, None, daemon, shutdown_for_server.notified()).await
+        });
+
+        (dir, handle, shutdown)
+    }
+
+    #[tokio::test]
+    async fn status_returns_version() {
+        let daemon = test_daemon();
+        let resp = daemon
+            .status(tonic::Request::new(StatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(resp.device_id, "test-device-id");
+        assert_eq!(resp.device_name, "test-device");
+        assert!(!resp.storage_ok);
+        assert!(!resp.nats_ok);
+        assert_eq!(resp.active_mounts, 0);
+        assert!(resp.uptime_secs >= 0);
+    }
+
+    #[tokio::test]
+    async fn credential_status_empty() {
+        let daemon = test_daemon();
+        let resp = daemon
+            .credential_status(tonic::Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.loaded);
+        assert_eq!(resp.source, "none");
+        assert!(resp.needs_reload);
+    }
+
+    #[tokio::test]
+    async fn auth_status_locked_by_default() {
+        let daemon = test_daemon();
+        let resp = daemon
+            .auth_status(tonic::Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.unlocked);
+        assert!(resp.available_methods.contains(&"master_key".to_string()));
+        assert!(resp.auth_method.is_empty());
+        assert_eq!(resp.session_device_id, "test-device-id");
+    }
+
+    #[tokio::test]
+    async fn auth_unlock_then_lock_roundtrip() {
+        let daemon = test_daemon();
+
+        // Unlock with a 32-byte key
+        let key = vec![0xAA; tcfs_crypto::KEY_SIZE];
+        let resp = daemon
+            .auth_unlock(tonic::Request::new(AuthUnlockRequest { master_key: key }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+
+        // Verify unlocked
+        let status = daemon
+            .auth_status(tonic::Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(status.unlocked);
+
+        // Lock
+        let resp = daemon
+            .auth_lock(tonic::Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+
+        // Verify locked
+        let status = daemon
+            .auth_status(tonic::Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!status.unlocked);
+    }
+
+    #[tokio::test]
+    async fn auth_unlock_wrong_key_size_fails() {
+        let daemon = test_daemon();
+
+        let resp = daemon
+            .auth_unlock(tonic::Request::new(AuthUnlockRequest {
+                master_key: vec![0x00; 16], // too short
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.error.contains("must be"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_empty_state() {
+        let daemon = test_daemon();
+        let resp = daemon
+            .diagnostics(tonic::Request::new(DiagnosticsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.state_cache_entries, 0);
+        assert_eq!(resp.conflict_count, 0);
+        assert!(!resp.nats_connected);
+        assert!(!resp.storage_reachable);
+        assert_eq!(resp.device_id, "test-device-id");
+    }
+
+    #[tokio::test]
+    async fn sync_status_unknown_path() {
+        let daemon = test_daemon();
+        let resp = daemon
+            .sync_status(tonic::Request::new(SyncStatusRequest {
+                path: "/nonexistent/file.txt".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Unknown path returns empty/default state
+        assert!(resp.state.is_empty() || resp.state == "unknown");
+    }
+
+    #[tokio::test]
+    async fn sync_status_reports_explicit_conflict_state() {
+        let daemon = test_daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let tracked = dir.path().join("conflicted.txt");
+        std::fs::write(&tracked, b"conflicted").unwrap();
+
+        {
+            let mut cache = daemon.state_cache.lock().await;
+            let mut entry = tcfs_sync::state::make_sync_state(
+                &tracked,
+                "abc123".to_string(),
+                1,
+                "data/manifests/abc123".to_string(),
+            )
+            .unwrap();
+            entry.status = tcfs_sync::state::FileSyncStatus::Conflict;
+            cache.set(&tracked, entry);
+            cache.flush().unwrap();
+        }
+
+        let resp = daemon
+            .sync_status(tonic::Request::new(SyncStatusRequest {
+                path: tracked.display().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.state, "conflict");
+    }
+
+    #[tokio::test]
+    async fn sync_status_reports_pending_for_modified_tracked_file() {
+        let daemon = test_daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let tracked = dir.path().join("modified.txt");
+        std::fs::write(&tracked, b"alpha").unwrap();
+
+        {
+            let mut cache = daemon.state_cache.lock().await;
+            let entry = tcfs_sync::state::make_sync_state(
+                &tracked,
+                "tracked-alpha".to_string(),
+                1,
+                "data/manifests/alpha".to_string(),
+            )
+            .unwrap();
+            cache.set(&tracked, entry);
+            cache.flush().unwrap();
+        }
+
+        std::fs::write(&tracked, b"alpha updated").unwrap();
+
+        let resp = daemon
+            .sync_status(tonic::Request::new(SyncStatusRequest {
+                path: tracked.display().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.state, "pending");
+    }
+
+    /// When a Synced entry exists but `needs_sync` errors (e.g. the path can't
+    /// be stat'd), we must NOT report the stale "synced" state. We report
+    /// "unknown" instead so observers can see the IO failure rather than
+    /// trusting a lie.
+    #[tokio::test]
+    async fn sync_status_surfaces_needs_sync_error_instead_of_synced() {
+        let daemon = test_daemon();
+        let dir = tempfile::tempdir().unwrap();
+        // Path that will never exist — needs_sync's std::fs::metadata will Err.
+        let missing = dir.path().join("vanished.txt");
+
+        {
+            let mut cache = daemon.state_cache.lock().await;
+            cache.set(
+                &missing,
+                tcfs_sync::state::SyncState {
+                    blake3: "deadbeef".into(),
+                    size: 42,
+                    mtime: 1_700_000_000,
+                    chunk_count: 1,
+                    remote_path: "data/manifests/deadbeef".into(),
+                    last_synced: 1_700_000_000,
+                    vclock: tcfs_sync::conflict::VectorClock::default(),
+                    device_id: "test-device-id".into(),
+                    conflict: None,
+                    status: tcfs_sync::state::FileSyncStatus::Synced,
+                },
+            );
+            cache.flush().unwrap();
+        }
+
+        let resp = daemon
+            .sync_status(tonic::Request::new(SyncStatusRequest {
+                path: missing.display().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_ne!(
+            resp.state, "synced",
+            "needs_sync Err was silently collapsed into \"synced\""
+        );
+        assert_eq!(resp.state, "unknown");
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_invalid_resolution() {
+        let daemon = test_daemon();
+        let resp = daemon
+            .resolve_conflict(tonic::Request::new(ResolveConflictRequest {
+                resolution: "invalid_strategy".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.error.contains("invalid resolution"));
+    }
+
+    #[tokio::test]
+    async fn mount_missing_required_fields_returns_error_response() {
+        let daemon = test_daemon();
+
+        let resp = daemon
+            .mount(tonic::Request::new(MountRequest {
+                remote: String::new(),
+                mountpoint: String::new(),
+                read_only: false,
+                options: vec![],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.error.contains("mountpoint and remote are required"));
+    }
+
+    #[tokio::test]
+    async fn mount_requires_initialized_operator() {
+        let daemon = test_daemon();
+        let mountpoint_dir = tempfile::tempdir().unwrap();
+
+        let err = daemon
+            .mount(tonic::Request::new(MountRequest {
+                remote: "s3://127.0.0.1/test/data".into(),
+                mountpoint: mountpoint_dir.path().join("mnt").display().to_string(),
+                read_only: false,
+                options: vec![],
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("storage operator not initialized"));
+    }
+
+    #[tokio::test]
+    async fn mount_rejects_duplicate_active_mountpoint() {
+        let daemon = test_daemon();
+        let mountpoint = tempfile::tempdir().unwrap();
+        let mountpoint_str = mountpoint.path().display().to_string();
+        let sentinel = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        daemon
+            .active_mounts
+            .lock()
+            .await
+            .insert(mountpoint_str.clone(), sentinel);
+
+        let resp = daemon
+            .mount(tonic::Request::new(MountRequest {
+                remote: "s3://127.0.0.1/test/data".into(),
+                mountpoint: mountpoint_str.clone(),
+                read_only: false,
+                options: vec![],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.error.contains("already mounted"));
+
+        let child = { daemon.active_mounts.lock().await.remove(&mountpoint_str) };
+        if let Some(mut child) = child {
+            let _ = child.kill().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unmount_requires_mountpoint() {
+        let daemon = test_daemon();
+
+        let resp = daemon
+            .unmount(tonic::Request::new(UnmountRequest {
+                mountpoint: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.error.contains("mountpoint is required"));
+    }
+
+    #[tokio::test]
+    async fn push_then_pull_streams_complete_successfully_over_uds() {
+        let daemon = test_daemon_with_operator(Some(memory_operator()));
+        let (socket_dir, server_handle, shutdown) = spawn_test_server(daemon).await;
+        let socket_path = socket_dir.path().join("tcfsd.sock");
+        let mut client = connect_test_client(&socket_path).await;
+
+        let push_chunk = PushChunk {
+            path: "docs/hello.txt".into(),
+            data: b"hello over grpc".to_vec(),
+            offset: 0,
+            last: true,
+        };
+
+        let mut push_stream = client
+            .push(tonic::Request::new(tokio_stream::once(push_chunk)))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let push_progress = push_stream
+            .message()
+            .await
+            .unwrap()
+            .expect("push should yield a final progress message");
+        assert!(push_progress.done);
+        assert!(
+            push_progress.error.is_empty(),
+            "push error: {}",
+            push_progress.error
+        );
+        assert_eq!(push_progress.bytes_sent, b"hello over grpc".len() as u64);
+        assert_eq!(push_progress.total_bytes, b"hello over grpc".len() as u64);
+        assert!(!push_progress.chunk_hash.is_empty());
+        assert!(push_stream.message().await.unwrap().is_none());
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let output_path = output_dir.path().join("downloaded.txt");
+
+        let mut pull_stream = client
+            .pull(tonic::Request::new(PullRequest {
+                remote_path: "docs/hello.txt".into(),
+                local_path: output_path.display().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let pull_progress = pull_stream
+            .message()
+            .await
+            .unwrap()
+            .expect("pull should yield a final progress message");
+        assert!(pull_progress.done);
+        assert!(
+            pull_progress.error.is_empty(),
+            "pull error: {}",
+            pull_progress.error
+        );
+        assert_eq!(
+            pull_progress.bytes_received,
+            b"hello over grpc".len() as u64
+        );
+        assert_eq!(pull_progress.total_bytes, b"hello over grpc".len() as u64);
+        assert!(pull_stream.message().await.unwrap().is_none());
+        assert_eq!(
+            std::fs::read(&output_path).unwrap(),
+            b"hello over grpc".to_vec()
+        );
+
+        shutdown.notify_one();
+        let server_result = server_handle.await.unwrap();
+        assert!(
+            server_result.is_ok(),
+            "server exited with error: {server_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsync_waits_for_active_path_lock() {
+        let daemon = test_daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let tracked = dir.path().join("tracked.txt");
+        std::fs::write(&tracked, b"tracked").unwrap();
+
+        {
+            let mut cache = daemon.state_cache.lock().await;
+            let entry = tcfs_sync::state::make_sync_state(
+                &tracked,
+                "abc123".to_string(),
+                1,
+                "data/manifests/abc123".to_string(),
+            )
+            .unwrap();
+            cache.set(&tracked, entry);
+            cache.flush().unwrap();
+        }
+
+        let state_cache = daemon.state_cache_handle();
+        let guard = daemon.path_locks.lock(&tracked).await;
+        let tracked_str = tracked.display().to_string();
+
+        let handle = tokio::spawn(async move {
+            daemon
+                .unsync(tonic::Request::new(UnsyncRequest {
+                    path: tracked_str,
+                    force: false,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "unsync should wait while the path lock is held"
+        );
+
+        drop(guard);
+
+        let resp = handle.await.unwrap();
+        assert!(resp.success, "unsync error: {}", resp.error);
+
+        let cache = state_cache.lock().await;
+        let entry = cache
+            .get(&tracked)
+            .expect("state should still exist after unsync");
+        assert_eq!(entry.status, tcfs_sync::state::FileSyncStatus::NotSynced);
+    }
+
+    #[test]
+    fn sanitize_rejects_parent_traversal() {
+        assert!(sanitize_rel_path("../../etc/passwd").is_err());
+        assert!(sanitize_rel_path("foo/../../../bar").is_err());
+        assert!(sanitize_rel_path("..").is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_absolute_paths() {
+        assert!(sanitize_rel_path("/etc/passwd").is_err());
+        assert!(sanitize_rel_path("/tmp/file.txt").is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_empty_path() {
+        assert!(sanitize_rel_path("").is_err());
+    }
+
+    #[test]
+    fn sanitize_accepts_valid_relative_paths() {
+        assert_eq!(sanitize_rel_path("file.txt").unwrap(), "file.txt");
+        assert_eq!(sanitize_rel_path("a/b/c.txt").unwrap(), "a/b/c.txt");
+        assert_eq!(
+            sanitize_rel_path("docs/nested/deep.md").unwrap(),
+            "docs/nested/deep.md"
+        );
+        assert_eq!(sanitize_rel_path("./current.txt").unwrap(), "./current.txt");
+    }
 }

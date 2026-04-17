@@ -197,28 +197,38 @@ mod inner {
         js: jetstream::Context,
     }
 
+    /// Resolve the effective NATS URL based on TLS requirements.
+    ///
+    /// - `require_tls=true` + `nats://` → upgraded to `tls://`
+    /// - `require_tls=true` + `tls://` → unchanged
+    /// - `require_tls=false` + `nats://` → unchanged (plaintext warning logged)
+    /// - `require_tls=false` + `tls://` → unchanged
+    pub fn resolve_nats_url(url: &str, require_tls: bool) -> String {
+        if require_tls && url.starts_with("nats://") {
+            let upgraded = url.replacen("nats://", "tls://", 1);
+            warn!(
+                original = url,
+                upgraded = %upgraded,
+                "NATS: upgrading to TLS (nats_tls=true)"
+            );
+            upgraded
+        } else {
+            if !require_tls && !url.starts_with("tls://") {
+                warn!(
+                    url,
+                    "NATS: connecting without TLS — credentials transmitted in plaintext"
+                );
+            }
+            url.to_string()
+        }
+    }
+
     impl NatsClient {
         /// Connect to NATS and return a client with JetStream enabled.
         ///
         /// If `require_tls` is true and the URL uses `nats://`, it is upgraded to `tls://`.
         pub async fn connect(url: &str, require_tls: bool, token: Option<&str>) -> Result<Self> {
-            let effective_url = if require_tls && url.starts_with("nats://") {
-                let upgraded = url.replacen("nats://", "tls://", 1);
-                warn!(
-                    original = url,
-                    upgraded = %upgraded,
-                    "NATS: upgrading to TLS (nats_tls=true)"
-                );
-                upgraded
-            } else {
-                if !require_tls && !url.starts_with("tls://") {
-                    warn!(
-                        url,
-                        "NATS: connecting without TLS — credentials transmitted in plaintext"
-                    );
-                }
-                url.to_string()
-            };
+            let effective_url = resolve_nats_url(url, require_tls);
 
             let client = if let Some(tok) = token {
                 info!("NATS: connecting with token auth");
@@ -521,6 +531,34 @@ mod inner {
 
     // ── process_with_retry helper ─────────────────────────────────────────────
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TaskDeliveryAction {
+        Ack,
+        Nak,
+    }
+
+    async fn decide_task_delivery<F, Fut>(
+        task: SyncTask,
+        task_id: &str,
+        task_type: &str,
+        f: F,
+    ) -> TaskDeliveryAction
+    where
+        F: FnOnce(SyncTask) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        match f(task).await {
+            Ok(()) => {
+                debug!(task_id, task_type, "task succeeded");
+                TaskDeliveryAction::Ack
+            }
+            Err(e) => {
+                error!(task_id, task_type, error = %e, "task failed — naking for retry");
+                TaskDeliveryAction::Nak
+            }
+        }
+    }
+
     /// Process a task: run `f`, ack on success, nak on error.
     ///
     /// After `max_deliver` naks NATS stops redelivering the message.
@@ -533,19 +571,316 @@ mod inner {
         let task_type = msg.task.type_name();
         let task = msg.task.clone();
 
-        match f(task).await {
-            Ok(()) => {
-                debug!(task_id, task_type, "task succeeded");
+        match decide_task_delivery(task, &task_id, task_type, f).await {
+            TaskDeliveryAction::Ack => {
                 if let Err(e) = msg.ack().await {
                     warn!(task_id, "ack failed: {e}");
                 }
             }
-            Err(e) => {
-                error!(task_id, task_type, error = %e, "task failed — naking for retry");
+            TaskDeliveryAction::Nak => {
                 if let Err(nak_err) = msg.nak().await {
                     warn!(task_id, "nak failed: {nak_err}");
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn sample_vclock() -> VectorClock {
+            let mut vc = VectorClock::new();
+            vc.tick("neo");
+            vc.tick("neo");
+            vc.tick("honey");
+            vc
+        }
+
+        // ── StateEvent serialization ─────────────────────────────────────
+
+        #[test]
+        fn state_event_file_synced_roundtrip() {
+            let event = StateEvent::FileSynced {
+                device_id: "neo".into(),
+                rel_path: "docs/readme.md".into(),
+                blake3: "abc123def456".into(),
+                size: 2048,
+                vclock: sample_vclock(),
+                manifest_path: "data/manifests/abc123def456".into(),
+                timestamp: 1700000000,
+            };
+            let bytes = event.to_bytes().unwrap();
+            let decoded = StateEvent::from_bytes(&bytes).unwrap();
+
+            assert_eq!(decoded.device_id(), "neo");
+            assert_eq!(decoded.event_type(), "file_synced");
+            if let StateEvent::FileSynced { rel_path, size, .. } = decoded {
+                assert_eq!(rel_path, "docs/readme.md");
+                assert_eq!(size, 2048);
+            } else {
+                panic!("wrong variant");
+            }
+        }
+
+        #[test]
+        fn state_event_file_deleted_roundtrip() {
+            let event = StateEvent::FileDeleted {
+                device_id: "honey".into(),
+                rel_path: "old.txt".into(),
+                vclock: sample_vclock(),
+                timestamp: 1700000001,
+            };
+            let bytes = event.to_bytes().unwrap();
+            let decoded = StateEvent::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.device_id(), "honey");
+            assert_eq!(decoded.event_type(), "file_deleted");
+        }
+
+        #[test]
+        fn state_event_file_renamed_roundtrip() {
+            let event = StateEvent::FileRenamed {
+                device_id: "neo".into(),
+                old_path: "a.txt".into(),
+                new_path: "b.txt".into(),
+                vclock: VectorClock::new(),
+                timestamp: 0,
+            };
+            let bytes = event.to_bytes().unwrap();
+            let decoded = StateEvent::from_bytes(&bytes).unwrap();
+            if let StateEvent::FileRenamed {
+                old_path, new_path, ..
+            } = decoded
+            {
+                assert_eq!(old_path, "a.txt");
+                assert_eq!(new_path, "b.txt");
+            } else {
+                panic!("wrong variant");
+            }
+        }
+
+        #[test]
+        fn state_event_device_online_roundtrip() {
+            let event = StateEvent::DeviceOnline {
+                device_id: "neo".into(),
+                last_seq: 42,
+                timestamp: 1700000000,
+            };
+            let bytes = event.to_bytes().unwrap();
+            let decoded = StateEvent::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.event_type(), "device_online");
+            if let StateEvent::DeviceOnline { last_seq, .. } = decoded {
+                assert_eq!(last_seq, 42);
+            } else {
+                panic!("wrong variant");
+            }
+        }
+
+        #[test]
+        fn state_event_device_offline_roundtrip() {
+            let event = StateEvent::DeviceOffline {
+                device_id: "honey".into(),
+                last_seq: 99,
+                timestamp: 1700000000,
+            };
+            let bytes = event.to_bytes().unwrap();
+            let decoded = StateEvent::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.event_type(), "device_offline");
+        }
+
+        #[test]
+        fn state_event_conflict_resolved_roundtrip() {
+            let event = StateEvent::ConflictResolved {
+                device_id: "neo".into(),
+                rel_path: "conflict.txt".into(),
+                resolution: "keep_local".into(),
+                merged_vclock: sample_vclock(),
+                timestamp: 1700000000,
+            };
+            let bytes = event.to_bytes().unwrap();
+            let decoded = StateEvent::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.event_type(), "conflict_resolved");
+            if let StateEvent::ConflictResolved { resolution, .. } = decoded {
+                assert_eq!(resolution, "keep_local");
+            } else {
+                panic!("wrong variant");
+            }
+        }
+
+        // ── StateEvent subject generation ────────────────────────────────
+
+        #[test]
+        fn state_event_subject_format() {
+            let event = StateEvent::FileSynced {
+                device_id: "neo".into(),
+                rel_path: "f.txt".into(),
+                blake3: "x".into(),
+                size: 0,
+                vclock: VectorClock::new(),
+                manifest_path: "m".into(),
+                timestamp: 0,
+            };
+            assert_eq!(event.subject(), "STATE.neo.file_synced");
+
+            let event2 = StateEvent::DeviceOnline {
+                device_id: "honey".into(),
+                last_seq: 0,
+                timestamp: 0,
+            };
+            assert_eq!(event2.subject(), "STATE.honey.device_online");
+        }
+
+        // ── SyncTask serialization ───────────────────────────────────────
+
+        #[test]
+        fn sync_task_push_roundtrip() {
+            let task = SyncTask::Push {
+                task_id: "task-001".into(),
+                local_path: "/home/jess/tcfs".into(),
+                remote_prefix: "data".into(),
+            };
+            let bytes = task.to_bytes().unwrap();
+            let decoded = SyncTask::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.task_id(), "task-001");
+            assert_eq!(decoded.type_name(), "push");
+        }
+
+        #[test]
+        fn sync_task_pull_roundtrip() {
+            let task = SyncTask::Pull {
+                task_id: "task-002".into(),
+                manifest_path: "data/manifests/abc123".into(),
+                remote_prefix: "data".into(),
+                local_path: "/tmp/out.txt".into(),
+            };
+            let bytes = task.to_bytes().unwrap();
+            let decoded = SyncTask::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.task_id(), "task-002");
+            assert_eq!(decoded.type_name(), "pull");
+        }
+
+        #[test]
+        fn sync_task_unsync_roundtrip() {
+            let task = SyncTask::Unsync {
+                task_id: "task-003".into(),
+                local_path: "/home/jess/tcfs/big.bin".into(),
+            };
+            let bytes = task.to_bytes().unwrap();
+            let decoded = SyncTask::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.task_id(), "task-003");
+            assert_eq!(decoded.type_name(), "unsync");
+        }
+
+        #[test]
+        fn state_event_invalid_json_errors() {
+            let result = StateEvent::from_bytes(b"not json at all");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn sync_task_invalid_json_errors() {
+            let result = SyncTask::from_bytes(b"{\"type\":\"unknown\"}");
+            assert!(result.is_err());
+        }
+
+        // ── VectorClock survives JSON roundtrip ──────────────────────────
+
+        #[test]
+        fn vclock_preserved_through_state_event() {
+            let mut vc = VectorClock::new();
+            vc.tick("neo");
+            vc.tick("neo");
+            vc.tick("honey");
+
+            let event = StateEvent::FileSynced {
+                device_id: "neo".into(),
+                rel_path: "f.txt".into(),
+                blake3: "x".into(),
+                size: 0,
+                vclock: vc.clone(),
+                manifest_path: "m".into(),
+                timestamp: 0,
+            };
+
+            let bytes = event.to_bytes().unwrap();
+            let decoded = StateEvent::from_bytes(&bytes).unwrap();
+            if let StateEvent::FileSynced { vclock, .. } = decoded {
+                assert_eq!(vclock.get("neo"), 2);
+                assert_eq!(vclock.get("honey"), 1);
+            } else {
+                panic!("wrong variant");
+            }
+        }
+
+        // ── TLS URL resolution ───────────────────────────────────────────
+
+        #[test]
+        fn tls_url_upgrade_nats_to_tls() {
+            let url = resolve_nats_url("nats://nats.example.com:4222", true);
+            assert_eq!(url, "tls://nats.example.com:4222");
+        }
+
+        #[test]
+        fn tls_url_already_tls_unchanged() {
+            let url = resolve_nats_url("tls://nats.example.com:4222", true);
+            assert_eq!(url, "tls://nats.example.com:4222");
+        }
+
+        #[test]
+        fn plaintext_url_preserved_when_tls_not_required() {
+            let url = resolve_nats_url("nats://localhost:4222", false);
+            assert_eq!(url, "nats://localhost:4222");
+        }
+
+        #[test]
+        fn tls_url_preserved_when_tls_not_required() {
+            let url = resolve_nats_url("tls://nats.example.com:4222", false);
+            assert_eq!(url, "tls://nats.example.com:4222");
+        }
+
+        #[tokio::test]
+        async fn process_with_retry_success_acks() {
+            let task = SyncTask::Push {
+                task_id: "task-ack".into(),
+                local_path: "/tmp/doc.txt".into(),
+                remote_prefix: "data".into(),
+            };
+
+            let action = decide_task_delivery(
+                task.clone(),
+                task.task_id(),
+                task.type_name(),
+                |seen| async move {
+                    assert_eq!(seen.task_id(), "task-ack");
+                    Ok(())
+                },
+            )
+            .await;
+
+            assert_eq!(action, TaskDeliveryAction::Ack);
+        }
+
+        #[tokio::test]
+        async fn process_with_retry_failure_naks() {
+            let task = SyncTask::Pull {
+                task_id: "task-nak".into(),
+                manifest_path: "data/manifests/abc123".into(),
+                remote_prefix: "data".into(),
+                local_path: "/tmp/out.txt".into(),
+            };
+
+            let action = decide_task_delivery(
+                task.clone(),
+                task.task_id(),
+                task.type_name(),
+                |seen| async move {
+                    assert_eq!(seen.task_id(), "task-nak");
+                    anyhow::bail!("transient NATS worker failure");
+                },
+            )
+            .await;
+
+            assert_eq!(action, TaskDeliveryAction::Nak);
         }
     }
 }

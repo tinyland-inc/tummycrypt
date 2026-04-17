@@ -24,6 +24,7 @@ pub type TcfsWatchCallback = Option<unsafe extern "C" fn(*const std::ffi::c_void
 
 /// Error codes returned by FFI functions.
 #[repr(C)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum TcfsError {
     /// Success (no error).
     TcfsErrorNone = 0,
@@ -59,6 +60,8 @@ pub struct TcfsFileItem {
     pub is_directory: bool,
     /// Content hash (BLAKE3 hex, UTF-8 C string).
     pub content_hash: *mut c_char,
+    /// Hydration state: "synced", "not_synced", "active", "locked", "conflict" (UTF-8 C string).
+    pub hydration_state: *mut c_char,
 }
 
 /// A change event returned by `tcfs_provider_enumerate_changes`.
@@ -162,6 +165,7 @@ pub unsafe extern "C" fn tcfs_file_items_free(items: *mut TcfsFileItem, count: u
             free_c_string(item.item_id);
             free_c_string(item.filename);
             free_c_string(item.content_hash);
+            free_c_string(item.hydration_state);
         }
         let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(items, count));
     }

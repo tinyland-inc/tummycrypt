@@ -2,39 +2,46 @@
 
 **FOSS self-hosted odrive replacement**
 
-tcfs is a FUSE-based file sync daemon backed by [SeaweedFS](https://github.com/seaweedfs/seaweedfs) with end-to-end [age](https://age-encryption.org) encryption, content-defined chunking, on-demand hydration via `.tc` stub files, and multi-machine fleet sync with vector clocks.
+tcfs is a self-hosted encrypted file sync system backed by [SeaweedFS](https://github.com/seaweedfs/seaweedfs) with end-to-end [age](https://age-encryption.org) encryption, content-defined chunking, on-demand hydration via `.tc` stub files, and multi-machine fleet sync with vector clocks. Linux is the best-supported runtime today; Apple desktop and mobile surfaces exist but are still experimental.
 
 ## Installation
 
 ### Binary Releases
 
-Download the latest release from [GitHub Releases](https://github.com/tinyland-inc/tummycrypt/releases):
+`Jesssullivan/tummycrypt` is the canonical source repository. Downstream org
+forks may exist for distribution, but releases and source references should
+default here.
+
+Download the latest release from [GitHub Releases](https://github.com/Jesssullivan/tummycrypt/releases):
 
 ```bash
 # Linux (x86_64)
-curl -fsSL https://github.com/tinyland-inc/tummycrypt/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Jesssullivan/tummycrypt/releases/latest/download/install.sh | sh
 
-# macOS (Homebrew)
-brew install tinyland-inc/tap/tcfs
+# macOS (Homebrew, current manual tap flow)
+brew tap --custom-remote Jesssullivan/tummycrypt https://github.com/Jesssullivan/tummycrypt.git
+git -C "$(brew --repo Jesssullivan/tummycrypt)" fetch origin homebrew-tap
+git -C "$(brew --repo Jesssullivan/tummycrypt)" checkout homebrew-tap
+brew install Jesssullivan/tummycrypt/tcfs
 
 # Debian/Ubuntu
-sudo dpkg -i tcfs-*.deb
+sudo dpkg -i tcfsd-*.deb tcfs-*.deb
 
-# RPM (Fedora/RHEL/Rocky)
+# RPM (Fedora/RHEL/Rocky, daemon-only today)
 sudo rpm -i tcfsd-*.rpm
 ```
 
 ### Container (K8s worker mode)
 
 ```bash
-podman pull ghcr.io/tinyland-inc/tcfsd:latest
+podman pull ghcr.io/jesssullivan/tcfsd:latest
 ```
 
 ### From Source
 
 ```bash
-# Requires Rust 1.93+, protoc, libfuse3-dev
-git clone https://github.com/tinyland-inc/tummycrypt.git
+# Requires the pinned Rust 1.93.0 toolchain (see rust-toolchain.toml), protoc, libfuse3-dev
+git clone https://github.com/Jesssullivan/tummycrypt.git
 cd tummycrypt
 cargo build --release
 # Binaries: target/release/tcfs, target/release/tcfsd, target/release/tcfs-tui, target/release/tcfs-mcp
@@ -43,16 +50,16 @@ cargo build --release
 ### Nix
 
 ```bash
-nix build github:tinyland-inc/tummycrypt
+nix build github:Jesssullivan/tummycrypt
 # Or enter a devShell:
-nix develop github:tinyland-inc/tummycrypt
+nix develop github:Jesssullivan/tummycrypt
 ```
 
 ## How It Works
 
 1. **Push**: Files are split into content-defined chunks (FastCDC), compressed (zstd), encrypted (age), and uploaded to SeaweedFS via S3. Vector clock is ticked and SyncManifest v2 (JSON) is written.
 2. **Pull**: Manifests describe the chunk layout. Chunks are fetched, verified (BLAKE3), decrypted, decompressed, and reassembled. Vector clock is merged with remote.
-3. **Mount**: FUSE driver presents remote files as local. Files appear as `.tc` stubs until opened — then they're hydrated on demand.
+3. **Mount**: The local filesystem surface presents remote files as local. On Linux this is exercised primarily through FUSE. Apple desktop surfaces are still evolving and should be treated as experimental.
 4. **Unsync**: Convert hydrated files back to stubs, reclaiming disk space while keeping the remote copy.
 5. **Fleet Sync**: NATS JetStream distributes `StateEvent` messages across devices. Vector clocks detect conflicts; pluggable resolvers handle them (auto, interactive, or defer).
 
@@ -119,11 +126,22 @@ Build locally: `task docs:pdf` (outputs to `dist/docs/`)
 - [Benchmarks](BENCHMARKS.md) — performance characteristics
 - [Changelog](../CHANGELOG.md) — release history
 
+### Ops Runbooks
+- [Product Reality and Priority](ops/product-reality-and-priority.md) — current proof surface, honest product posture, and prioritized backlog
+- [Distribution Smoke Matrix](ops/distribution-smoke-matrix.md) — canonical post-release install proof across Homebrew, `.pkg`, `.deb`, `.rpm`, container, and Nix
+- [Lab Host Acceptance Matrix](ops/lab-host-acceptance-matrix.md) — real-host acceptance lanes across `honey`, `neo`, and `petting-zoo-mini`
+- [Neo-Honey Live Acceptance](ops/neo-honey-acceptance.md) — named live fleet sync acceptance lane
+- [On-Prem Authority Recovery](ops/onprem-authority-recovery.md) — source-of-truth and recovery path for the Helm-managed `tcfs` backend namespace
+- [Fleet Deployment Guide](ops/fleet-deployment.md) — multi-machine fleet deployment and operational checks
+- [Apple Surface Status](ops/apple-surface-status.md) — current reality for macOS and iOS claims
+- [macOS Finder and FileProvider Reality](ops/macos-fileprovider-reality.md) — current macOS desktop workflow, proof gaps, and manual acceptance lane
+- [iOS Surface Status](ops/ios-surface-status.md) — current iOS scope, proof bar, and maintenance expectation
+
 ### RFCs
 
 - [RFC 0001: Fleet Sync Integration](rfc/0001-fleet-sync-integration.md) — multi-machine sync design and rollout plan
 - [RFC 0002: Darwin FUSE Strategy](rfc/0002-darwin-fuse-strategy.md) — FileProvider as primary macOS/iOS path
-- [RFC 0003: iOS File Provider](rfc/0003-ios-file-provider.md) — UniFFI bridge and .appex architecture
+- [RFC 0003: iOS File Provider](rfc/0003-ios-file-provider.md) — UniFFI bridge and experimental iOS scaffold architecture
 
 ## Platform Support
 
@@ -131,9 +149,10 @@ Build locally: `task docs:pdf` (outputs to `dist/docs/`)
 |----------|--------|-------|
 | Linux x86_64 | Full | FUSE mount, CLI, daemon, TUI, MCP |
 | Linux aarch64 | Full | FUSE mount, CLI, daemon, TUI, MCP |
-| macOS (Apple Silicon) | CLI + FUSE-T | Daemon over Unix socket; FileProvider extension in progress (RFC 0002) |
-| macOS (Intel) | CLI + FUSE-T | Daemon over Unix socket; FileProvider extension in progress (RFC 0002) |
+| macOS (Apple Silicon) | Experimental | CLI and daemon build, release `.pkg`, and FileProvider packaging exist, but user-facing acceptance coverage is still limited |
+| macOS (Intel) | Experimental | CLI binaries ship, but the desktop integration story is not yet as proven as Linux |
 | Windows x86_64 | CLI only | Cloud Files API skeleton; no FUSE or daemon |
+| iOS | Proof-of-concept | Read-only FileProvider direction; CI type-checks Swift, but there is no continuously proven TestFlight/App Store lane |
 | NixOS | Full | Flake + NixOS module + Home Manager module |
 
 ## License

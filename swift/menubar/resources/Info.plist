@@ -4,13 +4,15 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>io.tinyland.tcfs.findersync</string>
+    <string>io.tinyland.tcfs.status</string>
     <key>CFBundleExecutable</key>
-    <string>TCFSFinderSync</string>
+    <string>TCFSStatus</string>
     <key>CFBundleName</key>
-    <string>TCFSFinderSync</string>
+    <string>TCFSStatus</string>
+    <key>CFBundleDisplayName</key>
+    <string>TCFS Status</string>
     <key>CFBundlePackageType</key>
-    <string>XPC!</string>
+    <string>APPL</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
@@ -19,12 +21,9 @@
     <string>6.0</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
-    <key>NSExtension</key>
-    <dict>
-        <key>NSExtensionPointIdentifier</key>
-        <string>com.apple.FinderSync</string>
-        <key>NSExtensionPrincipalClass</key>
-        <string>TCFSFinderSync</string>
-    </dict>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSUserNotificationAlertStyle</key>
+    <string>banner</string>
 </dict>
 </plist>
