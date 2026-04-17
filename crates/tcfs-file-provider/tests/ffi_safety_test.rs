@@ -5,8 +5,7 @@
 //! - String allocation and deallocation are balanced
 //! - Error enum has correct C repr values
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::ffi::CString;
 use std::ptr;
 
 use tcfs_file_provider::*;
@@ -64,6 +63,7 @@ fn file_items_free_zero_count() {
         modified_timestamp: 0,
         is_directory: false,
         content_hash: ptr::null_mut(),
+        hydration_state: ptr::null_mut(),
     };
     unsafe {
         tcfs_file_items_free(&mut dummy as *mut TcfsFileItem, 0);
@@ -284,6 +284,7 @@ fn file_item_struct_is_c_compatible() {
         modified_timestamp: 1234567890,
         is_directory: true,
         content_hash: ptr::null_mut(),
+        hydration_state: ptr::null_mut(),
     };
 
     assert_eq!(item.file_size, 42);

@@ -25,7 +25,8 @@ pub struct AuthConfig {
     /// Enable auth subsystem (default: false)
     pub enabled: bool,
     /// Require a valid session token for protected RPCs (push, pull, mount, unsync).
-    /// Default: false (alpha bypass — all local requests are trusted).
+    /// Default: true. When false, all local requests are trusted (alpha bypass).
+    /// WARNING: Setting this to false grants full permissions to any Unix socket client.
     pub require_session: bool,
     /// Session expiry in hours (default: 24)
     pub session_expiry_hours: u64,
@@ -188,6 +189,16 @@ pub struct StorageConfig {
     pub max_download_bytes_per_sec: u64,
 }
 
+impl StorageConfig {
+    /// Resolve the effective S3 prefix: explicit `remote_prefix` or fall back to `bucket`.
+    ///
+    /// ALL code that needs the S3 prefix MUST call this instead of inlining
+    /// `remote_prefix.unwrap_or(bucket)` — there were 3 inconsistent copies.
+    pub fn resolved_prefix(&self) -> &str {
+        self.remote_prefix.as_deref().unwrap_or(&self.bucket)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecretsConfig {
@@ -230,6 +241,9 @@ pub struct SyncConfig {
     pub sync_hidden_dirs: bool,
     /// Glob patterns to exclude from sync
     pub exclude_patterns: Vec<String>,
+    /// Whether to sync empty directories via `.tcfs_dir` markers.
+    /// Default: true.
+    pub sync_empty_dirs: bool,
     /// Local directory root for synced files (used by auto-pull)
     pub sync_root: Option<PathBuf>,
     /// Maximum file age (seconds) before eligible for auto-unsync.
@@ -254,6 +268,13 @@ pub struct SyncConfig {
     /// Trash retention in seconds. Auto-purge entries older than this.
     /// 0 = never auto-purge. Default: 2592000 (30 days).
     pub trash_retention_secs: u64,
+    /// Periodic reconciliation interval in seconds. 0 = disabled.
+    /// Reconciles local sync_root against remote index, applying per-folder policies.
+    /// Default: 300 (5 minutes).
+    pub reconcile_interval_secs: u64,
+    /// Grace period before orphaned remote chunk objects are eligible for cleanup.
+    /// 0 = disabled. Default: 86400 (24 hours).
+    pub orphan_chunk_cleanup_grace_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,7 +399,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             nats_url: "nats://localhost:4222".into(),
-            nats_tls: false,
+            nats_tls: true,
             nats_token: None,
             nats_ca_cert: None,
             state_db: PathBuf::from("~/.local/share/tcfsd/state.db"),
@@ -391,6 +412,7 @@ impl Default for SyncConfig {
             git_sync_mode: "bundle".into(),
             sync_hidden_dirs: false,
             exclude_patterns: Vec::new(),
+            sync_empty_dirs: true,
             sync_root: None,
             auto_unsync_max_age_secs: 0,
             auto_unsync_interval_secs: 3600,
@@ -400,6 +422,8 @@ impl Default for SyncConfig {
             auto_download_threshold: 10 * 1024 * 1024, // 10MB
             trash_enabled: true,
             trash_retention_secs: 30 * 24 * 3600, // 30 days
+            reconcile_interval_secs: 300,         // 5 minutes
+            orphan_chunk_cleanup_grace_secs: 24 * 3600,
         }
     }
 }
@@ -443,6 +467,7 @@ nats_tls = true
 workers = 4
 max_retries = 5
 sync_root = "/home/user/tcfs"
+orphan_chunk_cleanup_grace_secs = 7200
 
 [fuse]
 negative_cache_ttl_secs = 60
@@ -468,6 +493,7 @@ argon2_parallelism = 8
             config.sync.sync_root,
             Some(PathBuf::from("/home/user/tcfs"))
         );
+        assert_eq!(config.sync.orphan_chunk_cleanup_grace_secs, 7200);
         assert_eq!(config.fuse.cache_max_mb, 20480);
         assert!(config.crypto.enabled);
         assert_eq!(config.crypto.argon2_mem_cost_kib, 131072);
@@ -492,7 +518,8 @@ argon2_parallelism = 8
         assert!(!config.storage.enforce_tls);
         assert_eq!(config.storage.bucket, "tcfs");
         assert_eq!(config.sync.nats_url, "nats://localhost:4222");
-        assert!(!config.sync.nats_tls);
+        assert!(config.sync.nats_tls);
+        assert_eq!(config.sync.orphan_chunk_cleanup_grace_secs, 24 * 3600);
         assert!(!config.crypto.enabled);
         assert_eq!(config.crypto.argon2_mem_cost_kib, 65536);
         assert!(config.config_file_mode_check);
@@ -523,5 +550,39 @@ endpoint = "http://192.168.1.100:8333"
         assert_eq!(config.daemon.socket, parsed.daemon.socket);
         assert_eq!(config.storage.endpoint, parsed.storage.endpoint);
         assert_eq!(config.sync.nats_url, parsed.sync.nats_url);
+    }
+
+    #[test]
+    fn auth_require_session_defaults_to_true() {
+        let config = AuthConfig::default();
+        assert!(
+            config.require_session,
+            "require_session must default to true for security"
+        );
+    }
+
+    #[test]
+    fn nats_tls_defaults_to_true() {
+        let config = SyncConfig::default();
+        assert!(
+            config.nats_tls,
+            "nats_tls must default to true for security"
+        );
+    }
+
+    #[test]
+    fn auth_bypass_from_toml() {
+        let toml_str = r#"
+[auth]
+require_session = false
+"#;
+        let config: TcfsConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.auth.require_session);
+    }
+
+    #[test]
+    fn auth_defaults_when_omitted() {
+        let config: TcfsConfig = toml::from_str("").unwrap();
+        assert!(config.auth.require_session);
     }
 }
