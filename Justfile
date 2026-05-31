@@ -10,20 +10,21 @@ default:
 
 # ── Infrastructure ──────────────────────────────────────────────────────────
 
-# Initialize OpenTofu for an environment
-tofu-init env="civo":
+# Initialize OpenTofu for an environment (defaults to current on-prem)
+tofu-init env="onprem":
     cd infra/tofu/environments/{{env}} && tofu init
 
 # Plan OpenTofu changes
-tofu-plan env="civo":
+tofu-plan env="onprem":
     cd infra/tofu/environments/{{env}} && tofu plan
 
-# Apply OpenTofu changes
-tofu-apply env="civo":
+# Apply OpenTofu changes (requires explicit env)
+tofu-apply env="":
+    @test -n "{{env}}" || (echo "pass env=onprem, env=local, or env=civo explicitly" >&2; exit 2)
     cd infra/tofu/environments/{{env}} && tofu apply
 
 # Validate OpenTofu configuration
-tofu-validate env="civo":
+tofu-validate env="onprem":
     cd infra/tofu/environments/{{env}} && tofu validate
 
 # ── Kubernetes ──────────────────────────────────────────────────────────────
@@ -33,6 +34,42 @@ k8s-status ns="tcfs":
     kubectl get pods -n {{ns}}
     @echo "---"
     kubectl get svc -n {{ns}}
+
+# Read-only on-prem authority/mobility check for tcfs
+onprem-preflight:
+    bash scripts/tcfs-onprem-preflight.sh
+
+# Regression test the read-only on-prem authority/mobility check
+onprem-preflight-test:
+    bash scripts/test-tcfs-onprem-preflight.sh
+
+# Read-only on-prem data inventory for NATS and SeaweedFS migration planning
+onprem-data-inventory:
+    bash scripts/tcfs-onprem-data-inventory.sh
+
+# Render non-mutating downtime migration facts, import Pods, or copy commands
+onprem-migration-plan *ARGS:
+    bash scripts/tcfs-onprem-migration-plan.sh {{ARGS}}
+
+# Render the non-mutating downtime cutover packet after window/owners are named
+onprem-cutover-packet:
+    bash scripts/tcfs-onprem-cutover-packet.sh
+
+# Regression test the non-mutating TCFS cutover packet renderer
+onprem-cutover-packet-test:
+    bash scripts/test-tcfs-onprem-cutover-packet.sh
+
+# Regression test the non-mutating TCFS migration command renderer
+onprem-migration-plan-test:
+    bash scripts/test-tcfs-onprem-migration-plan.sh
+
+# Validate on-prem OpenTofu migration surfaces without applying live changes
+onprem-tofu-validate:
+    bash scripts/tcfs-onprem-tofu-validate.sh
+
+# Static safety checks for source-owned on-prem candidate workload selectors
+onprem-tofu-candidate-test:
+    bash scripts/test-tcfs-onprem-tofu-candidate-workloads.sh
 
 # Tail logs from a workload
 k8s-logs app="tcfsd" ns="tcfs":
@@ -44,7 +81,7 @@ k8s-describe app="tcfsd" ns="tcfs":
 
 # ── DNS ────────────────────────────────────────────────────────────────────
 
-# Show current DNS records for tummycrypt.dev
+# Show current legacy/standby Civo DNS records for tummycrypt.dev
 dns-status:
     @echo "NATS Tailscale IP:"
     @kubectl get svc nats-tailscale -n tcfs -o jsonpath='{.status.loadBalancer.ingress[?(@.ip)].ip}'
@@ -52,26 +89,28 @@ dns-status:
     @echo "DNS record:"
     @dig +short nats.tcfs.tummycrypt.dev
 
-# Full deploy: infra + DNS (may need two runs for Tailscale IP)
 # Fresh cluster (no CRDs installed yet):
 #   just deploy-fresh   # Installs operators without CRD consumers
 #   just deploy         # Second run creates ServiceMonitors + ScaledObject
 # Import existing DNS record first if needed:
 #   cd infra/tofu/environments/civo && tofu import 'module.nats_dns[0].porkbun_dns_record.this' 'tummycrypt.dev:RECORD_ID'
-deploy env="civo":
+# Full deploy: infra + DNS (legacy civo-era helper; requires explicit env)
+deploy env="":
+    @test -n "{{env}}" || (echo "pass env=onprem, env=local, or env=civo explicitly" >&2; exit 2)
     cd infra/tofu/environments/{{env}} && tofu apply
 
 # First-apply on fresh cluster: skip CRD consumers (ServiceMonitor, ScaledObject)
-deploy-fresh env="civo":
+deploy-fresh env="":
+    @test -n "{{env}}" || (echo "pass env=onprem, env=local, or env=civo explicitly" >&2; exit 2)
     cd infra/tofu/environments/{{env}} && tofu apply -var='enable_crds=false'
 
 # ── NATS ────────────────────────────────────────────────────────────────────
 
-# Check NATS server info via Tailscale
+# Check legacy/standby Civo NATS server info via Tailscale
 nats-status server="nats://nats.tcfs.tummycrypt.dev:4222":
     nats server info --server {{server}}
 
-# List JetStream streams
+# List legacy/standby Civo JetStream streams
 nats-streams server="nats://nats.tcfs.tummycrypt.dev:4222":
     nats stream ls --server {{server}}
 
@@ -91,9 +130,49 @@ fleet-check:
 neo-honey-smoke:
     bash scripts/neo-honey-smoke.sh
 
+# Regression test the neo/honey evidence-packet wrapper without live services
+neo-honey-smoke-test:
+    bash scripts/test-neo-honey-smoke.sh
+
+# Read-only alpha productionization gate classifier
+alpha-gate-preflight *ARGS:
+    @bash scripts/tcfs-alpha-gate-preflight.sh {{ARGS}}
+
+# Regression test the alpha productionization gate classifier
+alpha-gate-preflight-test:
+    @bash scripts/test-tcfs-alpha-gate-preflight.sh
+
+# Static regression test for the Linux package post-install smoke workflow
+linux-postinstall-workflow-test:
+    @bash scripts/test-linux-postinstall-workflow.sh
+
+# Static regression test for the Linux package container smoke workflow
+linux-package-container-workflow-test:
+    @bash scripts/test-linux-package-container-smoke-workflow.sh
+
+# Static regression test for the storage large restore canary workflow
+storage-large-restore-workflow-test:
+    @bash scripts/test-storage-large-restore-canary-workflow.sh
+
+# Regression test the storage large restore SLO evaluator
+storage-large-restore-slo-test:
+    @bash scripts/test-evaluate-storage-large-restore-slo.sh
+
+# Read-only inventory packet for a candidate large workdir
+large-workdir-inventory ROOT *ARGS:
+    python3 scripts/large-workdir-inventory.py {{ROOT}} {{ARGS}}
+
+# Regression test the large workdir inventory helper
+large-workdir-inventory-test:
+    python3 scripts/test-large-workdir-inventory.py
+
 # Installed-binary smoke for release surfaces that ship tcfsd (and optionally tcfs)
 install-smoke *ARGS:
     bash scripts/install-smoke.sh {{ARGS}}
+
+# Regression test the installed-binary smoke helper with fake installed binaries
+install-smoke-test:
+    bash scripts/test-install-smoke.sh
 
 # ── Nix ─────────────────────────────────────────────────────────────────────
 

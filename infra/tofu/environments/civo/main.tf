@@ -1,8 +1,9 @@
-# Civo Kubernetes environment: tinyland-civo-dev
+# Legacy/standby Civo Kubernetes environment: tinyland-civo-dev
 #
-# Deploy the full tcfs stack to Civo K8s.
-# SeaweedFS and NATS run in-cluster in the tcfs namespace;
-# sync workers + observability also run in K8s.
+# Deploy the Civo tcfs worker stack. The active authority path is honey/on-prem;
+# use this environment only when explicitly targeting the Civo standby lane.
+# NATS, sync workers, and observability are modeled here. SeaweedFS is expected
+# as an existing S3 endpoint/secret; this environment does not create it.
 #
 # To deploy:
 #   task infra:apply ENV=civo
@@ -43,7 +44,7 @@ provider "porkbun" {
 
 module "nats" {
   source     = "../../modules/nats"
-  depends_on = [module.observability]  # CRD: ServiceMonitor
+  depends_on = [module.observability] # CRD: ServiceMonitor
 
   namespace         = var.namespace
   cluster_size      = 3
@@ -54,6 +55,10 @@ module "nats" {
 }
 
 # ── Tailscale NATS exposure (tailnet only, no public IP) ──────────────────────
+#
+# Legacy/standby note: this environment still carries the historical canonical
+# Civo `nats-tcfs` / `nats.tcfs` names. Applying it can mutate the standby DNS
+# path; do not use it as the active honey/on-prem authority path.
 
 module "tailscale_nats" {
   source             = "../../modules/tailscale-nats"
@@ -77,7 +82,7 @@ module "nats_dns" {
 
 module "keda" {
   source     = "../../modules/keda"
-  depends_on = [module.observability]  # CRD: ScaledObject + ServiceMonitor
+  depends_on = [module.observability] # CRD: ScaledObject + ServiceMonitor
 
   namespace          = var.namespace
   nats_url           = module.nats.nats_url
@@ -92,13 +97,14 @@ module "keda" {
 
 module "tcfs_backend" {
   source     = "../../modules/tcfs-backend"
-  depends_on = [module.observability]  # CRD: ServiceMonitor
+  depends_on = [module.observability] # CRD: ServiceMonitor
 
-  namespace  = var.namespace
-  image      = "ghcr.io/jesssullivan/tcfsd:${var.image_tag}"
-  nats_url   = module.nats.nats_url
+  namespace = var.namespace
+  image     = "ghcr.io/jesssullivan/tcfsd:${var.image_tag}"
+  nats_url  = module.nats.nats_url
 
-  # Point workers at the in-cluster SeaweedFS
+  # Point workers at the expected SeaweedFS S3 endpoint. This environment
+  # expects the service and credentials to exist already.
   s3_endpoint    = "http://seaweedfs.tcfs.svc.cluster.local:8333"
   s3_bucket      = "tcfs"
   s3_region      = "us-east-1"

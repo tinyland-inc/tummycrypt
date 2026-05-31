@@ -34,6 +34,91 @@ The practical consequence is simple: if the live namespace already contains
 Helm-managed `tcfs-backend-tcfs-backend-*` objects, the direct Helm chart is
 the source of truth for restoring that path.
 
+## Current Honey Readback
+
+Live readback from the Tinyland `honey` cluster on 2026-04-28 changed the
+operator call from "repair a broken worker" to "decide authority before moving
+placement":
+
+- `nats-0`, `seaweedfs-0`, and `tcfs-backend-tcfs-backend-worker` are Running.
+- NATS health returns OK, SeaweedFS reports a leader, and the worker logs show
+  a live NATS connection.
+- `helm list -n tcfs` reports no release state.
+- `tcfs/nats` and `tcfs/seaweedfs` have live Tailscale exposure annotations,
+  but their last-applied Service configuration had empty annotations.
+- `data-nats-0` and `data-seaweedfs-0` are `local-path` PVCs whose backing PVs
+  have node affinity to `honey`.
+
+That means a ProxyClass-only patch would be cosmetic. It could move the
+generated Tailscale proxy pods, but it would not source-own the exposure, create
+release state, or make NATS/SeaweedFS data drain-mobile.
+
+## Current Decision
+
+Treat the direct `tcfs-backend` Helm chart as a recovery authority for the
+backend worker objects only. Do not use it as evidence that the whole live
+namespace is Helm-owned.
+
+The durable on-prem path is OpenTofu migration, not blind Helm adoption. The
+current source-owned on-prem environment records retained target PVCs,
+non-canonical candidate workloads, candidate tailnet Services, and render-only
+cutover/rollback commands. Do not switch canonical tailnet hostnames or move
+data outside an approved downtime window.
+
+As of 2026-05-08, no downtime window is open. Keep the on-prem cutover deferred
+from the current usage-reality sprint unless `#327` is explicitly scheduled
+with preflight, rollback, and post-cut smoke owners. The lazy hydration and PZM
+FileProvider proof lanes should continue against disposable/live smoke
+endpoints rather than depending on this migration.
+
+Before any operator follows the rendered migration commands, render the
+source-owned cutover packet and attach it to `#327`/`TIN-720`:
+
+```bash
+TCFS_DOWNTIME_WINDOW='YYYY-MM-DD HH:MM-HH:MM TZ' \
+  TCFS_PREFLIGHT_OWNER='name' \
+  TCFS_ROLLBACK_OWNER='name' \
+  TCFS_POSTCUT_SMOKE_OWNER='name' \
+  TCFS_CONTEXT=honey \
+  just onprem-cutover-packet
+```
+
+The packet is non-mutating. Its job is to fail fast when the maintenance
+window or owner assignments are still placeholders, then print the ordered
+preflight, render, cutover, smoke, and rollback commands for review.
+
+Reasons:
+
+- The backend worker objects are Helm-shaped, but NATS and SeaweedFS are not.
+- The OpenTofu modules already model NATS, SeaweedFS, backend workers, and
+  tailnet exposure as separate source-owned concerns.
+- The live backing state is honey-local `local-path`, so honey/sting mobility
+  requires storage/data planning either way.
+- A migration plan can preserve the current healthy singleton while building
+  new source-owned objects with explicit storage class, Tailscale exposure, and
+  smoke gates.
+
+Minimum migration gates:
+
+1. capture live NATS JetStream and SeaweedFS data inventory;
+2. use the retained target storage classes for NATS and SeaweedFS instead of
+   inheriting `local-path`;
+3. render or apply retained target PVCs and non-canonical candidate workloads
+   only through `infra/tofu/environments/onprem`;
+4. smoke candidate Tailscale Services with selectors that do not point at the
+   live `app=nats` or `app=seaweedfs` pods;
+5. run a dry-run/plan that does not collide with live object names;
+6. cut over only after smoke tests prove NATS, SeaweedFS, and worker
+   connectivity on the new path;
+7. remove the old live annotations and retained objects through the same
+   source-controlled transition.
+
+Use the read-only preflight before changing either path:
+
+```bash
+TCFS_CONTEXT=honey just onprem-preflight
+```
+
 ## Preflight
 
 Confirm which cluster you are talking to before making changes:
@@ -79,8 +164,31 @@ Useful flags:
 ```bash
 bash scripts/tcfs-backend-deploy.sh --dry-run
 TCFS_NAMESPACE=tcfs bash scripts/tcfs-backend-deploy.sh \
-  --set image.tag=v0.12.2
+  --set image.tag=v0.12.12
 ```
+
+### RBAC-Only Recovery For Missing Helm Release State
+
+Live recovery note, 2026-04-27: the on-prem namespace can contain
+Helm-shaped `tcfs-backend-tcfs-backend-*` objects without Helm release
+secrets. In that state a full `helm upgrade --install` cannot immediately adopt
+the existing ConfigMap / Deployment, and it can also fail before adoption if
+optional CRDs such as KEDA `ScaledObject` or Prometheus `ServiceMonitor` are not
+installed.
+
+If the Deployment exists but pod creation is blocked because the service
+account is missing, restore only the chart-owned RBAC scaffold first:
+
+```bash
+bash scripts/tcfs-backend-deploy.sh --rbac-only --dry-run
+bash scripts/tcfs-backend-deploy.sh --rbac-only
+kubectl rollout restart deployment/tcfs-backend-tcfs-backend-worker -n tcfs
+kubectl rollout status deployment/tcfs-backend-tcfs-backend-worker -n tcfs
+```
+
+This is a repair path, not a complete Helm adoption. After the worker is
+healthy, follow the downtime-gated OpenTofu migration path for NATS,
+SeaweedFS, and canonical tailnet ownership.
 
 ## Validate Recovery
 

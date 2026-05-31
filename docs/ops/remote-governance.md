@@ -9,22 +9,28 @@ document makes the consequences of that declaration operational.
 
 ## Current Remote Topology
 
-As of 2026-04-17:
+As of 2026-05-09:
 
 | Remote | URL | Branches | `main` ahead of `origin/main` | `main` behind `origin/main` | Role |
 |--------|-----|----------|-------------------------------|------------------------------|------|
-| `origin` | `https://github.com/Jesssullivan/tummycrypt.git` | 25 | 0 | 0 | canonical source + release authority |
-| `tinyland` | `git@github.com:tinyland-inc/tummycrypt.git` | 73 | 19 | 106 | active downstream dev surface |
-| `yoga` | `yoga:git/tummycrypt` (bare SSH) | 10 | 137 | 328 | retired legacy mirror |
+| `origin` | `https://github.com/Jesssullivan/tummycrypt.git` | 26 | 0 | 0 | canonical source + release authority |
+| `tinyland` | `git@github.com:tinyland-inc/tummycrypt.git` | 65 | 21 | 141 | active downstream dev surface |
+| `yoga` | `yoga:git/tummycrypt` (bare SSH) | 9 cached remote-tracking branches | 137 | 472 | retired legacy mirror; live fetch timed out on 2026-05-09 |
 
 Divergence points:
 
-- `origin/main` ↔ `tinyland/main`: merge-base is `3b30df6` (#178 streaming
-  chunker, 2026-04-10). Divergence is 7 days old at time of writing. Both
-  sides have merged real work since the split; the two histories are
-  reconcilable but not identical.
-- `origin/main` ↔ `yoga/main`: severely diverged; yoga represents a
-  `v0.9.x`-era tcfs snapshot and is not a current development branch.
+- `origin/main` ↔ `tinyland/main`: merge-base is now `796b42e`
+  (`origin/main`, 2026-04-17). `tinyland/main` merged `origin/main` via
+  tinyland PR #60 on 2026-04-17, but canonical `origin/main` has since moved
+  141 commits ahead. The remaining 21 tinyland-only commits are the 19 pre-sync
+  historical commits recorded in
+  [Tinyland-Unique Commit Disposition](tinyland-upstream-disposition-2026-04-17.md)
+  plus the sync merge pair (`6f7841f`, `987a6b4`).
+- `origin/main` ↔ `yoga/main`: there is no current merge base in this checkout;
+  yoga represents a `v0.9.x`-era tcfs snapshot and is not a current development
+  branch. A May 9, 2026 `git fetch yoga --prune` attempt timed out over SSH,
+  so current governance decisions should treat the cached `yoga/*` refs as
+  historical evidence, not as a live collaboration surface.
 
 ## Declared Roles
 
@@ -39,9 +45,10 @@ Divergence points:
 - All **contributor PRs** targeting the canonical product land on `origin`.
   A PR that only exists on `tinyland` is staging-only until a corresponding
   `origin` PR is opened.
-- **Branch protection** and **required reviews** are configured on `origin`
-  as the gate of record. `tinyland` and `yoga` may have weaker or different
-  protections; those do not substitute for `origin`'s.
+- `origin` is the merge gate of record. As of 2026-05-09, GitHub branch
+  protection does not enforce required status checks, so operators must verify
+  Actions are green before merging until required checks are configured.
+  `tinyland` and `yoga` protections do not substitute for `origin`'s.
 
 ### `tinyland` — active downstream dev surface
 
@@ -52,33 +59,41 @@ merged there first and upstreamed to `origin` afterward.
 - `tinyland/main` may **lead** `origin/main` by a small number of commits
   (integration drift). A lead of **greater than 20 commits** is a
   governance smell and should open a tracker issue for reconciliation.
+  That threshold is currently exceeded; see #312 and the disposition doc.
 - `tinyland/main` must **not fall behind** `origin/main` indefinitely.
   Reconcile at release-cut cadence **or** weekly, whichever is more frequent.
 - Reconciliation is done **into `origin` first**, then `origin → tinyland`
   via a sync. Never the reverse (never force-push `tinyland` onto `origin`).
 - `tinyland`-specific infrastructure (binary-signing identifiers such as
-  `io.tinyland.tcfsd`, binary cache host `nix-cache.fuzzy-dev.tinyland.dev`)
+  `io.tinyland.tcfsd`, binary cache host `nix-cache.tinyland.dev`)
   is legitimate downstream coupling, but it is **externalization-sensitive**:
   see [v0.12.2 evidence matrix §Blocker A](../release/v0.12.2-evidence-matrix.md#blocker-a--nix-cache-externality)
-  for the cache-reachability implication, and #307 for the concrete decision.
+  for the cache-reachability implication. The concrete #307 tracker is closed;
+  future Nix proof belongs in the per-tag distribution smoke evidence.
 
 ### `yoga` — retired legacy mirror
 
 `yoga` is a bare SSH remote on a laptop host. It carries a `v0.9.x`-era
-snapshot that predates the current `v0.12.x` line by 328 commits.
+snapshot that predates the current `v0.12.x` line by 472 commits in the current
+cached remote comparison.
 
 - `yoga` is **not pushed to** from this point forward.
-- `yoga/main` and its 10 branches remain as **read-only historical
-  reference** only.
+- Cached `yoga/*` remote-tracking refs, including `yoga/main`, remain as
+  **read-only historical reference** only.
 - When the host is decommissioned the remote can be dropped with
   `git remote remove yoga` without information loss, provided anything
   worth preserving has been audited first.
 - Any attempt to land new work on `yoga` should be redirected to a PR on
   `origin`.
 
+Current formal decision for #313: **documentation-only retirement**. No archive,
+host deletion, key revocation, or local remote removal is part of the current
+proof/branch-hygiene lane. Revisit archive-or-remove only when an operator
+names a live host access window and an archive destination.
+
 ## Branch Lifecycle Rules
 
-These rules apply to `origin`. `tinyland` has its own branch tranche (73 at
+These rules apply to `origin`. `tinyland` has its own branch tranche (65 at
 time of writing) which is triaged separately and tracked under the
 [tinyland branch triage issue](#related-trackers).
 
@@ -109,7 +124,8 @@ Mechanical equivalent:
 
 ```bash
 git fetch origin main
-git checkout tinyland/main -b sync/origin-$(date +%Y-%m-%d)
+git fetch tinyland main
+git checkout -b sync/origin-$(date +%Y-%m-%d) tinyland/main
 git merge --no-ff origin/main
 git push tinyland sync/origin-$(date +%Y-%m-%d)
 # open PR against tinyland/main
@@ -149,28 +165,34 @@ Execution work derived from this policy is tracked as separate issues so
 the governance document itself stays a policy statement and not a punch
 list:
 
-- **Upstream current tinyland-unique commits to `origin`**: 19 commits
-  on `tinyland/main` ahead of `origin/main` as of 2026-04-17 (merge-base
-  `3b30df6`). Features include `feat(sync)` trash + bandwidth throttling,
-  `feat(sync)` selective sync policies + D-Bus gRPC backend, `feat`
-  unsync dehydration + auto-unsync with disk pressure, `fix(vfs)` OOM
-  prevention + bounded negative cache, `fix(fuse)` flush via VFS fsync,
-  `fix(daemon)` race guards + deferred vclock merge, `fix(sync)` panic
-  elimination. A tracker issue enumerates per-commit upstream disposition.
+- **Disposition of tinyland-unique history**: #311 is closed. The 19
+  pre-sync tinyland-only commits were audited in
+  [Tinyland-Unique Commit Disposition](tinyland-upstream-disposition-2026-04-17.md)
+  and all were classified as superseded or bookkeeping; zero upstream
+  cherry-picks are required. The 2026-04-17 audited 21-commit lead on
+  `tinyland/main` was therefore 19 historical commits plus the 2 sync-merge
+  commits from the 2026-04-17 origin→tinyland resync.
 
-- **Triage the tinyland branch tranche**: 73 branches under categories
-  `feat/*` (~30), `chore/bump-*` (~15), `sid/*` (~15), and migration /
-  sprint (~4). A tracker issue proposes per-category disposition
-  (mergeable, supersede, close stale).
+- **Triage the tinyland branch tranche**: 65 branches after two prune
+  tranches removed 7 superseded feature branches. The remaining live mix is
+  `41` `fix/*`, `14` `feat/*`, `4` `test/*`, `3` `chore/*`, `1`
+  `refactor/*`, `1` `homebrew-tap`, and `1` `main`. The tracker issue now
+  has a concrete non-destructive prune proposal:
+  [Tinyland Branch Prune Proposal - 2026-05-09](tinyland-branch-prune-proposal-2026-05-09.md).
+  As of May 9, 2026, no remote branches were deleted during the TCFS parity
+  proof push; the next action should be an explicit operator-approved prune
+  tranche, not opportunistic cleanup.
 
 - **Retire `yoga` formally**: the remote is already de facto retired.
-  A tracker issue decides whether to archive the bare SSH repo,
-  decommission the host, or leave both in place.
+  Current decision is documentation-only retirement: leave the cached refs and
+  local remote in place for historical lookups, perform no sync activity, and
+  defer archive/removal until there is an explicit host-access window.
 
-- **Nix cache externalization** (#307): the existing tracker for
-  `nix-cache.fuzzy-dev.tinyland.dev` externality. The infrastructure
-  question is cross-cut; resolving it informs both the release-surface
-  Nix blocker and the tinyland-vs-origin infra coupling.
+- **Nix cache externalization**: #307 is closed. The
+  legacy `nix-cache.fuzzy-dev.tinyland.dev` externality remains useful context.
+  Current flake and CI config point at `nix-cache.tinyland.dev`; future release
+  truth should be captured in per-tag distribution smoke evidence rather than
+  reopening the old tracker.
 
 ## Relationship To Other Documents
 
@@ -178,6 +200,10 @@ list:
   declaration; this document makes it operational
 - [Contributing](../CONTRIBUTING.md) — the PR-based workflow that all
   `origin`-targeted work follows
+- [Tinyland-Unique Commit Disposition](tinyland-upstream-disposition-2026-04-17.md) —
+  audited disposition of the pre-sync tinyland-only commits
+- [Tinyland Branch Prune Proposal - 2026-05-09](tinyland-branch-prune-proposal-2026-05-09.md) —
+  non-destructive branch audit and explicit prune tranches
 - [v0.12.2 Evidence Matrix](../release/v0.12.2-evidence-matrix.md) —
   release-surface consequences of tinyland-hosted infrastructure
 - [Product Reality and Priority](product-reality-and-priority.md) —
@@ -186,5 +212,38 @@ list:
 ## Revision History
 
 - 2026-04-17 — Initial governance doc. Captures the 3-remote topology at
-  its current divergence state (`tinyland` 19 ahead / 106 behind,
-  `yoga` 137 ahead / 328 behind) and declares roles + sync policy.
+  its current divergence state and declares roles + sync policy.
+- 2026-04-17 — Refreshed after tinyland PR #60 merged `origin/main` into
+  `tinyland/main` and #311 closed with zero upstream cherry-picks required.
+- 2026-04-29 — Refreshed branch counts and divergence after origin PRs #337
+  through #340 landed; tinyland now trails canonical `origin/main` again while
+  keeping the same 21-commit downstream lead.
+- 2026-05-08 — Branch hygiene was inspected during the usage-reality push but
+  intentionally deferred. `origin/main` is current, several local branches track
+  deleted remotes, and product proof is still actively moving through the next
+  FileProvider/conflict and distribution packets. Do not prune or delete
+  branches as part of this sprint until the next proof packet is chosen.
+- 2026-05-09 — Refreshed remote counts after parity proof PRs #341 and #342
+  merged. `origin/main` is current and all #342 checks passed. `tinyland` still
+  has the 65-branch tranche; `yoga` live fetch timed out and remains retired.
+  Branch deletion remains a separate explicit-approval action.
+- 2026-05-09 — Refreshed divergence after proof and release-claim PRs #343
+  through #348 merged. `tinyland` remains 65 branches with the same 21-commit
+  downstream lead and a 138-commit lag behind `origin/main`; cached `yoga/main`
+  remains 137 commits ahead and is now 469 commits behind current `origin/main`.
+- 2026-05-09 — Refreshed divergence after PR #350 merged. `tinyland` remains
+  65 branches with the same 21-commit downstream lead and a 140-commit lag
+  behind `origin/main`; cached `yoga/main` remains 137 commits ahead and is now
+  471 commits behind current `origin/main`. #313 is treated as
+  documentation-only retirement unless an operator later approves archive or
+  removal.
+- 2026-05-09 — Added a non-destructive tinyland branch prune proposal. The
+  proposal recommends 44 fix/chore branches for an operator-approved first
+  deletion tranche, 17 feature/test branches for short human review before
+  deletion, and keeps `main`, `homebrew-tap`, `feat/fuse-free-vfs-nfs`, and
+  `refactor/retire-fuse-crates`.
+- 2026-05-09 — Refreshed divergence after PR #351 merged as `26e9fab3e08d`.
+  `tinyland/main` remains 21 commits ahead and is now 141 commits behind
+  `origin/main`; cached `yoga/main` remains 137 commits ahead and is now 472
+  commits behind `origin/main`. The `origin` branch count remains 26 after
+  pruning the deleted PR branch.

@@ -111,28 +111,15 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
             dev.device_id.clone()
         }
     } else {
-        let identity = age::x25519::Identity::generate();
-        let public_key = identity.to_public().to_string();
-        let secret_key = identity.to_string();
-
-        let id = registry.enroll(&device_name, &public_key, None);
-
-        // Persist the device secret key alongside the registry
-        let secret_key_path = registry_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join(format!("device-{id}.age"));
-        if let Err(e) = std::fs::write(&secret_key_path, secret_key.expose_secret().as_bytes()) {
+        let (id, device_key) = registry.enroll_local(&device_name, None);
+        let secret_key_path = tcfs_secrets::device::device_secret_key_path(&registry_path, &id);
+        if let Err(e) = tcfs_secrets::device::save_device_secret_key(
+            &secret_key_path,
+            &device_key.secret_key,
+            false,
+        ) {
             warn!("failed to write device secret key: {e}");
         } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &secret_key_path,
-                    std::fs::Permissions::from_mode(0o600),
-                );
-            }
             info!(path = %secret_key_path.display(), "device secret key saved");
         }
 
@@ -146,9 +133,15 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
     // Load credentials
     let cred_store: SharedCredStore = new_cred_store();
     match tcfs_secrets::CredStore::load(&config.secrets, &config.storage).await {
-        Ok(cs) => {
+        Ok(cs) if cs.s3.is_some() => {
             info!(source = %cs.source, "credentials loaded");
             cred_store.write().await.replace(cs);
+        }
+        Ok(cs) => {
+            warn!(
+                source = %cs.source,
+                "no S3 credentials found (daemon will start without creds)"
+            );
         }
         Err(e) => {
             warn!("credential load failed: {e}  (daemon will start without creds)");
@@ -257,14 +250,30 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
             &s3.access_key_id,
             s3.secret_access_key.expose_secret(),
         )?;
-        match tcfs_storage::check_health(&op).await {
-            Ok(()) => {
-                info!(endpoint = %config.storage.endpoint, "SeaweedFS: connected");
+        let storage_prefix = config.storage.resolved_prefix();
+        match tcfs_storage::check_health_for_prefix_detailed(&op, storage_prefix).await {
+            Ok(report) => {
+                info!(
+                    endpoint = %config.storage.endpoint,
+                    prefix = %storage_prefix,
+                    health_path = %report.path,
+                    elapsed_ms = report.elapsed_ms,
+                    entry_count = report.entry_count,
+                    "SeaweedFS: connected"
+                );
                 operator = Some(op);
                 true
             }
             Err(e) => {
-                warn!(endpoint = %config.storage.endpoint, "SeaweedFS: {e}");
+                warn!(
+                    endpoint = %config.storage.endpoint,
+                    prefix = %storage_prefix,
+                    health_kind = %e.kind(),
+                    health_path = %e.path(),
+                    elapsed_ms = e.elapsed_ms(),
+                    backend_kind = e.backend_kind().unwrap_or("none"),
+                    "SeaweedFS health check failed: {e}"
+                );
                 // Still keep the operator for retry
                 operator = Some(op);
                 false
@@ -307,8 +316,18 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
             .sync_root
             .as_deref()
             .unwrap_or(std::path::Path::new("/tmp/tcfs"));
-        match tcfs_sync::reconcile::list_remote_index(op, resolved_prefix).await {
-            Ok(remote_index) => {
+        // Bound startup remote-index discovery so a slow/unreachable S3
+        // endpoint cannot block the gRPC socket bind that happens later in
+        // run(). On timeout, log non-fatally and continue — the socket still
+        // binds and periodic reconcile retries. Prevents the "daemon running
+        // but no socket" startup hang.
+        let discovery = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tcfs_sync::reconcile::list_remote_index(op, resolved_prefix),
+        )
+        .await;
+        match discovery {
+            Ok(Ok(remote_index)) => {
                 let mut discovered = 0usize;
                 for (rel_path, entry) in &remote_index {
                     let local_key = std::path::PathBuf::from(sync_root).join(rel_path);
@@ -348,8 +367,14 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                     );
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("remote index discovery failed (non-fatal): {e}");
+            }
+            Err(_elapsed) => {
+                warn!(
+                    "remote index discovery timed out after 60s (non-fatal); \
+                     binding socket anyway, periodic reconcile will retry"
+                );
             }
         }
     }
@@ -375,6 +400,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
         let health_state = crate::metrics::HealthState {
             registry: metrics_registry.clone(),
             operator: operator.clone(),
+            storage_prefix: config.storage.resolved_prefix().to_string(),
             sync_root: config.sync.sync_root.clone(),
         };
         tokio::spawn(async move {
@@ -435,6 +461,11 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
         "blacklist configured"
     );
 
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("tcfsd");
+    let policy_store_path = data_dir.join("folder-policies.json");
+
     // Per-path locks: prevent concurrent operations on the same file.
     // Shared across the watcher/scheduler and the state sync loop.
     let path_locks = tcfs_sync::state::PathLocks::new();
@@ -446,8 +477,9 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
     // On macOS with FileProvider active, the watcher is skipped because
     // ~/Library/CloudStorage/TCFSProvider-TCFS/ is the primary interface.
     // The FileProvider extension handles uploads/downloads via gRPC RPCs.
-    let fileprovider_active =
-        cfg!(target_os = "macos") && config.daemon.fileprovider_socket.is_some();
+    let fileprovider_active = cfg!(target_os = "macos")
+        && (config.daemon.fileprovider_socket.is_some()
+            || config.daemon.fileprovider_endpoint.is_some());
 
     let _watcher_handle = if let Some(ref sync_root) = config.sync.sync_root {
         if fileprovider_active {
@@ -473,19 +505,17 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                     // Consults the blacklist to filter excluded paths before scheduling.
                     let bridge_blacklist = blacklist.clone();
                     let bridge_policy_store = {
-                        let policy_path = sync_root.join(".tcfs-policy.json");
-                        tcfs_sync::policy::PolicyStore::open(&policy_path).unwrap_or_default()
+                        tcfs_sync::policy::PolicyStore::open(&policy_store_path).unwrap_or_default()
                     };
                     tokio::spawn(async move {
                         while let Some(event) = watch_rx.recv().await {
-                            // Check blacklist before scheduling
-                            let filename = event
-                                .path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("");
-                            let is_dir = event.path.is_dir();
-                            if let Some(reason) = bridge_blacklist.check_name(filename, is_dir) {
+                            // Check blacklist before scheduling. Full component
+                            // checks are required so events inside an existing
+                            // denied subtree (for example `.ssh/id_ed25519`)
+                            // cannot bypass final-name filtering.
+                            if let Some(reason) =
+                                bridge_blacklist.check_path_components(&event.path)
+                            {
                                 debug!(
                                     path = %event.path.display(),
                                     reason = %reason,
@@ -536,6 +566,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                     let sched_metrics = daemon_metrics.clone();
                     let sched_master_key = master_key.clone();
                     let sched_path_locks = path_locks.clone();
+                    let sched_config = config.clone();
 
                     tokio::spawn({
                         let scheduler = scheduler.clone();
@@ -552,6 +583,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                                     let metrics = sched_metrics.clone();
                                     let mk = sched_master_key.clone();
                                     let locks = sched_path_locks.clone();
+                                    let cfg = sched_config.clone();
 
                                     Box::pin(async move {
                                         // Acquire per-path lock to prevent concurrent operations
@@ -585,9 +617,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                                                     cache.set(&task.path, active);
                                                 }
 
-                                                let enc_ctx = mk.as_ref().map(|k| tcfs_sync::engine::EncryptionContext {
-                                                    master_key: k.clone(),
-                                                });
+                                                let enc_ctx = mk.as_ref().map(|k| crate::grpc::build_encryption_context(&cfg, &device, k));
                                                 let upload_result =
                                                     tcfs_sync::engine::upload_file_with_device(
                                                         op_ref,
@@ -864,6 +894,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
     // Start gRPC server
     let socket_path = config.daemon.socket.clone();
     let fp_socket_path = config.daemon.fileprovider_socket.clone();
+    let listen_addr = config.daemon.listen.clone();
     let config = Arc::new(config);
     let impl_ = TcfsDaemonImpl::new(
         cred_store,
@@ -879,9 +910,6 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
     );
 
     // Load persisted auth credentials (best-effort)
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("tcfsd");
     let totp_cred_path = data_dir.join("totp-credentials.json");
     if totp_cred_path.exists() {
         if let Err(e) = impl_.load_totp_credentials(&totp_cred_path).await {
@@ -892,6 +920,12 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
     if session_path.exists() {
         if let Err(e) = impl_.load_sessions(&session_path).await {
             warn!("failed to load sessions: {e}");
+        }
+    }
+    let invite_redemption_path = data_dir.join("invite-redemptions.json");
+    if invite_redemption_path.exists() {
+        if let Err(e) = impl_.load_invite_redemptions(&invite_redemption_path).await {
+            warn!("failed to load invite redemptions: {e}");
         }
     }
 
@@ -943,7 +977,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                     let sync_conflict_mode = config.sync.conflict_mode.clone();
                     let sync_root = config.sync.sync_root.clone();
                     let storage_prefix = config.storage.resolved_prefix().to_string();
-                    let policy_path = data_dir.join("folder-policies.json");
+                    let policy_path = policy_store_path.clone();
                     let download_threshold = config.sync.auto_download_threshold;
                     spawn_state_sync_loop(
                         &nats,
@@ -1054,6 +1088,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
             let recon_state = impl_.state_cache_handle();
             let recon_op = operator.clone();
             let recon_device = device_id.clone();
+            let recon_tcfs_config = config.clone();
             let recon_master_key = impl_.master_key_handle();
             let orphan_chunk_cleanup_grace_secs = config.sync.orphan_chunk_cleanup_grace_secs;
             let orphan_chunk_cleanup_sweep_interval_secs = if orphan_chunk_cleanup_grace_secs > 0 {
@@ -1063,7 +1098,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
             } else {
                 0
             };
-            let _recon_policy_path = data_dir.join("folder-policies.json");
+            let recon_blacklist = blacklist.clone();
 
             info!(
                 interval_secs = recon_interval,
@@ -1102,7 +1137,6 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                     };
                     drop(op_guard);
 
-                    let blacklist = tcfs_sync::blacklist::Blacklist::default();
                     let recon_config = tcfs_sync::reconcile::ReconcileConfig::default();
 
                     let cache = recon_state.lock().await;
@@ -1112,7 +1146,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
                         &recon_prefix,
                         &cache,
                         &recon_device,
-                        &blacklist,
+                        &recon_blacklist,
                         &recon_config,
                     )
                     .await
@@ -1139,12 +1173,13 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
 
                         // Build encryption context from master key (if loaded)
                         let mk_guard = recon_master_key.lock().await;
-                        let enc_ctx =
-                            mk_guard
-                                .as_ref()
-                                .map(|k| tcfs_sync::engine::EncryptionContext {
-                                    master_key: k.clone(),
-                                });
+                        let enc_ctx = mk_guard.as_ref().map(|k| {
+                            crate::grpc::build_encryption_context(
+                                &recon_tcfs_config,
+                                &recon_device,
+                                k,
+                            )
+                        });
                         drop(mk_guard);
 
                         let mut cache = recon_state.lock().await;
@@ -1234,7 +1269,7 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
         let unsync_interval = config.sync.auto_unsync_interval_secs;
         let unsync_max_age = config.sync.auto_unsync_max_age_secs;
         let unsync_dry_run = config.sync.auto_unsync_dry_run;
-        let unsync_policy_path = data_dir.join("folder-policies.json");
+        let unsync_policy_path = policy_store_path.clone();
         let unsync_vfs = impl_.vfs_handle.clone();
         let disk_pressure_pct = config.sync.auto_unsync_disk_pressure_pct;
         let max_per_sweep = config.sync.auto_unsync_max_per_sweep;
@@ -1333,10 +1368,14 @@ pub async fn run(config: TcfsConfig) -> Result<()> {
     if let Some(ref fp) = fp_socket_path {
         info!(socket = %fp.display(), "gRPC: FileProvider socket");
     }
+    if let Some(ref addr) = listen_addr {
+        info!(addr = %addr, "gRPC: TCP listening");
+    }
 
     crate::grpc::serve(
         &socket_path,
         fp_socket_path.as_deref(),
+        listen_addr.as_deref(),
         impl_,
         shutdown_signal,
     )

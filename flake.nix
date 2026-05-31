@@ -5,10 +5,10 @@
   # CI/release workflows push with `attic login` separately.
   nixConfig = {
     extra-substituters = [
-      "https://nix-cache.fuzzy-dev.tinyland.dev/main"
+      "https://nix-cache.tinyland.dev/main"
     ];
     extra-trusted-public-keys = [
-      "main:NKRk1XYo/dfd9fcDqgotUJg2DTDHWp5ny+Ba7WzRjgE="
+      "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="
     ];
   };
 
@@ -132,7 +132,7 @@
         tcfsd-app = pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin (
           pkgs.stdenv.mkDerivation {
             pname = "tcfsd-app";
-            version = tcfsd.version or "0.12.2";
+            version = tcfsd.version or "0.12.6";
             dontUnpack = true;
             buildInputs = [ pkgs.darwin.sigtool ];
             installPhase = ''
@@ -175,9 +175,17 @@
             cargo-watch
             cargo-deny
             cargo-audit
+            shellcheck
+            jq
 
             # NATS
             natscli
+
+            # Lazy hydration demo helpers
+            awscli2
+            s5cmd
+            minio-client
+            openssh
 
             # Docs tooling
             lychee
@@ -193,6 +201,10 @@
           TCFS_RUST_TOOLCHAIN = rustVersion;
 
           shellHook = ''
+            # Home Manager user profiles may carry an older rustc/cargo ahead
+            # of Nix's shell paths. Keep the project-pinned toolchain first.
+            export PATH="$PWD/target/debug:$PWD/target/release:${pkgs.lib.makeBinPath [ rustToolchain pkgs.go-task pkgs.just pkgs.shellcheck pkgs.jq.bin pkgs.awscli2 pkgs.s5cmd pkgs.minio-client ]}:$PATH"
+
             echo "tcfs devShell (tummycrypt monorepo)"
             echo "  rustc --version  # pinned toolchain should report ${rustVersion}"
             echo "  just --list      # show available recipes"

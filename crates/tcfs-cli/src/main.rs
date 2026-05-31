@@ -9,15 +9,22 @@
 //!   push <local> [<prefix>]      - upload file or directory tree to SeaweedFS
 //!   pull <manifest> [<local>]    - download file from manifest path
 //!   sync-status [<path>]         - show local sync state for a file/dir
+//!   index inspect <path>         - inspect one remote index entry read-only
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use secrecy::ExposeSecret;
+use serde::Serialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+#[cfg(unix)]
+use tonic::metadata::MetadataValue;
+#[cfg(unix)]
+use tonic::service::{interceptor::InterceptedService, Interceptor};
 #[cfg(unix)]
 use tonic::transport::{Channel, Endpoint, Uri};
 #[cfg(unix)]
@@ -25,6 +32,35 @@ use tower::service_fn;
 
 #[cfg(unix)]
 use tcfs_core::proto::{tcfs_daemon_client::TcfsDaemonClient, Empty, StatusRequest};
+
+#[cfg(unix)]
+type DaemonClient = TcfsDaemonClient<InterceptedService<Channel, SessionTokenInterceptor>>;
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct SessionTokenInterceptor {
+    token: Option<String>,
+}
+
+#[cfg(unix)]
+impl Interceptor for SessionTokenInterceptor {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(token) = self.token.as_deref().filter(|token| !token.is_empty()) {
+            let value = format!("Bearer {token}")
+                .parse::<MetadataValue<_>>()
+                .map_err(|_| {
+                    tonic::Status::unauthenticated(
+                        "stored TCFS session token is not valid metadata",
+                    )
+                })?;
+            request.metadata_mut().insert("authorization", value);
+        }
+        Ok(request)
+    }
+}
 
 // ── CLI structure ──────────────────────────────────────────────────────────────
 
@@ -108,10 +144,22 @@ enum Commands {
         state: Option<PathBuf>,
     },
 
+    /// Inspect remote index entries without changing storage
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
+
+    /// Storage posture checks
+    Storage {
+        #[command(subcommand)]
+        action: StorageAction,
+    },
+
     // ── Phase 3: mount + stub management ──────────────────────────────────────
     /// Mount a remote as a local directory
     Mount {
-        /// Remote spec (e.g. seaweedfs://host/bucket[/prefix])
+        /// Remote spec (e.g. seaweedfs://host/bucket[/prefix] or seaweedfs+https://host/bucket[/prefix])
         remote: String,
         /// Local mountpoint
         mountpoint: PathBuf,
@@ -153,6 +201,21 @@ enum Commands {
         /// Device name (default: hostname)
         #[arg(long)]
         device_name: Option<String>,
+        /// Check whether first-run identity and user config are present
+        #[arg(long)]
+        check: bool,
+        /// Do not write ~/.config/tcfs/config.toml
+        #[arg(long)]
+        skip_config: bool,
+        /// Overwrite an existing init config file
+        #[arg(long)]
+        force_config: bool,
+        /// Config path to write/check (default: ~/.config/tcfs/config.toml)
+        #[arg(long)]
+        config_out: Option<PathBuf>,
+        /// Optional FileProvider bootstrap JSON path to write for macOS HostApp provisioning
+        #[arg(long)]
+        fileprovider_config_out: Option<PathBuf>,
         /// Non-interactive mode (use with --password)
         #[arg(long)]
         non_interactive: bool,
@@ -292,6 +355,71 @@ enum PolicyAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum IndexAction {
+    /// Inspect one logical path in the remote index
+    Inspect {
+        /// Logical relative path under the remote prefix
+        rel_path: String,
+        /// Remote prefix override
+        #[arg(long, short = 'p')]
+        prefix: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum StorageAction {
+    /// Write, read, delete, and verify one scoped canary object
+    Canary {
+        /// Remote prefix override (default: storage.remote_prefix or bucket)
+        #[arg(long, short = 'p')]
+        prefix: Option<String>,
+        /// Prefix that must reject canary writes with PermissionDenied
+        #[arg(long, value_name = "PREFIX")]
+        expect_deny_prefix: Option<String>,
+        /// Per-operation timeout in seconds
+        #[arg(long, default_value = "5")]
+        timeout_secs: u64,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct StorageCanaryReport {
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+    key: String,
+    list_prefix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_deny: Option<StorageCanaryScopeDenyReport>,
+    bytes: usize,
+    write_ms: u128,
+    list_ms: u128,
+    list_count: usize,
+    read_ms: u128,
+    delete_ms: u128,
+    verify_delete_ms: u128,
+    listed: bool,
+    deleted: bool,
+    endpoint_tls: bool,
+    enforce_tls: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageCanaryScopeDenyReport {
+    prefix: String,
+    key: String,
+    write_ms: u128,
+    error_kind: String,
+    denied: bool,
+}
+
+#[derive(Subcommand, Debug)]
 enum DeviceAction {
     /// Enroll this device in the sync fleet
     Enroll {
@@ -400,6 +528,21 @@ enum TrashAction {
 enum ConfigAction {
     /// Print the active configuration (merged defaults + config file)
     Show,
+    /// Render the macOS FileProvider bootstrap JSON from the active config
+    Fileprovider {
+        /// Path to write (default: ~/.config/tcfs/fileprovider/config.json)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Device ID to place in the FileProvider bootstrap JSON
+        #[arg(long)]
+        device_id: Option<String>,
+        /// Master key file path to hand to the HostApp for Keychain enrichment
+        #[arg(long)]
+        master_key_file: Option<PathBuf>,
+        /// Overwrite an existing FileProvider config JSON
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -408,6 +551,17 @@ enum CacheAction {
     Stats,
     /// Clear all cached content
     Clear,
+    /// Evict one remote-backed file from the local hydrated-content cache
+    Evict {
+        /// Logical relative path under the remote prefix
+        rel_path: String,
+        /// Remote prefix override
+        #[arg(long, short = 'p')]
+        prefix: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -464,6 +618,24 @@ async fn main() -> Result<()> {
         Commands::Config {
             action: ConfigAction::Show,
         } => cmd_config_show(&config, &cli.config),
+        Commands::Config {
+            action:
+                ConfigAction::Fileprovider {
+                    out,
+                    device_id,
+                    master_key_file,
+                    force,
+                },
+        } => {
+            cmd_config_fileprovider(
+                &config,
+                out.as_deref(),
+                device_id.as_deref(),
+                master_key_file.as_deref(),
+                force,
+            )
+            .await
+        }
         Commands::Kdbx {
             action:
                 KdbxAction::Resolve {
@@ -503,9 +675,16 @@ async fn main() -> Result<()> {
         Commands::SyncStatus { path, state } => {
             cmd_sync_status(&config, path.as_deref(), state.as_deref())
         }
+        Commands::Index { action } => cmd_index(&config, action).await,
+        Commands::Storage { action } => cmd_storage(&config, action).await,
         Commands::Cache { action } => match action {
             CacheAction::Stats => cmd_cache_stats(&config).await,
             CacheAction::Clear => cmd_cache_clear(&config).await,
+            CacheAction::Evict {
+                rel_path,
+                prefix,
+                json,
+            } => cmd_cache_evict(&config, &rel_path, prefix.as_deref(), json).await,
         },
         Commands::Mount {
             remote,
@@ -518,9 +697,29 @@ async fn main() -> Result<()> {
         Commands::Unsync { path, force } => cmd_unsync(&config, &path, force).await,
         Commands::Init {
             device_name,
+            check,
+            skip_config,
+            force_config,
+            config_out,
+            fileprovider_config_out,
             non_interactive,
             password,
-        } => cmd_init(&config, device_name, non_interactive, password).await,
+        } => {
+            cmd_init(
+                &config,
+                InitOptions {
+                    device_name,
+                    check,
+                    skip_config,
+                    force_config,
+                    config_out: config_out.as_deref(),
+                    fileprovider_config_out: fileprovider_config_out.as_deref(),
+                    non_interactive,
+                    password,
+                },
+            )
+            .await
+        }
         Commands::Device { action } => match action {
             DeviceAction::Enroll { name } => cmd_device_enroll(name),
             DeviceAction::List => cmd_device_list(),
@@ -693,6 +892,14 @@ fn resolve_state_path(
     db.with_extension("json")
 }
 
+/// Resolve the daemon-owned per-folder policy store.
+fn policy_store_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("tcfsd")
+        .join("folder-policies.json")
+}
+
 // ── Progress bar helpers ──────────────────────────────────────────────────────
 
 fn make_progress_bar(total: u64, prefix: &str) -> ProgressBar {
@@ -773,6 +980,7 @@ fn collect_config_from_sync(
         sync_hidden_dirs: config.sync.sync_hidden_dirs,
         exclude_patterns: config.sync.exclude_patterns.clone(),
         follow_symlinks: false,
+        preserve_symlinks: config.sync.sync_symlinks,
         sync_empty_dirs: config.sync.sync_empty_dirs,
     }
 }
@@ -875,6 +1083,64 @@ fn resolve_sync_status_lookup_path(path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path).map_err(Into::into)
 }
 
+/// Build an `EncryptionContext`, attaching per-device wrapping (TIN-1417) when
+/// `crypto.per_device_wrapping` is enabled and the device registry has real age
+/// recipients. Falls back to legacy shared-master wrapping (logging why) if the
+/// registry can't be loaded, has no real recipients, or this device's age secret
+/// is missing — never producing content this device cannot read back.
+fn build_encryption_context(
+    config: &tcfs_core::config::TcfsConfig,
+    device_id: &str,
+    master_key: &tcfs_crypto::MasterKey,
+) -> tcfs_sync::engine::EncryptionContext {
+    use tcfs_sync::engine::{DeviceUnwrapIdentity, EncryptionContext};
+
+    let base = EncryptionContext::new(master_key.clone());
+    if !config.crypto.per_device_wrapping {
+        return base;
+    }
+    let registry_path = config
+        .sync
+        .device_identity
+        .clone()
+        .unwrap_or_else(tcfs_secrets::device::default_registry_path);
+    let registry = match tcfs_secrets::device::DeviceRegistry::load(&registry_path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("per-device wrapping: registry load failed ({e}); using master wrap");
+            return base;
+        }
+    };
+    let recipients: Vec<tcfs_crypto::AgeFileKeyRecipient> = registry
+        .active_devices()
+        .filter(|d| tcfs_secrets::device::is_real_age_public_key(&d.public_key))
+        .map(|d| tcfs_crypto::AgeFileKeyRecipient {
+            device_id: d.device_id.clone(),
+            recipient: d.public_key.clone(),
+        })
+        .collect();
+    if recipients.is_empty() {
+        tracing::warn!(
+            "per-device wrapping enabled but no active age recipients; using master wrap"
+        );
+        return base;
+    }
+    let secret_path = tcfs_secrets::device::device_secret_key_path(&registry_path, device_id);
+    let identity = match std::fs::read_to_string(&secret_path) {
+        Ok(s) => DeviceUnwrapIdentity {
+            device_id: device_id.to_string(),
+            secret: s.trim().to_string(),
+        },
+        Err(e) => {
+            tracing::warn!(
+                "per-device wrapping: local device secret unreadable ({e}); using master wrap"
+            );
+            return base;
+        }
+    };
+    base.with_device_wrapping(recipients, Some(identity))
+}
+
 // ── `tcfs push` ───────────────────────────────────────────────────────────────
 
 async fn cmd_push_with_operator(
@@ -937,9 +1203,7 @@ async fn cmd_push_with_operator(
             });
         let enc_ctx = master_key
             .as_ref()
-            .map(|mk| tcfs_sync::engine::EncryptionContext {
-                master_key: mk.clone(),
-            });
+            .map(|mk| build_encryption_context(config, device_id, mk));
 
         let result = tcfs_sync::engine::upload_file_with_device(
             op,
@@ -1102,14 +1366,23 @@ async fn cmd_pull_with_operator(
             .await
             .with_context(|| format!("resolving manifest for: {manifest_path}"))?;
 
-    // Default local path: current dir + manifest hash (last path component)
-    let hash_basename = resolved_manifest
-        .split('/')
-        .next_back()
-        .unwrap_or("downloaded");
-    let local_path = local
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(hash_basename));
+    // Default local destination:
+    // - an explicit `local` always wins;
+    // - if the user pulled by file path, write back to that path (not a
+    //   hash-named file in the current directory);
+    // - otherwise (a remote manifest reference) fall back to the manifest hash
+    //   basename in the current directory.
+    let local_path = match local {
+        Some(p) => p.to_path_buf(),
+        None if is_file_path => PathBuf::from(manifest_path),
+        None => {
+            let hash_basename = resolved_manifest
+                .split('/')
+                .next_back()
+                .unwrap_or("downloaded");
+            PathBuf::from(hash_basename)
+        }
+    };
 
     println!("Pulling {} → {}", manifest_path, local_path.display(),);
 
@@ -1141,9 +1414,7 @@ async fn cmd_pull_with_operator(
         });
     let enc_ctx = master_key
         .as_ref()
-        .map(|mk| tcfs_sync::engine::EncryptionContext {
-            master_key: mk.clone(),
-        });
+        .map(|mk| build_encryption_context(config, device_id, mk));
 
     let result = tcfs_sync::engine::download_file_with_device(
         op,
@@ -1159,6 +1430,7 @@ async fn cmd_pull_with_operator(
     .with_context(|| format!("downloading {}", manifest_path))?;
 
     state.flush().context("flushing state cache")?;
+    remove_adjacent_stub_after_pull(&result.local_path).await?;
 
     pb.finish_with_message("done".to_string());
     println!();
@@ -1167,6 +1439,46 @@ async fn cmd_pull_with_operator(
     println!("  bytes:  {}", fmt_bytes(result.bytes));
 
     Ok(())
+}
+
+async fn remove_adjacent_stub_after_pull(local_path: &Path) -> Result<()> {
+    if tcfs_vfs::is_stub_path(local_path) {
+        return Ok(());
+    }
+
+    let file_name = match local_path.file_name() {
+        Some(name) => name,
+        None => return Ok(()),
+    };
+    let stub_path = local_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(tcfs_vfs::real_to_stub_name(file_name));
+
+    let stub_bytes = match tokio::fs::read(&stub_path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading adjacent stub: {}", stub_path.display()));
+        }
+    };
+    let Ok(stub_text) = String::from_utf8(stub_bytes) else {
+        return Ok(());
+    };
+    if tcfs_vfs::StubMeta::parse(&stub_text).is_err() {
+        return Ok(());
+    }
+
+    match tokio::fs::remove_file(&stub_path).await {
+        Ok(()) => {
+            println!("  removed stub: {}", stub_path.display());
+            Ok(())
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("removing stale stub: {}", stub_path.display()))
+        }
+    }
 }
 
 async fn cmd_pull(
@@ -1238,6 +1550,485 @@ fn cmd_sync_status(
     }
 
     Ok(())
+}
+
+// ── `tcfs index` ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IndexInspectReport {
+    rel_path: String,
+    remote_prefix: String,
+    index_key: String,
+    index_exists: bool,
+    status: String,
+    parse_error: Option<String>,
+    entry_state: Option<String>,
+    visible_entry: Option<IndexInspectVisibleEntry>,
+    pending_entry: Option<IndexInspectPendingEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IndexInspectVisibleEntry {
+    manifest_hash: String,
+    manifest_key: String,
+    manifest_exists: bool,
+    size: u64,
+    chunks: usize,
+    kind: tcfs_sync::index_entry::RemoteEntryKind,
+    symlink_target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IndexInspectPendingEntry {
+    manifest_hash: String,
+    manifest_key: String,
+    manifest_exists: bool,
+    staged_manifest_key: String,
+    staged_manifest_exists: bool,
+    size: u64,
+    chunks: usize,
+    kind: tcfs_sync::index_entry::RemoteEntryKind,
+    symlink_target: Option<String>,
+}
+
+fn normalize_index_rel_path(path: &str) -> Result<String> {
+    let trimmed = path.trim().trim_start_matches('/');
+    anyhow::ensure!(!trimmed.is_empty(), "index path must not be empty");
+    anyhow::ensure!(
+        !trimmed.ends_with('/'),
+        "index inspect expects a file or marker path, not a directory"
+    );
+
+    let mut parts = Vec::new();
+    for component in trimmed.split('/') {
+        anyhow::ensure!(
+            !component.is_empty() && component != "." && component != "..",
+            "index path must be normalized: {path}"
+        );
+        parts.push(component);
+    }
+
+    Ok(parts.join("/"))
+}
+
+async fn inspect_index_entry_with_operator(
+    op: &opendal::Operator,
+    rel_path: &str,
+    remote_prefix: &str,
+) -> Result<IndexInspectReport> {
+    let rel_path = normalize_index_rel_path(rel_path)?;
+    let remote_prefix = remote_prefix.trim_end_matches('/').to_string();
+    anyhow::ensure!(!remote_prefix.is_empty(), "remote prefix must not be empty");
+
+    let index_key = format!("{remote_prefix}/index/{rel_path}");
+    let manifest_prefix = format!("{remote_prefix}/manifests");
+
+    let raw = match op.read(&index_key).await {
+        Ok(bytes) => bytes.to_vec(),
+        Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+            return Ok(IndexInspectReport {
+                rel_path,
+                remote_prefix,
+                index_key,
+                index_exists: false,
+                status: "missing_index".to_string(),
+                parse_error: None,
+                entry_state: None,
+                visible_entry: None,
+                pending_entry: None,
+            });
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(e))
+                .with_context(|| format!("reading index entry: {index_key}"));
+        }
+    };
+
+    let parsed = match tcfs_sync::index_entry::parse_index_entry_record(&raw) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return Ok(IndexInspectReport {
+                rel_path,
+                remote_prefix,
+                index_key,
+                index_exists: true,
+                status: "parse_error".to_string(),
+                parse_error: Some(format!("{e:#}")),
+                entry_state: None,
+                visible_entry: None,
+                pending_entry: None,
+            });
+        }
+    };
+
+    let entry_state = Some(format!("{:?}", parsed.state()).to_lowercase());
+
+    let visible_entry = if let Some(entry) = parsed.visible_entry() {
+        let manifest_key =
+            tcfs_sync::index_entry::manifest_key(&manifest_prefix, &entry.manifest_hash);
+        let manifest_exists = op.exists(&manifest_key).await.unwrap_or(false);
+        Some(IndexInspectVisibleEntry {
+            manifest_hash: entry.manifest_hash.clone(),
+            manifest_key,
+            manifest_exists,
+            size: entry.size,
+            chunks: entry.chunks,
+            kind: entry.kind,
+            symlink_target: entry.symlink_target.clone(),
+        })
+    } else {
+        None
+    };
+
+    let pending_entry = if let Some(entry) = parsed.pending_entry() {
+        let manifest_key =
+            tcfs_sync::index_entry::manifest_key(&manifest_prefix, &entry.manifest_hash);
+        let manifest_exists = op.exists(&manifest_key).await.unwrap_or(false);
+        let staged_manifest_exists = op.exists(&entry.staged_manifest_key).await.unwrap_or(false);
+        Some(IndexInspectPendingEntry {
+            manifest_hash: entry.manifest_hash.clone(),
+            manifest_key,
+            manifest_exists,
+            staged_manifest_key: entry.staged_manifest_key.clone(),
+            staged_manifest_exists,
+            size: entry.size,
+            chunks: entry.chunks,
+            kind: entry.kind,
+            symlink_target: entry.symlink_target.clone(),
+        })
+    } else {
+        None
+    };
+
+    let status = match &visible_entry {
+        Some(entry) if entry.manifest_exists => "visible",
+        Some(_) => "missing_manifest",
+        None if pending_entry.is_some() => "preparing_only",
+        None => "no_visible_entry",
+    }
+    .to_string();
+
+    Ok(IndexInspectReport {
+        rel_path,
+        remote_prefix,
+        index_key,
+        index_exists: true,
+        status,
+        parse_error: None,
+        entry_state,
+        visible_entry,
+        pending_entry,
+    })
+}
+
+async fn cmd_index(config: &tcfs_core::config::TcfsConfig, action: IndexAction) -> Result<()> {
+    match action {
+        IndexAction::Inspect {
+            rel_path,
+            prefix,
+            json,
+        } => {
+            let op = build_operator(config).await?;
+            let remote_prefix = prefix
+                .as_deref()
+                .unwrap_or_else(|| config.storage.resolved_prefix());
+            let report = inspect_index_entry_with_operator(&op, &rel_path, remote_prefix).await?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).context("serializing index report")?
+                );
+            } else {
+                print_index_inspect_report(&report);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_index_inspect_report(report: &IndexInspectReport) {
+    println!("Remote prefix: {}", report.remote_prefix);
+    println!("Relative path: {}", report.rel_path);
+    println!("Index key:     {}", report.index_key);
+    println!("Status:        {}", report.status);
+    if let Some(error) = &report.parse_error {
+        println!("Parse error:   {error}");
+    }
+    if let Some(entry) = &report.visible_entry {
+        println!("Manifest key:  {}", entry.manifest_key);
+        println!(
+            "Manifest:      {}",
+            if entry.manifest_exists {
+                "ok"
+            } else {
+                "missing"
+            }
+        );
+        println!("Size:          {}", fmt_bytes(entry.size));
+        println!("Chunks:        {}", entry.chunks);
+        println!("Kind:          {:?}", entry.kind);
+        if let Some(target) = &entry.symlink_target {
+            println!("Symlink:       {target}");
+        }
+    }
+    if let Some(entry) = &report.pending_entry {
+        println!("Pending key:   {}", entry.manifest_key);
+        println!(
+            "Pending:       {}",
+            if entry.manifest_exists {
+                "ok"
+            } else {
+                "missing"
+            }
+        );
+        println!("Staged key:    {}", entry.staged_manifest_key);
+        println!(
+            "Staged:        {}",
+            if entry.staged_manifest_exists {
+                "ok"
+            } else {
+                "missing"
+            }
+        );
+    }
+}
+
+// ── `tcfs storage` ───────────────────────────────────────────────────────────
+
+async fn cmd_storage(config: &tcfs_core::config::TcfsConfig, action: StorageAction) -> Result<()> {
+    match action {
+        StorageAction::Canary {
+            prefix,
+            expect_deny_prefix,
+            timeout_secs,
+            json,
+        } => {
+            let op = build_operator(config).await?;
+            let remote_prefix = prefix
+                .map(|s| s.trim_matches('/').to_string())
+                .unwrap_or_else(|| {
+                    config
+                        .storage
+                        .resolved_prefix()
+                        .trim_matches('/')
+                        .to_string()
+                });
+            let expect_deny_prefix = expect_deny_prefix
+                .map(|s| s.trim_matches('/').to_string())
+                .filter(|s| !s.is_empty());
+            let timeout = Duration::from_secs(timeout_secs.max(1));
+            let nonce = new_storage_canary_nonce();
+            let report = run_storage_canary_with_operator(
+                config,
+                &op,
+                &remote_prefix,
+                expect_deny_prefix.as_deref(),
+                &nonce,
+                timeout,
+            )
+            .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Storage canary passed:");
+                println!("  endpoint: {}", report.endpoint);
+                println!("  bucket:   {}", report.bucket);
+                println!("  prefix:   {}", report.prefix);
+                println!("  key:      {}", report.key);
+                println!("  bytes:    {}", report.bytes);
+                println!("  write:    {} ms", report.write_ms);
+                println!(
+                    "  list:     {} ms ({} entries at {})",
+                    report.list_ms, report.list_count, report.list_prefix
+                );
+                println!("  read:     {} ms", report.read_ms);
+                println!("  delete:   {} ms", report.delete_ms);
+                println!("  verify:   {} ms", report.verify_delete_ms);
+                if let Some(scope_deny) = &report.scope_deny {
+                    println!(
+                        "  scope:    deny write to {} ({}, {} ms)",
+                        scope_deny.key, scope_deny.error_kind, scope_deny.write_ms
+                    );
+                }
+                println!(
+                    "  tls:      endpoint={}, enforce_tls={}",
+                    report.endpoint_tls, report.enforce_tls
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn new_storage_canary_nonce() -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}-{}", now.as_secs(), std::process::id())
+}
+
+fn storage_canary_key(prefix: &str, nonce: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        format!(".tcfs-canary/{nonce}.txt")
+    } else {
+        format!("{prefix}/.tcfs-canary/{nonce}.txt")
+    }
+}
+
+fn storage_canary_list_prefix(prefix: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
+async fn run_storage_canary_with_operator(
+    config: &tcfs_core::config::TcfsConfig,
+    op: &opendal::Operator,
+    prefix: &str,
+    expect_deny_prefix: Option<&str>,
+    nonce: &str,
+    timeout: Duration,
+) -> Result<StorageCanaryReport> {
+    let key = storage_canary_key(prefix, nonce);
+    let list_prefix = storage_canary_list_prefix(prefix);
+    let payload = format!(
+        "tcfs storage canary\nendpoint={}\nbucket={}\nprefix={}\nkey={}\nnonce={}\n",
+        config.storage.endpoint, config.storage.bucket, prefix, key, nonce
+    )
+    .into_bytes();
+
+    let write_start = std::time::Instant::now();
+    tokio::time::timeout(timeout, op.write(&key, payload.clone()))
+        .await
+        .map_err(|_| anyhow::anyhow!("storage canary write timed out after {timeout:?}: {key}"))?
+        .with_context(|| format!("storage canary write failed: {key}"))?;
+    let write_ms = write_start.elapsed().as_millis();
+
+    let list_start = std::time::Instant::now();
+    let list_entries = tokio::time::timeout(timeout, op.list(&list_prefix))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("storage canary list timed out after {timeout:?}: {list_prefix}")
+        })?
+        .with_context(|| format!("storage canary list failed: {list_prefix}"))?;
+    let list_ms = list_start.elapsed().as_millis();
+    let list_count = list_entries.len();
+
+    let read_start = std::time::Instant::now();
+    let read_back = tokio::time::timeout(timeout, op.read(&key))
+        .await
+        .map_err(|_| anyhow::anyhow!("storage canary read timed out after {timeout:?}: {key}"))?
+        .with_context(|| format!("storage canary read failed: {key}"))?
+        .to_bytes();
+    let read_ms = read_start.elapsed().as_millis();
+
+    anyhow::ensure!(
+        read_back == payload.as_slice(),
+        "storage canary readback mismatch: {key}"
+    );
+
+    let delete_start = std::time::Instant::now();
+    tokio::time::timeout(timeout, op.delete(&key))
+        .await
+        .map_err(|_| anyhow::anyhow!("storage canary delete timed out after {timeout:?}: {key}"))?
+        .with_context(|| format!("storage canary delete failed: {key}"))?;
+    let delete_ms = delete_start.elapsed().as_millis();
+
+    let verify_start = std::time::Instant::now();
+    let exists_after_delete = tokio::time::timeout(timeout, op.exists(&key))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("storage canary delete verification timed out after {timeout:?}: {key}")
+        })?
+        .with_context(|| format!("storage canary delete verification failed: {key}"))?;
+    let verify_delete_ms = verify_start.elapsed().as_millis();
+
+    anyhow::ensure!(
+        !exists_after_delete,
+        "storage canary delete verification failed; object still exists: {key}"
+    );
+
+    let scope_deny = if let Some(deny_prefix) = expect_deny_prefix {
+        Some(run_storage_canary_scope_deny_probe(op, prefix, deny_prefix, nonce, timeout).await?)
+    } else {
+        None
+    };
+
+    Ok(StorageCanaryReport {
+        endpoint: config.storage.endpoint.clone(),
+        bucket: config.storage.bucket.clone(),
+        prefix: prefix.to_string(),
+        key,
+        list_prefix,
+        scope_deny,
+        bytes: payload.len(),
+        write_ms,
+        list_ms,
+        list_count,
+        read_ms,
+        delete_ms,
+        verify_delete_ms,
+        listed: true,
+        deleted: !exists_after_delete,
+        endpoint_tls: config.storage.endpoint.starts_with("https://"),
+        enforce_tls: config.storage.enforce_tls,
+    })
+}
+
+async fn run_storage_canary_scope_deny_probe(
+    op: &opendal::Operator,
+    allowed_prefix: &str,
+    deny_prefix: &str,
+    nonce: &str,
+    timeout: Duration,
+) -> Result<StorageCanaryScopeDenyReport> {
+    let key = storage_canary_key(deny_prefix, nonce);
+    anyhow::ensure!(
+        key != storage_canary_key(allowed_prefix, nonce),
+        "--expect-deny-prefix resolves to the same canary key as --prefix: {key}"
+    );
+
+    let payload = format!(
+        "tcfs storage canary forbidden-scope probe\nallowed_prefix={allowed_prefix}\ndeny_prefix={deny_prefix}\nkey={key}\nnonce={nonce}\n",
+    )
+    .into_bytes();
+
+    let write_start = std::time::Instant::now();
+    let write_result = tokio::time::timeout(timeout, op.write(&key, payload)).await;
+    let write_ms = write_start.elapsed().as_millis();
+
+    match write_result {
+        Err(_) => {
+            anyhow::bail!("storage canary deny-scope write timed out after {timeout:?}: {key}")
+        }
+        Ok(Err(err)) if err.kind() == opendal::ErrorKind::PermissionDenied => {
+            Ok(StorageCanaryScopeDenyReport {
+                prefix: deny_prefix.to_string(),
+                key,
+                write_ms,
+                error_kind: err.kind().to_string(),
+                denied: true,
+            })
+        }
+        Ok(Err(err)) => anyhow::bail!(
+            "storage canary deny-scope write failed with {}, expected PermissionDenied: {key}",
+            err.kind()
+        ),
+        Ok(Ok(_)) => {
+            let _ = tokio::time::timeout(timeout, op.delete(&key)).await;
+            anyhow::bail!(
+                "storage canary deny-scope write unexpectedly succeeded; credentials are not scoped away from {key}"
+            )
+        }
+    }
 }
 
 // ── `tcfs migrate-prefix` ────────────────────────────────────────────────────
@@ -1714,8 +2505,39 @@ fn print_update_notice(current: &str, latest: &str) {
 // ── gRPC connection ───────────────────────────────────────────────────────────
 
 #[cfg(unix)]
-async fn connect_daemon(socket_path: &Path) -> Result<TcfsDaemonClient<Channel>> {
+fn load_session_token() -> Option<String> {
+    if let Ok(token) = std::env::var("TCFS_SESSION_TOKEN") {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    match tcfs_secrets::keychain::get_secret(tcfs_secrets::keychain::keys::SESSION_TOKEN) {
+        Ok(Some(secret)) => Some(secret.expose_secret().to_string()),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::debug!("failed to read TCFS session token from keychain: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+fn store_session_token(token: &str) -> Result<()> {
+    if token.trim().is_empty() {
+        anyhow::bail!("refusing to store an empty session token");
+    }
+
+    let secret = secrecy::SecretString::from(token.to_string());
+    tcfs_secrets::keychain::store_secret(tcfs_secrets::keychain::keys::SESSION_TOKEN, &secret)
+        .context("storing TCFS session token in keychain")
+}
+
+#[cfg(unix)]
+async fn connect_daemon(socket_path: &Path) -> Result<DaemonClient> {
     let path = socket_path.to_path_buf();
+    let token = load_session_token();
 
     // tonic over Unix domain socket: use a tower service_fn connector
     let channel = Endpoint::from_static("http://[::]:0")
@@ -1729,7 +2551,10 @@ async fn connect_daemon(socket_path: &Path) -> Result<TcfsDaemonClient<Channel>>
         .await
         .with_context(|| format!("connecting to tcfsd at {}", socket_path.display()))?;
 
-    Ok(TcfsDaemonClient::new(channel))
+    Ok(TcfsDaemonClient::with_interceptor(
+        channel,
+        SessionTokenInterceptor { token },
+    ))
 }
 
 // ── `tcfs config show` ────────────────────────────────────────────────────────
@@ -1747,6 +2572,29 @@ fn cmd_config_show(config: &tcfs_core::config::TcfsConfig, config_path: &Path) -
     let rendered = toml::to_string_pretty(config).context("serializing config to TOML")?;
     print!("{rendered}");
     Ok(())
+}
+
+async fn cmd_config_fileprovider(
+    config: &tcfs_core::config::TcfsConfig,
+    out: Option<&Path>,
+    device_id: Option<&str>,
+    master_key_file: Option<&Path>,
+    force: bool,
+) -> Result<()> {
+    let config_path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_fileprovider_config_path);
+    let device_id = resolve_fileprovider_device_id(config, device_id)?;
+    let master_key_path = resolve_fileprovider_master_key_path(config, master_key_file)?;
+
+    write_fileprovider_init_config(&config_path, config, &master_key_path, &device_id, force)
+        .await?;
+    println!("FileProvider config: {}", config_path.display());
+    Ok(())
+}
+
+fn default_fileprovider_config_path() -> PathBuf {
+    default_user_config_dir().join("fileprovider/config.json")
 }
 
 // ── `tcfs kdbx resolve` ───────────────────────────────────────────────────────
@@ -1800,6 +2648,15 @@ fn format_uptime(secs: i64) -> String {
 
 // ── `tcfs cache stats` / `tcfs cache clear` ──────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CacheEvictReport {
+    rel_path: String,
+    remote_prefix: String,
+    manifest_hash: String,
+    bytes_freed: u64,
+    was_cached: bool,
+}
+
 async fn cmd_cache_stats(config: &tcfs_core::config::TcfsConfig) -> Result<()> {
     let cache_dir = expand_tilde(&config.fuse.cache_dir);
     let cache_max = config.fuse.cache_max_mb * 1024 * 1024;
@@ -1843,6 +2700,74 @@ async fn cmd_cache_clear(config: &tcfs_core::config::TcfsConfig) -> Result<()> {
     } else {
         println!("Cache directory does not exist: {}", cache_dir.display());
     }
+    Ok(())
+}
+
+async fn evict_cache_entry_with_operator(
+    config: &tcfs_core::config::TcfsConfig,
+    op: &opendal::Operator,
+    rel_path: &str,
+    remote_prefix: &str,
+) -> Result<CacheEvictReport> {
+    let report = inspect_index_entry_with_operator(op, rel_path, remote_prefix).await?;
+    let status = report.status.clone();
+    let visible = report.visible_entry.with_context(|| {
+        format!(
+            "cannot evict cache for {}: remote index status is {status}",
+            report.rel_path
+        )
+    })?;
+    anyhow::ensure!(
+        visible.manifest_exists,
+        "cannot evict cache for {}: manifest {} is missing",
+        report.rel_path,
+        visible.manifest_key
+    );
+
+    let cache_dir = expand_tilde(&config.fuse.cache_dir);
+    let cache_max = config.fuse.cache_max_mb * 1024 * 1024;
+    let cache = tcfs_vfs::DiskCache::new(cache_dir, cache_max);
+    let bytes_freed = cache.evict(&visible.manifest_hash).await?;
+
+    Ok(CacheEvictReport {
+        rel_path: report.rel_path,
+        remote_prefix: report.remote_prefix,
+        manifest_hash: visible.manifest_hash,
+        bytes_freed,
+        was_cached: bytes_freed > 0,
+    })
+}
+
+async fn cmd_cache_evict(
+    config: &tcfs_core::config::TcfsConfig,
+    rel_path: &str,
+    prefix: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let op = build_operator(config).await?;
+    let remote_prefix = prefix.unwrap_or_else(|| config.storage.resolved_prefix());
+    let report = evict_cache_entry_with_operator(config, &op, rel_path, remote_prefix).await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serializing cache evict report")?
+        );
+    } else {
+        println!("Evicted cache entry: {}", report.rel_path);
+        println!("  remote prefix: {}", report.remote_prefix);
+        println!("  manifest:      {}", report.manifest_hash);
+        println!("  freed:         {}", fmt_bytes(report.bytes_freed));
+        println!(
+            "  result:        {}",
+            if report.was_cached {
+                "evicted"
+            } else {
+                "not cached"
+            }
+        );
+    }
+
     Ok(())
 }
 
@@ -1907,8 +2832,17 @@ async fn cmd_mount(
         bucket: bucket.clone(),
         access_key_id: access_key,
         secret_access_key: secret_key,
+        s3_connect_timeout_secs: config.storage.s3_connect_timeout_secs,
+        s3_pool_idle_timeout_secs: config.storage.s3_pool_idle_timeout_secs,
+        s3_pool_max_idle_per_host: config.storage.s3_pool_max_idle_per_host,
+        s3_http1_only: config.storage.s3_http1_only,
+        ca_cert_path: config.storage.ca_cert_path.clone(),
     };
-    let op = tcfs_storage::build_operator(&storage_cfg).context("building storage operator")?;
+    let op = tcfs_storage::operator::build_operator_with_limits(
+        &storage_cfg,
+        config.storage.max_concurrent_ops,
+    )
+    .context("building storage operator")?;
 
     let cache_dir = expand_tilde(&config.fuse.cache_dir);
     let neg_ttl = config.fuse.negative_cache_ttl_secs;
@@ -2096,10 +3030,50 @@ fn cmd_unmount(mountpoint: &std::path::Path) -> Result<()> {
 
 // ── `tcfs unsync` ─────────────────────────────────────────────────────────────
 
-/// Convert a hydrated file back to a `.tc` stub, reclaiming disk space.
+#[derive(Debug, Clone)]
+struct UnsyncTarget {
+    path: PathBuf,
+    tracked: tcfs_sync::state::SyncState,
+}
+
+#[derive(Debug, Clone)]
+struct UnsyncConversion {
+    path: PathBuf,
+    stub_full: PathBuf,
+    tracked: tcfs_sync::state::SyncState,
+    local_size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct UnsyncSkip {
+    path: PathBuf,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct DirtyUnsyncPath {
+    path: PathBuf,
+    reason: String,
+}
+
+#[derive(Debug, Default)]
+struct UnsyncPlan {
+    conversions: Vec<UnsyncConversion>,
+    skipped: Vec<UnsyncSkip>,
+    dirty: Vec<DirtyUnsyncPath>,
+}
+
+impl UnsyncPlan {
+    fn has_work(&self) -> bool {
+        !self.conversions.is_empty() || !self.skipped.is_empty()
+    }
+}
+
+/// Convert hydrated file(s) back to `.tc` stubs, reclaiming disk space.
 ///
-/// Reads the file, computes its BLAKE3 hash, looks up the matching index entry,
-/// and replaces the file content with a stub. The actual remote data is NOT deleted.
+/// File input preserves the original one-file behavior. Directory input walks
+/// tracked descendants, refuses dirty files unless `--force` is set, flips
+/// state to `NotSynced`, then writes stubs and removes hydrated files.
 async fn cmd_unsync(
     config: &tcfs_core::config::TcfsConfig,
     path: &std::path::Path,
@@ -2114,56 +3088,257 @@ async fn cmd_unsync(
     }
 
     let state_path = resolve_state_path(config, None);
-    let state = tcfs_sync::state::StateCache::open(&state_path)
+
+    if path.is_dir() {
+        cmd_unsync_directory(config, path, force, &state_path).await
+    } else {
+        cmd_unsync_file(config, path, force, &state_path).await
+    }
+}
+
+async fn cmd_unsync_file(
+    config: &tcfs_core::config::TcfsConfig,
+    path: &std::path::Path,
+    force: bool,
+    state_path: &std::path::Path,
+) -> Result<()> {
+    let state = tcfs_sync::state::StateCache::open(state_path)
         .with_context(|| format!("opening state cache: {}", state_path.display()))?;
     let tracked = state
         .get(path)
         .cloned()
         .with_context(|| format!("{} is not tracked (never pushed)", path.display()))?;
+    drop(state);
 
-    // Read file content and compute hash
-    let data = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("reading: {}", path.display()))?;
-
-    let hash = tcfs_chunks::hash_bytes(&data);
-    let hash_hex = tcfs_chunks::hash_to_hex(&hash);
-    let size = data.len() as u64;
-
-    if !force && tracked.blake3 != hash_hex {
+    let target = UnsyncTarget {
+        path: path.to_path_buf(),
+        tracked,
+    };
+    let plan = build_unsync_plan(state_path, vec![target], force)?;
+    if let Some(dirty) = plan.dirty.first() {
         anyhow::bail!(
-            "{} has local changes (hash mismatch). Use --force to unsync anyway.",
-            path.display()
+            "{} has local changes ({}). Use --force to unsync anyway.",
+            dirty.path.display(),
+            dirty.reason
         );
     }
 
-    let sync_root = config.sync.sync_root.as_deref();
-    let rel_path = tcfs_sync::engine::normalize_rel_path(path, sync_root);
-    let stub = tcfs_vfs::StubMeta::for_upload(
-        &tracked.blake3,
-        tracked.size,
-        tracked.chunk_count,
-        config.storage.resolved_prefix(),
-        &rel_path,
+    flush_unsync_state_first(
+        state_path,
+        plan.conversions.iter().map(|c| c.path.as_path()),
+    )?;
+
+    let conversion = plan
+        .conversions
+        .first()
+        .context("tracked file had no unsync conversion")?;
+    apply_unsync_conversion(config, conversion).await?;
+
+    println!(
+        "Unsynced: {} → {}",
+        conversion.path.display(),
+        conversion.stub_full.display()
+    );
+    println!(
+        "  hash: {}",
+        &conversion.tracked.blake3[..16.min(conversion.tracked.blake3.len())]
+    );
+    println!("  size: {} freed", fmt_bytes(conversion.local_size));
+
+    Ok(())
+}
+
+async fn cmd_unsync_directory(
+    config: &tcfs_core::config::TcfsConfig,
+    path: &std::path::Path,
+    force: bool,
+    state_path: &std::path::Path,
+) -> Result<()> {
+    let state = tcfs_sync::state::StateCache::open(state_path)
+        .with_context(|| format!("opening state cache: {}", state_path.display()))?;
+    let mut targets: Vec<UnsyncTarget> = state
+        .children_with_prefix(path)
+        .into_iter()
+        .map(|(key, tracked)| UnsyncTarget {
+            path: PathBuf::from(key),
+            tracked: tracked.clone(),
+        })
+        .collect();
+    targets.sort_by(|a, b| a.path.cmp(&b.path));
+    drop(state);
+
+    if targets.is_empty() {
+        anyhow::bail!(
+            "{} has no tracked descendants in {}",
+            path.display(),
+            state_path.display()
+        );
+    }
+
+    let plan = build_unsync_plan(state_path, targets, force)?;
+    if !plan.dirty.is_empty() {
+        print_dirty_unsync_paths(path, &plan.dirty);
+        anyhow::bail!(
+            "{} dirty descendant(s) with local changes. Use --force to unsync anyway.",
+            plan.dirty.len()
+        );
+    }
+
+    if !plan.has_work() {
+        println!(
+            "{} has no hydrated tracked descendants to unsync.",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    flush_unsync_state_first(
+        state_path,
+        plan.conversions
+            .iter()
+            .map(|c| c.path.as_path())
+            .chain(plan.skipped.iter().map(|s| s.path.as_path())),
+    )?;
+
+    for conversion in &plan.conversions {
+        apply_unsync_conversion(config, conversion).await?;
+    }
+
+    println!("Unsynced directory: {}", path.display());
+    if !plan.conversions.is_empty() {
+        println!("  converted:");
+        for conversion in &plan.conversions {
+            println!(
+                "    {} → {}",
+                conversion.path.display(),
+                conversion.stub_full.display()
+            );
+        }
+    }
+    if !plan.skipped.is_empty() {
+        println!("  skipped:");
+        for skipped in &plan.skipped {
+            println!("    {} ({})", skipped.path.display(), skipped.reason);
+        }
+    }
+    println!(
+        "  summary: {} converted, {} skipped, 0 dirty",
+        plan.conversions.len(),
+        plan.skipped.len()
     );
 
-    // Build stub at path.tc
-    let stub_path = tcfs_vfs::real_to_stub_name(path.file_name().context("path has no filename")?);
-    let stub_full = path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join(stub_path);
+    Ok(())
+}
 
+fn build_unsync_plan(
+    state_path: &std::path::Path,
+    targets: Vec<UnsyncTarget>,
+    force: bool,
+) -> Result<UnsyncPlan> {
+    let state = tcfs_sync::state::StateCache::open(state_path)
+        .with_context(|| format!("opening state cache: {}", state_path.display()))?;
+    let mut plan = UnsyncPlan::default();
+
+    for target in targets {
+        if target.path.is_dir() {
+            plan.skipped.push(UnsyncSkip {
+                path: target.path,
+                reason: "tracked directory marker".to_string(),
+            });
+            continue;
+        }
+
+        if target.path.exists() {
+            match state.needs_sync(&target.path) {
+                Ok(Some(reason)) if !force => {
+                    plan.dirty.push(DirtyUnsyncPath {
+                        path: target.path,
+                        reason,
+                    });
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) if !force => {
+                    plan.dirty.push(DirtyUnsyncPath {
+                        path: target.path,
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+                Err(_) => {}
+            }
+
+            let metadata = std::fs::metadata(&target.path)
+                .with_context(|| format!("stat: {}", target.path.display()))?;
+            if !metadata.is_file() {
+                plan.skipped.push(UnsyncSkip {
+                    path: target.path,
+                    reason: "not a regular file".to_string(),
+                });
+                continue;
+            }
+
+            let stub_name = tcfs_vfs::real_to_stub_name(
+                target
+                    .path
+                    .file_name()
+                    .context("tracked path has no filename")?,
+            );
+            let stub_full = target
+                .path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(stub_name);
+
+            plan.conversions.push(UnsyncConversion {
+                path: target.path,
+                stub_full,
+                tracked: target.tracked,
+                local_size: metadata.len(),
+            });
+            continue;
+        }
+
+        let stub_candidate = target
+            .path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(tcfs_vfs::real_to_stub_name(
+                target
+                    .path
+                    .file_name()
+                    .context("tracked path has no filename")?,
+            ));
+        let reason = if stub_candidate.exists() {
+            "already stubbed".to_string()
+        } else {
+            "hydrated file missing".to_string()
+        };
+        plan.skipped.push(UnsyncSkip {
+            path: target.path,
+            reason,
+        });
+    }
+
+    Ok(plan)
+}
+
+fn flush_unsync_state_first<'a>(
+    state_path: &std::path::Path,
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
+) -> Result<()> {
     // Flip persisted state to NotSynced BEFORE destructive fs ops.
     //
-    // If the stub write or original removal fails below, the on-disk state
+    // If a stub write or original removal fails below, the on-disk state
     // already reflects reality (NotSynced, possibly with a missing stub)
     // and a re-hydration pass can recover. The previous ordering could
     // leave a stub on disk, the original gone, and status still Synced —
     // which would make the CLI lie to the daemon.
-    let mut state = tcfs_sync::state::StateCache::open(&state_path)
+    let mut state = tcfs_sync::state::StateCache::open(state_path)
         .with_context(|| format!("opening state cache: {}", state_path.display()))?;
-    state.set_status(path, tcfs_sync::state::FileSyncStatus::NotSynced);
+    for path in paths {
+        state.set_status(path, tcfs_sync::state::FileSyncStatus::NotSynced);
+    }
     state.flush().with_context(|| {
         format!(
             "flushing state cache before unsync: {}",
@@ -2171,50 +3346,94 @@ async fn cmd_unsync(
         )
     })?;
     drop(state);
+    Ok(())
+}
+
+async fn apply_unsync_conversion(
+    config: &tcfs_core::config::TcfsConfig,
+    conversion: &UnsyncConversion,
+) -> Result<()> {
+    let sync_root = config.sync.sync_root.as_deref();
+    let rel_path = tcfs_sync::engine::normalize_rel_path(&conversion.path, sync_root);
+    let stub = tcfs_vfs::StubMeta::for_upload(
+        &conversion.tracked.blake3,
+        conversion.tracked.size,
+        conversion.tracked.chunk_count,
+        config.storage.resolved_prefix(),
+        &rel_path,
+    );
 
     // Now safe: any fs failure below leaves a recoverable
     // NotSynced-with-possibly-missing-stub state.
-    tokio::fs::write(&stub_full, stub.to_bytes())
+    tokio::fs::write(&conversion.stub_full, stub.to_bytes())
         .await
-        .with_context(|| format!("writing stub: {}", stub_full.display()))?;
-    tokio::fs::remove_file(path)
+        .with_context(|| format!("writing stub: {}", conversion.stub_full.display()))?;
+    tokio::fs::remove_file(&conversion.path)
         .await
-        .with_context(|| format!("removing hydrated file: {}", path.display()))?;
-
-    println!("Unsynced: {} → {}", path.display(), stub_full.display());
-    println!(
-        "  hash: {}",
-        &tracked.blake3[..16.min(tracked.blake3.len())]
-    );
-    println!("  size: {} freed", fmt_bytes(size));
+        .with_context(|| format!("removing hydrated file: {}", conversion.path.display()))?;
 
     Ok(())
 }
 
+fn print_dirty_unsync_paths(root: &std::path::Path, dirty: &[DirtyUnsyncPath]) {
+    eprintln!(
+        "Refusing to unsync directory with dirty descendants: {}",
+        root.display()
+    );
+    eprintln!("  dirty:");
+    for entry in dirty {
+        eprintln!("    {} ({})", entry.path.display(), entry.reason);
+    }
+    eprintln!("  summary: 0 converted, 0 skipped, {} dirty", dirty.len());
+}
+
 // ── `tcfs init` ──────────────────────────────────────────────────────────────
 
-async fn cmd_init(
-    _config: &tcfs_core::config::TcfsConfig,
+#[derive(Debug)]
+struct InitOptions<'a> {
     device_name: Option<String>,
+    check: bool,
+    skip_config: bool,
+    force_config: bool,
+    config_out: Option<&'a Path>,
+    fileprovider_config_out: Option<&'a Path>,
     non_interactive: bool,
     password: Option<String>,
-) -> Result<()> {
+}
+
+async fn cmd_init(config: &tcfs_core::config::TcfsConfig, options: InitOptions<'_>) -> Result<()> {
+    let InitOptions {
+        device_name,
+        check,
+        skip_config,
+        force_config,
+        config_out,
+        fileprovider_config_out,
+        non_interactive,
+        password,
+    } = options;
+
     let device_name = device_name.unwrap_or_else(tcfs_secrets::device::default_device_name);
+    let init_paths = InitPaths::resolve(config_out);
+    let config_path = init_paths.config_path.clone();
+    let master_key_path = init_paths.master_key_path.clone();
+    let registry_path = init_paths.registry_path.clone();
+
+    if check {
+        return cmd_init_check(&init_paths);
+    }
 
     // Step 1: Check if already initialized (master key file exists)
-    let config_dir = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".config")
-        })
-        .join("tcfs");
-    let master_key_path = config_dir.join("master.key");
-
     if master_key_path.exists() {
         anyhow::bail!(
             "Already initialized: {} exists. Remove it to re-initialize.",
             master_key_path.display()
+        );
+    }
+    if !skip_config && config_path.exists() && !force_config {
+        anyhow::bail!(
+            "Config already exists: {}. Pass --force-config to overwrite it or --skip-config to leave it unchanged.",
+            config_path.display()
         );
     }
 
@@ -2274,8 +3493,8 @@ async fn cmd_init(
     };
 
     // Step 5: Write master key to ~/.config/tcfs/master.key (raw 32 bytes)
-    std::fs::create_dir_all(&config_dir)
-        .with_context(|| format!("creating config dir: {}", config_dir.display()))?;
+    std::fs::create_dir_all(&init_paths.config_dir)
+        .with_context(|| format!("creating config dir: {}", init_paths.config_dir.display()))?;
     std::fs::write(&master_key_path, master_key.as_bytes())
         .with_context(|| format!("writing master key: {}", master_key_path.display()))?;
 
@@ -2288,11 +3507,26 @@ async fn cmd_init(
     }
 
     // Step 6: Create device registry and enroll this device
-    let registry_path = tcfs_secrets::device::default_registry_path();
     let mut registry = tcfs_secrets::device::DeviceRegistry::load(&registry_path)?;
-    let public_key = format!("age1-device-{}", &blake3_short(&device_name));
-    let device_id = registry.enroll(&device_name, &public_key, None);
+    let (device_id, device_key) = registry.enroll_local(&device_name, None);
+    let device_key_path = tcfs_secrets::device::device_secret_key_path(&registry_path, &device_id);
+    tcfs_secrets::device::save_device_secret_key(&device_key_path, &device_key.secret_key, false)?;
     registry.save(&registry_path)?;
+
+    let init_config = build_init_config(config, &master_key_path, &registry_path, &device_name);
+    if !skip_config {
+        write_init_config(&config_path, &init_config, force_config)?;
+    }
+    if let Some(fileprovider_config_path) = fileprovider_config_out {
+        write_fileprovider_init_config(
+            fileprovider_config_path,
+            &init_config,
+            &master_key_path,
+            &device_id,
+            force_config,
+        )
+        .await?;
+    }
 
     // Step 7: Print success message
     println!();
@@ -2300,12 +3534,410 @@ async fn cmd_init(
     println!();
     println!("  Device name:  {}", device_name);
     println!("  Device ID:    {}", device_id);
+    println!("  Device key:   {}", device_key_path.display());
     println!("  Master key:   {}", master_key_path.display());
     println!("  Registry:     {}", registry_path.display());
+    if !skip_config {
+        println!("  Config:       {}", config_path.display());
+    }
+    if let Some(fileprovider_config_path) = fileprovider_config_out {
+        println!("  FileProvider: {}", fileprovider_config_path.display());
+    }
     println!();
     println!("Next steps:");
-    println!("  1. Configure storage: tcfs config show");
-    println!("  2. Push files: tcfs push /path/to/files");
+    if skip_config {
+        println!("  1. Write a config.toml or re-run tcfs init without --skip-config");
+        println!("  2. Start tcfsd with that config, then run tcfs status");
+    } else {
+        println!(
+            "  1. Review configuration: tcfs --config {} config show",
+            config_path.display()
+        );
+        println!(
+            "  2. Start tcfsd with that config, then run: tcfs --config {} status",
+            config_path.display()
+        );
+        println!(
+            "  3. Push files: tcfs --config {} push /path/to/files",
+            config_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitPaths {
+    config_dir: PathBuf,
+    config_path: PathBuf,
+    master_key_path: PathBuf,
+    registry_path: PathBuf,
+}
+
+impl InitPaths {
+    fn resolve(config_out: Option<&Path>) -> Self {
+        let config_path = config_out.map(Path::to_path_buf).unwrap_or_else(|| {
+            let config_dir = default_user_config_dir();
+            config_dir.join("config.toml")
+        });
+        let config_dir = config_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let master_key_path = config_dir.join("master.key");
+        let registry_path = config_dir.join("devices.json");
+        Self {
+            config_dir,
+            config_path,
+            master_key_path,
+            registry_path,
+        }
+    }
+}
+
+fn default_user_config_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".config")
+        })
+        .join("tcfs")
+}
+
+fn cmd_init_check(paths: &InitPaths) -> Result<()> {
+    let mut missing = Vec::new();
+    if !paths.config_path.exists() {
+        missing.push(format!("config {}", paths.config_path.display()));
+    }
+    if !paths.master_key_path.exists() {
+        missing.push(format!("master key {}", paths.master_key_path.display()));
+    }
+    if !paths.registry_path.exists() {
+        missing.push(format!("device registry {}", paths.registry_path.display()));
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "tcfs is not initialized; missing {}. Run 'tcfs init'.",
+            missing.join(", ")
+        );
+    }
+    let registry = tcfs_secrets::device::DeviceRegistry::load(&paths.registry_path)?;
+    if registry.devices.is_empty() {
+        anyhow::bail!(
+            "tcfs is not initialized; device registry {} has no enrolled devices. Run 'tcfs init'.",
+            paths.registry_path.display()
+        );
+    }
+    let configured_device_name = std::fs::read_to_string(&paths.config_path)
+        .ok()
+        .and_then(|content| toml::from_str::<tcfs_core::config::TcfsConfig>(&content).ok())
+        .and_then(|config| config.sync.device_name);
+    let active_devices: Vec<_> = registry.active_devices().collect();
+    let local_device = configured_device_name
+        .as_deref()
+        .and_then(|name| {
+            active_devices
+                .iter()
+                .copied()
+                .find(|device| device.name == name)
+        })
+        .or_else(|| {
+            if active_devices.len() == 1 {
+                active_devices.first().copied()
+            } else {
+                None
+            }
+        })
+        .with_context(|| {
+            let expected = configured_device_name
+                .as_deref()
+                .unwrap_or("<unset; registry has multiple active devices>");
+            format!(
+                "tcfs is not initialized; local device '{expected}' was not found in {}",
+                paths.registry_path.display()
+            )
+        })?;
+
+    if !tcfs_secrets::device::is_real_age_public_key(&local_device.public_key) {
+        anyhow::bail!(
+            "tcfs is not initialized with a real device key; '{}' has a placeholder public key. Run 'tcfs init' with a fresh config or migrate the device registry.",
+            local_device.name
+        );
+    }
+    let key_path =
+        tcfs_secrets::device::device_secret_key_path(&paths.registry_path, &local_device.device_id);
+    if !key_path.exists() {
+        anyhow::bail!(
+            "tcfs is not initialized; missing device private key for '{}' ({}). Run 'tcfs init' with a fresh config or restore the device key backup.",
+            local_device.name,
+            key_path.display()
+        );
+    }
+
+    println!("tcfs init check [ok]");
+    println!("  Config:     {}", paths.config_path.display());
+    println!("  Master key: {}", paths.master_key_path.display());
+    println!("  Registry:   {}", paths.registry_path.display());
+    Ok(())
+}
+
+fn build_init_config(
+    base: &tcfs_core::config::TcfsConfig,
+    master_key_path: &Path,
+    registry_path: &Path,
+    device_name: &str,
+) -> tcfs_core::config::TcfsConfig {
+    let mut config = base.clone();
+    config.crypto.enabled = true;
+    config.crypto.master_key_file = Some(master_key_path.to_path_buf());
+    config.sync.device_identity = Some(registry_path.to_path_buf());
+    config.sync.device_name = Some(device_name.to_string());
+    config
+}
+
+fn resolve_fileprovider_device_id(
+    config: &tcfs_core::config::TcfsConfig,
+    explicit: Option<&str>,
+) -> Result<String> {
+    if let Some(device_id) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(device_id.to_string());
+    }
+
+    if let Some(registry_path) = &config.sync.device_identity {
+        if let Ok(registry) = tcfs_secrets::device::DeviceRegistry::load(registry_path) {
+            let active_devices: Vec<_> = registry.active_devices().collect();
+            if let Some(device_name) = config.sync.device_name.as_deref() {
+                if let Some(device) = active_devices
+                    .iter()
+                    .copied()
+                    .find(|device| device.name == device_name)
+                {
+                    if !device.device_id.is_empty() {
+                        return Ok(device.device_id.clone());
+                    }
+                }
+            }
+            if active_devices.len() == 1 && !active_devices[0].device_id.is_empty() {
+                return Ok(active_devices[0].device_id.clone());
+            }
+        }
+    }
+
+    if let Some(device_name) = config
+        .sync
+        .device_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(device_name.to_string());
+    }
+
+    anyhow::bail!(
+        "FileProvider config requires a device id; pass --device-id or configure sync.device_name/device_identity"
+    )
+}
+
+fn resolve_fileprovider_master_key_path(
+    config: &tcfs_core::config::TcfsConfig,
+    explicit: Option<&Path>,
+) -> Result<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| config.crypto.master_key_file.clone())
+        .context(
+            "FileProvider config requires a master key file; pass --master-key-file or configure crypto.master_key_file",
+        )
+}
+
+fn write_init_config(
+    config_path: &Path,
+    config: &tcfs_core::config::TcfsConfig,
+    force: bool,
+) -> Result<()> {
+    if config_path.exists() && !force {
+        anyhow::bail!(
+            "Config already exists: {}. Pass --force-config to overwrite it.",
+            config_path.display()
+        );
+    }
+    if let Some(parent) = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir: {}", parent.display()))?;
+    }
+    let rendered = toml::to_string_pretty(config).context("serializing init config to TOML")?;
+    std::fs::write(config_path, rendered)
+        .with_context(|| format!("writing config: {}", config_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on: {}", config_path.display()))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct FileProviderInitConfig {
+    s3_endpoint: String,
+    s3_bucket: String,
+    s3_access: String,
+    s3_secret: String,
+    remote_prefix: String,
+    device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_socket: Option<String>,
+    master_key_file: String,
+}
+
+fn build_fileprovider_init_config(
+    config: &tcfs_core::config::TcfsConfig,
+    s3: &tcfs_secrets::S3Credentials,
+    master_key_path: &Path,
+    device_id: &str,
+) -> FileProviderInitConfig {
+    FileProviderInitConfig {
+        s3_endpoint: config.storage.endpoint.clone(),
+        s3_bucket: config.storage.bucket.clone(),
+        s3_access: s3.access_key_id.clone(),
+        s3_secret: s3.secret_access_key.expose_secret().to_string(),
+        remote_prefix: config.storage.resolved_prefix().to_string(),
+        device_id: device_id.to_string(),
+        daemon_endpoint: config.daemon.fileprovider_endpoint.clone(),
+        daemon_socket: config
+            .daemon
+            .fileprovider_socket
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        master_key_file: master_key_path.to_string_lossy().into_owned(),
+    }
+}
+
+async fn write_fileprovider_init_config(
+    config_path: &Path,
+    config: &tcfs_core::config::TcfsConfig,
+    master_key_path: &Path,
+    device_id: &str,
+    force: bool,
+) -> Result<()> {
+    if config_path.exists() && !force {
+        anyhow::bail!(
+            "FileProvider config already exists: {}. Pass --force-config to overwrite it.",
+            config_path.display()
+        );
+    }
+    let cred_store = tcfs_secrets::CredStore::load(&config.secrets, &config.storage)
+        .await
+        .context("credential discovery failed for FileProvider init config")?;
+    let s3 = cred_store.s3.context(
+        "S3 credentials not found for FileProvider init config.\n\
+         Set TCFS_S3_ACCESS and TCFS_S3_SECRET environment variables,\n\
+         or configure storage.credentials_file in tcfs.toml,\n\
+         or use ~/.aws/credentials file.",
+    )?;
+    tracing::info!(source = %cred_store.source, "FileProvider init credentials loaded");
+
+    let rendered = serde_json::to_string_pretty(&build_fileprovider_init_config(
+        config,
+        &s3,
+        master_key_path,
+        device_id,
+    ))
+    .context("serializing FileProvider init config to JSON")?;
+    write_fileprovider_config_file(config_path, &rendered, force)
+}
+
+fn write_fileprovider_config_file(config_path: &Path, rendered: &str, force: bool) -> Result<()> {
+    if config_path.exists() && !force {
+        anyhow::bail!(
+            "FileProvider config already exists: {}. Pass --force-config to overwrite it.",
+            config_path.display()
+        );
+    }
+    if let Some(parent) = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating FileProvider config dir: {}", parent.display()))?;
+    }
+
+    let parent = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let filename = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let temp_path = parent.join(format!(".{filename}.{}.tmp", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&temp_path).with_context(|| {
+            format!(
+                "creating FileProvider config temp file: {}",
+                temp_path.display()
+            )
+        })?;
+        file.write_all(rendered.as_bytes()).with_context(|| {
+            format!(
+                "writing FileProvider config temp file: {}",
+                temp_path.display()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "syncing FileProvider config temp file: {}",
+                temp_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on: {}", temp_path.display()))?;
+    }
+    if config_path.exists() && !force {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::bail!(
+            "FileProvider config already exists: {}. Pass --force-config to overwrite it.",
+            config_path.display()
+        );
+    }
+
+    #[cfg(windows)]
+    if force && config_path.exists() {
+        std::fs::remove_file(config_path)
+            .with_context(|| format!("replacing FileProvider config: {}", config_path.display()))?;
+    }
+
+    if let Err(error) = std::fs::rename(&temp_path, config_path)
+        .with_context(|| format!("installing FileProvider config: {}", config_path.display()))
+    {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
 
     Ok(())
 }
@@ -2315,11 +3947,6 @@ fn rand_salt() -> [u8; 16] {
     use rand::RngCore;
     rand::thread_rng().fill_bytes(&mut salt);
     salt
-}
-
-fn blake3_short(s: &str) -> String {
-    let hash = blake3::hash(s.as_bytes());
-    hash.to_hex().as_str()[..8].to_string()
 }
 
 // ── `tcfs device list` ───────────────────────────────────────────────────────
@@ -2380,16 +4007,16 @@ fn cmd_device_enroll(name: Option<String>) -> Result<()> {
         );
     }
 
-    let public_key = format!(
-        "age1-device-{}",
-        &blake3::hash(device_name.as_bytes()).to_hex().as_str()[..8]
-    );
-    let device_id = registry.enroll(&device_name, &public_key, None);
+    let (device_id, device_key) = registry.enroll_local(&device_name, None);
+    let device_key_path = tcfs_secrets::device::device_secret_key_path(&registry_path, &device_id);
+    tcfs_secrets::device::save_device_secret_key(&device_key_path, &device_key.secret_key, false)?;
     registry.save(&registry_path)?;
 
     println!("Device enrolled:");
     println!("  name:      {}", device_name);
     println!("  device_id: {}", device_id);
+    println!("  public_key: {}", device_key.public_key);
+    println!("  key:       {}", device_key_path.display());
     println!("  registry:  {}", registry_path.display());
     println!();
     println!("Next: configure sync in tcfs.toml and run 'tcfs push'");
@@ -2688,7 +4315,19 @@ async fn cmd_auth_verify(config: &tcfs_core::config::TcfsConfig, code: &str) -> 
         .into_inner();
 
     if resp.success {
+        let saved = match store_session_token(&resp.session_token) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("Warning: failed to save session token to platform keychain: {err:#}");
+                false
+            }
+        };
         println!("Authentication successful.");
+        if saved {
+            println!("Session token saved to platform keychain.");
+        } else {
+            println!("Session token was not saved; set TCFS_SESSION_TOKEN to use it manually.");
+        }
         println!(
             "Session token: {}...",
             &resp.session_token[..8.min(resp.session_token.len())]
@@ -2770,11 +4409,10 @@ async fn cmd_device_invite(
         }
         *blake3::hash(&key_bytes).as_bytes()
     } else {
-        eprintln!(
-            "Warning: master key not found at {}, using placeholder signing key",
-            key_path.display()
+        anyhow::bail!(
+            "cannot create a device invite without a master key at {}; run tcfs init or configure crypto.master_key_file",
+            key_path.display(),
         );
-        *blake3::hash(b"tcfs-fleet-invite-key").as_bytes()
     };
 
     let mut invite = EnrollmentInvite::new(
@@ -2784,33 +4422,13 @@ async fn cmd_device_invite(
         DevicePermissions::default(),
     );
 
-    // Include storage credentials for credential brokering
+    // Include non-secret routing metadata. Secret bootstrap material is brokered
+    // by tcfsd during DeviceEnroll and wrapped to the joining device public key.
     invite.storage_endpoint = Some(config.storage.endpoint.clone());
     invite.storage_bucket = Some(config.storage.bucket.clone());
-    invite.remote_prefix = Some(String::from("default"));
+    invite.remote_prefix = Some(config.storage.resolved_prefix().to_string());
 
-    // Load S3 credentials from environment (sops-nix populates these)
-    if let Ok(access_key) = std::env::var("AWS_ACCESS_KEY_ID").or_else(|_| {
-        std::env::var("TCFS_S3_ACCESS_KEY_FILE")
-            .and_then(|f| std::fs::read_to_string(f).map_err(|_| std::env::VarError::NotPresent))
-    }) {
-        invite.storage_access_key = Some(access_key);
-    }
-    if let Ok(secret_key) = std::env::var("AWS_SECRET_ACCESS_KEY").or_else(|_| {
-        std::env::var("TCFS_S3_SECRET_KEY_FILE")
-            .and_then(|f| std::fs::read_to_string(f).map_err(|_| std::env::VarError::NotPresent))
-    }) {
-        invite.storage_secret_key = Some(secret_key);
-    }
-
-    // Include encryption config if enabled
-    if config.crypto.enabled {
-        if let Ok(passphrase) = std::env::var("TCFS_ENCRYPTION_KEY_FILE")
-            .and_then(|f| std::fs::read_to_string(f).map_err(|_| std::env::VarError::NotPresent))
-        {
-            invite.encryption_passphrase = Some(passphrase);
-        }
-    }
+    invite.refresh_signature(&signing_key);
 
     // Use compact encoding (short keys + zstd) for QR-friendly payloads
     let compact = invite
@@ -2826,11 +4444,7 @@ async fn cmd_device_invite(
         "Storage: {} (bucket: {})",
         config.storage.endpoint, config.storage.bucket
     );
-    if invite.storage_access_key.is_some() {
-        println!("Credentials: included (S3 access key brokered)");
-    } else {
-        println!("Credentials: NOT included (set AWS_ACCESS_KEY_ID or TCFS_S3_ACCESS_KEY_FILE)");
-    }
+    println!("Credentials: not embedded in invite; daemon wraps bootstrap during enrollment");
     println!(
         "Payload: {} bytes compact, {} bytes full",
         compact.len(),
@@ -3429,14 +5043,8 @@ async fn cmd_rotate_credentials(
 
 // ── `tcfs policy` ────────────────────────────────────────────────────────────
 
-async fn cmd_policy(config: &tcfs_core::config::TcfsConfig, action: PolicyAction) -> Result<()> {
-    let policy_path = config
-        .sync
-        .sync_root
-        .as_ref()
-        .map(|r| r.join(".tcfs-policy.json"))
-        .unwrap_or_else(|| PathBuf::from(".tcfs-policy.json"));
-
+async fn cmd_policy(_config: &tcfs_core::config::TcfsConfig, action: PolicyAction) -> Result<()> {
+    let policy_path = policy_store_path();
     let mut store = tcfs_sync::policy::PolicyStore::open(&policy_path).unwrap_or_default();
 
     match action {
@@ -3569,9 +5177,10 @@ async fn cmd_reconcile(
     // Display plan
     println!();
     println!(
-        "Plan: {} push, {} pull, {} delete-local, {} delete-remote, {} conflict, {} up-to-date",
+        "Plan: {} push, {} pull, {} create-dir, {} delete-local, {} delete-remote, {} conflict, {} up-to-date",
         plan.summary.pushes,
         plan.summary.pulls,
+        plan.summary.directories,
         plan.summary.local_deletes,
         plan.summary.remote_deletes,
         plan.summary.conflicts,
@@ -3605,6 +5214,9 @@ async fn cmd_reconcile(
                     info.local_device, info.remote_device
                 )
             }
+            tcfs_sync::reconcile::ReconcileAction::CreateDirectory { rel_path } => {
+                println!("  + create-dir  {rel_path}")
+            }
             tcfs_sync::reconcile::ReconcileAction::UpToDate { rel_path } => {
                 println!("  = up-to-date  {rel_path}")
             }
@@ -3615,10 +5227,16 @@ async fn cmd_reconcile(
         println!();
         println!("Dry run — no changes made. Use --execute to apply.");
         if !orphan_chunk_cleanup_grace.is_zero() {
-            println!(
-                "Orphan chunk cleanup runs during execute with a {} second grace period.",
-                config.sync.orphan_chunk_cleanup_grace_secs
-            );
+            if plan_may_orphan_remote_chunks(&plan) {
+                println!(
+                    "Orphan chunk cleanup runs during execute with a {} second grace period.",
+                    config.sync.orphan_chunk_cleanup_grace_secs
+                );
+            } else {
+                println!(
+                    "Orphan chunk cleanup will be skipped during execute; this plan does not overwrite or delete remote data."
+                );
+            }
         }
         return Ok(());
     }
@@ -3642,9 +5260,7 @@ async fn cmd_reconcile(
             });
         let enc_ctx = master_key
             .as_ref()
-            .map(|mk| tcfs_sync::engine::EncryptionContext {
-                master_key: mk.clone(),
-            });
+            .map(|mk| build_encryption_context(config, &device_id, mk));
 
         let result = tcfs_sync::reconcile::execute_plan(
             &plan,
@@ -3662,9 +5278,10 @@ async fn cmd_reconcile(
         state.flush().context("flushing state cache")?;
 
         println!(
-            "Done: {} pushed, {} pulled, {} deleted, {} conflicts, {} errors",
+            "Done: {} pushed, {} pulled, {} dirs-created, {} deleted, {} conflicts, {} errors",
             result.pushed,
             result.pulled,
+            result.directories_created,
             result.deleted_local + result.deleted_remote,
             result.conflicts_recorded,
             result.errors.len()
@@ -3675,7 +5292,7 @@ async fn cmd_reconcile(
         }
     }
 
-    if !orphan_chunk_cleanup_grace.is_zero() {
+    if !orphan_chunk_cleanup_grace.is_zero() && plan_may_orphan_remote_chunks(&plan) {
         println!();
         println!(
             "Sweeping orphaned remote chunks older than {} seconds...",
@@ -3703,9 +5320,26 @@ async fn cmd_reconcile(
         for (chunk, err) in &cleanup.delete_errors {
             eprintln!("  orphan cleanup error: {chunk}: {err}");
         }
+    } else if execute && !orphan_chunk_cleanup_grace.is_zero() {
+        println!();
+        println!(
+            "Skipping orphan chunk cleanup; this plan did not overwrite or delete remote data."
+        );
     }
 
     Ok(())
+}
+
+fn plan_may_orphan_remote_chunks(plan: &tcfs_sync::reconcile::ReconcilePlan) -> bool {
+    plan.actions.iter().any(|action| {
+        matches!(
+            action,
+            tcfs_sync::reconcile::ReconcileAction::Push {
+                reason: tcfs_sync::reconcile::PushReason::LocalNewer,
+                ..
+            } | tcfs_sync::reconcile::ReconcileAction::DeleteRemote { .. }
+        )
+    })
 }
 
 // ── `tcfs resolve` ───────────────────────────────────────────────────────────
@@ -3843,6 +5477,298 @@ mod tests {
         config
     }
 
+    #[test]
+    fn init_paths_use_config_out_parent_for_master_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("nested/config.toml");
+        let paths = InitPaths::resolve(Some(&config_path));
+
+        assert_eq!(paths.config_path, config_path);
+        assert_eq!(paths.config_dir, dir.path().join("nested"));
+        assert_eq!(paths.master_key_path, dir.path().join("nested/master.key"));
+        assert_eq!(paths.registry_path, dir.path().join("nested/devices.json"));
+    }
+
+    #[test]
+    fn init_paths_use_current_dir_for_relative_config_out() {
+        let paths = InitPaths::resolve(Some(Path::new("config.toml")));
+
+        assert_eq!(paths.config_path, PathBuf::from("config.toml"));
+        assert_eq!(paths.config_dir, PathBuf::from("."));
+        assert_eq!(paths.master_key_path, PathBuf::from(".").join("master.key"));
+        assert_eq!(paths.registry_path, PathBuf::from(".").join("devices.json"));
+    }
+
+    #[test]
+    fn build_init_config_enables_crypto_and_device_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = test_config(dir.path());
+        base.storage.endpoint = "https://s3.example.test".into();
+        base.crypto.enabled = false;
+        base.crypto.master_key_file = None;
+        base.sync.device_name = None;
+
+        let master_key_path = dir.path().join("master.key");
+        let registry_path = dir.path().join("devices.json");
+        let config = build_init_config(&base, &master_key_path, &registry_path, "laptop");
+
+        assert!(config.crypto.enabled);
+        assert_eq!(
+            config.crypto.master_key_file.as_deref(),
+            Some(master_key_path.as_path())
+        );
+        assert_eq!(
+            config.sync.device_identity.as_deref(),
+            Some(registry_path.as_path())
+        );
+        assert_eq!(config.sync.device_name.as_deref(), Some("laptop"));
+        assert_eq!(config.storage.endpoint, "https://s3.example.test");
+    }
+
+    #[test]
+    fn write_init_config_refuses_existing_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "existing = true\n").unwrap();
+        let config = tcfs_core::config::TcfsConfig::default();
+
+        let err = write_init_config(&config_path, &config, false).unwrap_err();
+        assert!(err.to_string().contains("Config already exists"));
+
+        write_init_config(&config_path, &config, true).unwrap();
+        let reparsed: tcfs_core::config::TcfsConfig =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(reparsed.storage.bucket, config.storage.bucket);
+    }
+
+    #[test]
+    fn build_fileprovider_init_config_emits_hostapp_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.storage.endpoint = "https://s3.example.test".into();
+        config.storage.bucket = "tcfs-smoke".into();
+        config.storage.remote_prefix = Some("devices/neo".into());
+        config.daemon.fileprovider_endpoint = Some("http://127.0.0.1:19101".into());
+        config.daemon.fileprovider_socket = Some(dir.path().join("tcfsd-fileprovider.sock"));
+
+        let s3 = tcfs_secrets::S3Credentials {
+            access_key_id: "access-key".into(),
+            secret_access_key: secrecy::SecretString::from("secret-key".to_string()),
+            endpoint: config.storage.endpoint.clone(),
+            region: config.storage.region.clone(),
+        };
+        let master_key_path = dir.path().join("master.key");
+        let rendered = build_fileprovider_init_config(&config, &s3, &master_key_path, "device-1");
+
+        assert_eq!(rendered.s3_endpoint, "https://s3.example.test");
+        assert_eq!(rendered.s3_bucket, "tcfs-smoke");
+        assert_eq!(rendered.s3_access, "access-key");
+        assert_eq!(rendered.s3_secret, "secret-key");
+        assert_eq!(rendered.remote_prefix, "devices/neo");
+        assert_eq!(rendered.device_id, "device-1");
+        assert_eq!(
+            rendered.daemon_endpoint.as_deref(),
+            Some("http://127.0.0.1:19101")
+        );
+        assert_eq!(
+            rendered.daemon_socket.as_deref(),
+            Some(dir.path().join("tcfsd-fileprovider.sock").to_str().unwrap())
+        );
+        assert_eq!(rendered.master_key_file, master_key_path.to_string_lossy());
+
+        let json = serde_json::to_value(&rendered).unwrap();
+        assert_eq!(json["s3_secret"], "secret-key");
+        assert_eq!(
+            json["master_key_file"].as_str(),
+            Some(master_key_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn resolve_fileprovider_device_id_prefers_explicit_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        let resolved = resolve_fileprovider_device_id(&config, Some(" device-from-ci ")).unwrap();
+
+        assert_eq!(resolved, "device-from-ci");
+    }
+
+    #[test]
+    fn resolve_fileprovider_device_id_reads_registry_for_configured_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("devices.json");
+        let mut registry = tcfs_secrets::device::DeviceRegistry::load(&registry_path).unwrap();
+        let (device_id, _device_key) = registry.enroll_local("macbook", None);
+        registry.save(&registry_path).unwrap();
+
+        let mut config = test_config(dir.path());
+        config.sync.device_identity = Some(registry_path);
+        config.sync.device_name = Some("macbook".into());
+
+        let resolved = resolve_fileprovider_device_id(&config, None).unwrap();
+
+        assert_eq!(resolved, device_id);
+    }
+
+    #[test]
+    fn resolve_fileprovider_device_id_falls_back_to_device_name_for_packaged_smoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.sync.device_name = Some("gha-macos-postinstall".into());
+
+        let resolved = resolve_fileprovider_device_id(&config, None).unwrap();
+
+        assert_eq!(resolved, "gha-macos-postinstall");
+    }
+
+    #[test]
+    fn resolve_fileprovider_master_key_path_prefers_explicit_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let explicit = dir.path().join("explicit-master.key");
+
+        let resolved = resolve_fileprovider_master_key_path(&config, Some(&explicit)).unwrap();
+
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn write_fileprovider_config_file_refuses_existing_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("fileprovider/config.json");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let err = write_fileprovider_config_file(&config_path, "{\"ok\":true}", false).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("FileProvider config already exists"));
+
+        write_fileprovider_config_file(&config_path, "{\"ok\":true}", true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "{\"ok\":true}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_init_config_sets_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let config = tcfs_core::config::TcfsConfig::default();
+
+        write_init_config(&config_path, &config, false).unwrap();
+
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_fileprovider_config_file_sets_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("fileprovider/config.json");
+
+        write_fileprovider_config_file(&config_path, "{\"ok\":true}", false).unwrap();
+
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_token_interceptor_attaches_bearer_metadata() {
+        let mut interceptor = SessionTokenInterceptor {
+            token: Some("session-token-123".into()),
+        };
+
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer session-token-123"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_token_interceptor_skips_missing_token() {
+        let mut interceptor = SessionTokenInterceptor { token: None };
+
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+
+        assert!(request.metadata().get("authorization").is_none());
+    }
+
+    #[test]
+    fn init_check_accepts_real_device_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let master_key_path = dir.path().join("master.key");
+        let registry_path = dir.path().join("devices.json");
+        std::fs::write(&config_path, "config = true\n").unwrap();
+        std::fs::write(&master_key_path, [7u8; tcfs_crypto::KEY_SIZE]).unwrap();
+
+        let mut registry = tcfs_secrets::device::DeviceRegistry::default();
+        let (device_id, key) = registry.enroll_local("laptop", None);
+        registry.save(&registry_path).unwrap();
+        let key_path = tcfs_secrets::device::device_secret_key_path(&registry_path, &device_id);
+        tcfs_secrets::device::save_device_secret_key(&key_path, &key.secret_key, false).unwrap();
+
+        let paths = InitPaths {
+            config_dir: dir.path().to_path_buf(),
+            config_path,
+            master_key_path,
+            registry_path,
+        };
+        cmd_init_check(&paths).unwrap();
+    }
+
+    #[test]
+    fn init_check_rejects_placeholder_device_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let master_key_path = dir.path().join("master.key");
+        let registry_path = dir.path().join("devices.json");
+        std::fs::write(&config_path, "config = true\n").unwrap();
+        std::fs::write(&master_key_path, [7u8; tcfs_crypto::KEY_SIZE]).unwrap();
+
+        let mut registry = tcfs_secrets::device::DeviceRegistry::default();
+        registry.enroll("legacy", "age1-device-deadbeef", None);
+        registry.save(&registry_path).unwrap();
+
+        let paths = InitPaths {
+            config_dir: dir.path().to_path_buf(),
+            config_path,
+            master_key_path,
+            registry_path,
+        };
+        let err = cmd_init_check(&paths).unwrap_err();
+        assert!(
+            err.to_string().contains("placeholder public key"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     fn make_encrypted_manifest(
         old_master: &tcfs_crypto::MasterKey,
         manifest_hash: &str,
@@ -3861,6 +5787,7 @@ mod tests {
             rel_path: Some(rel_path.to_string()),
             mode: None,
             encrypted_file_key: Some(base64::engine::general_purpose::STANDARD.encode(wrapped)),
+            wrapped_file_keys: Vec::new(),
         }
     }
 
@@ -3878,6 +5805,109 @@ mod tests {
             .decode(wrapped_b64)
             .unwrap();
         tcfs_crypto::unwrap_key(master_key, &wrapped).is_ok()
+    }
+
+    fn plan_with_actions(
+        actions: Vec<tcfs_sync::reconcile::ReconcileAction>,
+    ) -> tcfs_sync::reconcile::ReconcilePlan {
+        tcfs_sync::reconcile::ReconcilePlan {
+            actions,
+            summary: tcfs_sync::reconcile::ReconcileSummary::default(),
+            device_id: "test-device".into(),
+            generated_at: 0,
+        }
+    }
+
+    #[test]
+    fn reconcile_cleanup_skips_pull_only_plans() {
+        let plan = plan_with_actions(vec![tcfs_sync::reconcile::ReconcileAction::Pull {
+            rel_path: "doc.txt".into(),
+            manifest_hash: "hash".into(),
+            size: 12,
+            reason: tcfs_sync::reconcile::PullReason::NewRemote,
+        }]);
+
+        assert!(!plan_may_orphan_remote_chunks(&plan));
+    }
+
+    #[test]
+    fn reconcile_cleanup_runs_for_remote_overwrite_or_delete() {
+        let overwrite = plan_with_actions(vec![tcfs_sync::reconcile::ReconcileAction::Push {
+            local_path: PathBuf::from("doc.txt"),
+            rel_path: "doc.txt".into(),
+            reason: tcfs_sync::reconcile::PushReason::LocalNewer,
+        }]);
+        let delete = plan_with_actions(vec![tcfs_sync::reconcile::ReconcileAction::DeleteRemote {
+            rel_path: "old.txt".into(),
+        }]);
+
+        assert!(plan_may_orphan_remote_chunks(&overwrite));
+        assert!(plan_may_orphan_remote_chunks(&delete));
+    }
+
+    #[test]
+    fn collect_config_from_sync_enables_symlink_preservation() {
+        let mut config = tcfs_core::config::TcfsConfig::default();
+        config.sync.sync_git_dirs = true;
+        config.sync.git_sync_mode = "raw".into();
+        config.sync.sync_hidden_dirs = true;
+        config.sync.sync_symlinks = true;
+        config.sync.sync_empty_dirs = true;
+
+        let collect = collect_config_from_sync(&config);
+
+        assert!(collect.sync_git_dirs);
+        assert_eq!(collect.git_sync_mode, "raw");
+        assert!(collect.sync_hidden_dirs);
+        assert!(!collect.follow_symlinks);
+        assert!(collect.preserve_symlinks);
+        assert!(collect.sync_empty_dirs);
+    }
+
+    #[tokio::test]
+    async fn load_config_reads_canary_sync_symlink_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tcfs-canary.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[daemon]
+socket = "{socket}"
+
+[storage]
+endpoint = "http://localhost:8333"
+bucket = "tcfs"
+remote_prefix = "git-repo-canary"
+enforce_tls = false
+
+[sync]
+state_db = "{state_db}"
+sync_root = "{sync_root}"
+nats_url = "nats://localhost:4222"
+nats_tls = false
+sync_git_dirs = true
+git_sync_mode = "raw"
+sync_hidden_dirs = true
+sync_symlinks = true
+sync_empty_dirs = true
+
+[crypto]
+enabled = false
+"#,
+                socket = dir.path().join("no-daemon.sock").display(),
+                state_db = dir.path().join("state.db").display(),
+                sync_root = dir.path().join("shadow").display(),
+            ),
+        )
+        .unwrap();
+
+        let config = load_config(&config_path).await.unwrap();
+        let collect = collect_config_from_sync(&config);
+
+        assert!(config.sync.sync_symlinks);
+        assert!(collect.preserve_symlinks);
+        assert!(!collect.follow_symlinks);
     }
 
     #[tokio::test]
@@ -3926,6 +5956,274 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read(&pulled).unwrap(), b"hello from tcfs");
+    }
+
+    #[tokio::test]
+    async fn cli_pull_by_file_path_without_dest_writes_to_file_path() {
+        // Regression: `tcfs pull <file-path>` with no explicit destination must
+        // write back to that file path, not to a hash-named file in the cwd.
+        let dir = tempfile::tempdir().unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        let source = sync_root.join("docs/readme.txt");
+        std::fs::write(&source, b"hello from tcfs").unwrap();
+
+        let op = memory_op();
+        let state_path = dir.path().join("state.json");
+        let config = test_config(&sync_root);
+
+        cmd_push_with_operator(&config, &op, &source, None, &state_path, "test-device")
+            .await
+            .unwrap();
+
+        // Locally drift the file, then pull by file path with NO explicit dest.
+        // (Keep the file present so manifest resolution by path still works.)
+        std::fs::write(&source, b"locally drifted content").unwrap();
+        cmd_pull_with_operator(
+            &config,
+            &op,
+            &source.to_string_lossy(),
+            None,
+            None,
+            &state_path,
+            "test-device",
+        )
+        .await
+        .unwrap();
+
+        // The fix: pull wrote back to the file path (not a hash-named cwd file),
+        // restoring the exact pushed bytes.
+        assert_eq!(std::fs::read(&source).unwrap(), b"hello from tcfs");
+    }
+
+    #[tokio::test]
+    async fn index_inspect_reports_missing_index_without_error() {
+        let op = memory_op();
+
+        let report = inspect_index_entry_with_operator(&op, "shared/alpha-test.txt", "data")
+            .await
+            .unwrap();
+
+        assert_eq!(report.status, "missing_index");
+        assert_eq!(report.index_key, "data/index/shared/alpha-test.txt");
+        assert!(!report.index_exists);
+        assert!(report.visible_entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn index_inspect_reports_visible_manifest() {
+        let op = memory_op();
+        op.write("data/manifests/hash123", b"{}".to_vec())
+            .await
+            .unwrap();
+        tcfs_sync::index_entry::write_committed_index_entry(
+            &op,
+            "data/index/shared/alpha-test.txt",
+            &tcfs_sync::index_entry::RemoteIndexEntry::new("hash123", 46, 1),
+        )
+        .await
+        .unwrap();
+
+        let report = inspect_index_entry_with_operator(&op, "shared/alpha-test.txt", "data")
+            .await
+            .unwrap();
+
+        assert_eq!(report.status, "visible");
+        let visible = report.visible_entry.unwrap();
+        assert_eq!(visible.manifest_hash, "hash123");
+        assert_eq!(visible.manifest_key, "data/manifests/hash123");
+        assert!(visible.manifest_exists);
+        assert_eq!(visible.size, 46);
+    }
+
+    #[tokio::test]
+    async fn cache_evict_uses_remote_index_manifest_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let mut config = test_config(dir.path());
+        config.fuse.cache_dir = cache_dir.clone();
+
+        let op = memory_op();
+        op.write("data/manifests/hash123", b"{}".to_vec())
+            .await
+            .unwrap();
+        tcfs_sync::index_entry::write_committed_index_entry(
+            &op,
+            "data/index/shared/alpha-test.txt",
+            &tcfs_sync::index_entry::RemoteIndexEntry::new("hash123", 46, 1),
+        )
+        .await
+        .unwrap();
+
+        let cache = tcfs_vfs::DiskCache::new(cache_dir, 1024 * 1024);
+        cache.put("hash123", b"hydrated bytes").await.unwrap();
+        assert!(cache.contains("hash123").await);
+
+        let report = evict_cache_entry_with_operator(&config, &op, "shared/alpha-test.txt", "data")
+            .await
+            .unwrap();
+
+        assert_eq!(report.rel_path, "shared/alpha-test.txt");
+        assert_eq!(report.manifest_hash, "hash123");
+        assert_eq!(report.bytes_freed, b"hydrated bytes".len() as u64);
+        assert!(report.was_cached);
+        assert!(!cache.contains("hash123").await);
+    }
+
+    #[tokio::test]
+    async fn cache_evict_rejects_missing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.fuse.cache_dir = dir.path().join("cache");
+        let op = memory_op();
+
+        let err = evict_cache_entry_with_operator(&config, &op, "missing.txt", "data")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("remote index status is missing_index"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_canary_key_is_scoped_under_prefix() {
+        assert_eq!(
+            storage_canary_key("data", "nonce"),
+            "data/.tcfs-canary/nonce.txt"
+        );
+        assert_eq!(
+            storage_canary_key("/tenant/a/", "nonce"),
+            "tenant/a/.tcfs-canary/nonce.txt"
+        );
+        assert_eq!(storage_canary_key("", "nonce"), ".tcfs-canary/nonce.txt");
+    }
+
+    #[test]
+    fn storage_canary_list_prefix_matches_daemon_health_scope() {
+        assert_eq!(storage_canary_list_prefix("data"), "data/");
+        assert_eq!(storage_canary_list_prefix("/tenant/a/"), "tenant/a/");
+        assert_eq!(storage_canary_list_prefix(""), "/");
+    }
+
+    #[tokio::test]
+    async fn storage_canary_writes_reads_deletes_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let op = memory_op();
+
+        let report = run_storage_canary_with_operator(
+            &config,
+            &op,
+            "data",
+            None,
+            "test-nonce",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.key, "data/.tcfs-canary/test-nonce.txt");
+        assert_eq!(report.list_prefix, "data/");
+        assert!(report.listed);
+        assert!(report.list_count >= 1);
+        assert!(report.deleted);
+        assert!(report.scope_deny.is_none());
+        assert!(!op.exists(&report.key).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn storage_canary_rejects_same_scope_deny_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let op = memory_op();
+
+        let err = run_storage_canary_with_operator(
+            &config,
+            &op,
+            "data",
+            Some("/data/"),
+            "test-nonce",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("same canary key"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn storage_canary_fails_when_deny_prefix_is_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let op = memory_op();
+
+        let err = run_storage_canary_with_operator(
+            &config,
+            &op,
+            "data",
+            Some("outside"),
+            "test-nonce",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("unexpectedly succeeded"),
+            "unexpected error: {err}"
+        );
+        assert!(!op
+            .exists("outside/.tcfs-canary/test-nonce.txt")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn index_inspect_reports_missing_manifest() {
+        let op = memory_op();
+        tcfs_sync::index_entry::write_committed_index_entry(
+            &op,
+            "data/index/shared/alpha-test.txt",
+            &tcfs_sync::index_entry::RemoteIndexEntry::new("missing", 46, 1),
+        )
+        .await
+        .unwrap();
+
+        let report = inspect_index_entry_with_operator(&op, "shared/alpha-test.txt", "data")
+            .await
+            .unwrap();
+
+        assert_eq!(report.status, "missing_manifest");
+        assert!(!report.visible_entry.unwrap().manifest_exists);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_directory_push_preserves_symlink_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let sync_root = dir.path().join("tree");
+        std::fs::create_dir_all(&sync_root).unwrap();
+        std::fs::write(sync_root.join("target.txt"), b"target").unwrap();
+        std::os::unix::fs::symlink("target.txt", sync_root.join("link.txt")).unwrap();
+
+        let op = memory_op();
+        let state_path = dir.path().join("state.json");
+        let mut config = test_config(&sync_root);
+        config.sync.sync_symlinks = true;
+
+        cmd_push_with_operator(&config, &op, &sync_root, None, &state_path, "test-device")
+            .await
+            .unwrap();
+
+        let index_bytes = op.read("data/index/link.txt").await.unwrap().to_bytes();
+        let entry = tcfs_sync::index_entry::parse_index_entry(&index_bytes).unwrap();
+        assert!(entry.is_symlink());
+        assert_eq!(entry.symlink_target.as_deref(), Some("target.txt"));
     }
 
     #[tokio::test]
@@ -4055,6 +6353,219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_pull_after_unsync_hydrates_latest_remote_and_removes_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let neo_root = dir.path().join("neo");
+        let honey_root = dir.path().join("honey");
+        std::fs::create_dir_all(&neo_root).unwrap();
+        std::fs::create_dir_all(&honey_root).unwrap();
+        let neo_file = neo_root.join("shared.txt");
+        let honey_file = honey_root.join("shared.txt");
+        std::fs::write(&neo_file, b"version from neo").unwrap();
+
+        let op = memory_op();
+        let neo_state = dir.path().join("neo-state.json");
+        let honey_state = dir.path().join("honey-state.json");
+        let mut neo_config = test_config(&neo_root);
+        neo_config.sync.state_db = dir.path().join("neo-state.db");
+        let mut honey_config = test_config(&honey_root);
+        honey_config.sync.state_db = dir.path().join("honey-state.db");
+
+        cmd_push_with_operator(&neo_config, &op, &neo_file, None, &neo_state, "neo-device")
+            .await
+            .unwrap();
+
+        cmd_pull_with_operator(
+            &honey_config,
+            &op,
+            "shared.txt",
+            Some(&honey_file),
+            Some("data"),
+            &honey_state,
+            "honey-device",
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&honey_file).unwrap(), b"version from neo");
+
+        cmd_unsync(&neo_config, &neo_file, false).await.unwrap();
+        let stub_path = neo_root.join("shared.txt.tc");
+        assert!(
+            !neo_file.exists(),
+            "neo file should be removed after unsync"
+        );
+        assert!(stub_path.exists(), "neo stub should exist after unsync");
+
+        std::fs::write(&honey_file, b"version from honey after neo unsynced").unwrap();
+        cmd_push_with_operator(
+            &honey_config,
+            &op,
+            &honey_file,
+            None,
+            &honey_state,
+            "honey-device",
+        )
+        .await
+        .unwrap();
+
+        cmd_pull_with_operator(
+            &neo_config,
+            &op,
+            "shared.txt",
+            Some(&neo_file),
+            Some("data"),
+            &neo_state,
+            "neo-device",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&neo_file).unwrap(),
+            b"version from honey after neo unsynced"
+        );
+        assert!(
+            !stub_path.exists(),
+            "rehydrating a clean path should remove the adjacent stub"
+        );
+
+        let state = tcfs_sync::state::StateCache::open(&neo_state).unwrap();
+        let entry = state.get(&neo_file).expect("neo state after rehydrate");
+        assert_eq!(entry.status, tcfs_sync::state::FileSyncStatus::Synced);
+    }
+
+    #[tokio::test]
+    async fn cli_pull_after_peer_delete_recreate_over_unsynced_stub_uses_recreated_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let neo_root = dir.path().join("neo");
+        let honey_root = dir.path().join("honey");
+        std::fs::create_dir_all(&neo_root).unwrap();
+        std::fs::create_dir_all(&honey_root).unwrap();
+        let neo_file = neo_root.join("shared.txt");
+        let honey_file = honey_root.join("shared.txt");
+        std::fs::write(&neo_file, b"version from neo").unwrap();
+
+        let op = memory_op();
+        let neo_state = dir.path().join("neo-state.json");
+        let honey_state = dir.path().join("honey-state.json");
+        let mut neo_config = test_config(&neo_root);
+        neo_config.sync.state_db = dir.path().join("neo-state.db");
+        let mut honey_config = test_config(&honey_root);
+        honey_config.sync.state_db = dir.path().join("honey-state.db");
+
+        cmd_push_with_operator(&neo_config, &op, &neo_file, None, &neo_state, "neo-device")
+            .await
+            .unwrap();
+        cmd_pull_with_operator(
+            &honey_config,
+            &op,
+            "shared.txt",
+            Some(&honey_file),
+            Some("data"),
+            &honey_state,
+            "honey-device",
+        )
+        .await
+        .unwrap();
+
+        cmd_unsync(&neo_config, &neo_file, false).await.unwrap();
+        let stub_path = neo_root.join("shared.txt.tc");
+        assert!(stub_path.exists(), "neo should keep only a physical stub");
+        assert!(!neo_file.exists(), "neo hydrated file should be removed");
+
+        let mut delete_state = tcfs_sync::state::StateCache::open(&honey_state).unwrap();
+        tcfs_sync::engine::delete_remote_file(
+            &op,
+            "shared.txt",
+            "data",
+            &mut delete_state,
+            Some(&honey_root),
+        )
+        .await
+        .unwrap();
+
+        cmd_pull_with_operator(
+            &neo_config,
+            &op,
+            "shared.txt",
+            Some(&neo_file),
+            Some("data"),
+            &neo_state,
+            "neo-device",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            stub_path.exists(),
+            "remote delete should not remove local stub"
+        );
+        assert!(
+            !neo_file.exists(),
+            "failed pull should not hydrate local file"
+        );
+
+        std::fs::write(&honey_file, b"recreated after delete").unwrap();
+        cmd_push_with_operator(
+            &honey_config,
+            &op,
+            &honey_file,
+            None,
+            &honey_state,
+            "honey-device",
+        )
+        .await
+        .unwrap();
+
+        cmd_pull_with_operator(
+            &neo_config,
+            &op,
+            "shared.txt",
+            Some(&neo_file),
+            Some("data"),
+            &neo_state,
+            "neo-device",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&neo_file).unwrap(), b"recreated after delete");
+        assert!(
+            !stub_path.exists(),
+            "rehydrating recreated remote path should remove the adjacent stub"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_pull_adjacent_stub_cleanup_ignores_non_tcfs_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let pulled = dir.path().join("notes.md");
+        let adjacent = dir.path().join("notes.md.tc");
+        std::fs::write(&pulled, b"hydrated bytes").unwrap();
+        std::fs::write(&adjacent, b"user-owned sidecar, not a TCFS stub").unwrap();
+
+        remove_adjacent_stub_after_pull(&pulled).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&adjacent).unwrap(),
+            b"user-owned sidecar, not a TCFS stub"
+        );
+
+        let binary_pulled = dir.path().join("asset.bin");
+        let binary_adjacent = dir.path().join("asset.bin.tc");
+        std::fs::write(&binary_pulled, b"hydrated binary").unwrap();
+        std::fs::write(&binary_adjacent, [0xff, 0x00, 0xfe, 0x01]).unwrap();
+
+        remove_adjacent_stub_after_pull(&binary_pulled)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&binary_adjacent).unwrap(),
+            [0xff, 0x00, 0xfe, 0x01]
+        );
+    }
+
+    #[tokio::test]
     async fn cli_unsync_force_uses_tracked_remote_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let sync_root = dir.path().join("tree");
@@ -4117,6 +6628,141 @@ mod tests {
         assert!(
             !sync_root.join("never-pushed.txt.tc").exists(),
             "force unsync must not create a fake stub for an untracked file"
+        );
+    }
+
+    fn seed_tracked_file(
+        state: &mut tcfs_sync::state::StateCache,
+        file: &Path,
+        remote_path: &str,
+    ) -> tcfs_sync::state::SyncState {
+        let data = std::fs::read(file).unwrap();
+        let hash = tcfs_chunks::hash_to_hex(&tcfs_chunks::hash_bytes(&data));
+        let entry =
+            tcfs_sync::state::make_sync_state(file, hash, 1, remote_path.to_string()).unwrap();
+        state.set(file, entry.clone());
+        entry
+    }
+
+    #[tokio::test]
+    async fn cli_unsync_directory_converts_clean_tracked_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let sync_root = dir.path().join("tree");
+        std::fs::create_dir_all(sync_root.join("docs/deep")).unwrap();
+        let alpha = sync_root.join("docs/alpha.txt");
+        let beta = sync_root.join("docs/deep/beta.txt");
+        let outside = sync_root.join("outside.txt");
+        std::fs::write(&alpha, b"alpha").unwrap();
+        std::fs::write(&beta, b"beta").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let config = test_config(&sync_root);
+        let state_path = resolve_state_path(&config, None);
+        let mut state = tcfs_sync::state::StateCache::open(&state_path).unwrap();
+        seed_tracked_file(&mut state, &alpha, "data/index/docs/alpha.txt");
+        seed_tracked_file(&mut state, &beta, "data/index/docs/deep/beta.txt");
+        seed_tracked_file(&mut state, &outside, "data/index/outside.txt");
+        state.flush().unwrap();
+
+        cmd_unsync(&config, &sync_root.join("docs"), false)
+            .await
+            .unwrap();
+
+        assert!(!alpha.exists(), "alpha should be dehydrated");
+        assert!(!beta.exists(), "beta should be dehydrated");
+        assert!(sync_root.join("docs/alpha.txt.tc").exists());
+        assert!(sync_root.join("docs/deep/beta.txt.tc").exists());
+        assert!(outside.exists(), "outside path is not a descendant");
+
+        let state = tcfs_sync::state::StateCache::open(&state_path).unwrap();
+        assert_eq!(
+            state.get(&alpha).map(|entry| entry.status),
+            Some(tcfs_sync::state::FileSyncStatus::NotSynced)
+        );
+        assert_eq!(
+            state.get(&beta).map(|entry| entry.status),
+            Some(tcfs_sync::state::FileSyncStatus::NotSynced)
+        );
+        assert_eq!(
+            state.get(&outside).map(|entry| entry.status),
+            Some(tcfs_sync::state::FileSyncStatus::Synced)
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_unsync_directory_refuses_dirty_descendants_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let sync_root = dir.path().join("tree");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        let clean = sync_root.join("docs/clean.txt");
+        let dirty = sync_root.join("docs/dirty.txt");
+        std::fs::write(&clean, b"clean").unwrap();
+        std::fs::write(&dirty, b"before").unwrap();
+
+        let config = test_config(&sync_root);
+        let state_path = resolve_state_path(&config, None);
+        let mut state = tcfs_sync::state::StateCache::open(&state_path).unwrap();
+        seed_tracked_file(&mut state, &clean, "data/index/docs/clean.txt");
+        seed_tracked_file(&mut state, &dirty, "data/index/docs/dirty.txt");
+        state.flush().unwrap();
+
+        std::fs::write(&dirty, b"after local edit").unwrap();
+
+        let err = cmd_unsync(&config, &sync_root.join("docs"), false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("dirty descendant"),
+            "unexpected error: {err}"
+        );
+        assert!(clean.exists(), "clean file should not be converted");
+        assert!(dirty.exists(), "dirty file should not be converted");
+        assert!(!sync_root.join("docs/clean.txt.tc").exists());
+        assert!(!sync_root.join("docs/dirty.txt.tc").exists());
+
+        let state = tcfs_sync::state::StateCache::open(&state_path).unwrap();
+        assert_eq!(
+            state.get(&clean).map(|entry| entry.status),
+            Some(tcfs_sync::state::FileSyncStatus::Synced)
+        );
+        assert_eq!(
+            state.get(&dirty).map(|entry| entry.status),
+            Some(tcfs_sync::state::FileSyncStatus::Synced)
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_unsync_directory_force_converts_dirty_with_tracked_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let sync_root = dir.path().join("tree");
+        std::fs::create_dir_all(sync_root.join("docs")).unwrap();
+        let dirty = sync_root.join("docs/dirty.txt");
+        std::fs::write(&dirty, b"before").unwrap();
+
+        let config = test_config(&sync_root);
+        let state_path = resolve_state_path(&config, None);
+        let mut state = tcfs_sync::state::StateCache::open(&state_path).unwrap();
+        let tracked = seed_tracked_file(&mut state, &dirty, "data/index/docs/dirty.txt");
+        state.flush().unwrap();
+
+        std::fs::write(&dirty, b"after local edit").unwrap();
+
+        cmd_unsync(&config, &sync_root.join("docs"), true)
+            .await
+            .unwrap();
+
+        let stub_path = sync_root.join("docs/dirty.txt.tc");
+        assert!(!dirty.exists(), "dirty file should be removed after force");
+        assert!(stub_path.exists(), "dirty file should be replaced by stub");
+        let stub =
+            tcfs_vfs::StubMeta::parse(&std::fs::read_to_string(&stub_path).unwrap()).unwrap();
+        assert_eq!(stub.blake3_hex(), Some(tracked.blake3.as_str()));
+        assert_eq!(stub.size, tracked.size);
+
+        let state = tcfs_sync::state::StateCache::open(&state_path).unwrap();
+        assert_eq!(
+            state.get(&dirty).map(|entry| entry.status),
+            Some(tcfs_sync::state::FileSyncStatus::NotSynced)
         );
     }
 

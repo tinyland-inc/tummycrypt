@@ -11,13 +11,15 @@ env:
   RUST_BACKTRACE: 1
   RUST_TOOLCHAIN: 1.93.0
   GITLEAKS_VERSION: 8.30.1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   check:
     name: Build + Lint + Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -26,11 +28,21 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+
+      - name: Free hosted runner disk
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
 
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
+            build-essential \
             protobuf-compiler \
             libfuse3-dev \
             pkg-config \
@@ -41,6 +53,9 @@ jobs:
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
+
+      - name: FileProvider surface contract
+        run: bash scripts/test-fileprovider-surface-contract.sh
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets
@@ -56,6 +71,14 @@ jobs:
           cargo test -p tcfs-e2e --test blacklist_wireup -- --nocapture
           cargo test -p tcfs-e2e --test reconcile_wireup -- --nocapture
 
+      - name: Trim incremental artifacts before final builds
+        run: |
+          set -euo pipefail
+          du -sh target || true
+          find target -type d -name incremental -prune -exec rm -rf {} +
+          du -sh target || true
+          df -h .
+
       - name: Build workspace (default features)
         run: cargo build --workspace
 
@@ -69,32 +92,44 @@ jobs:
     name: Nix Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install Nix
+      - name: Bootstrap Nix CLI
         uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
-            extra-substituters = https://nix-cache.fuzzy-dev.tinyland.dev/main
-            extra-trusted-public-keys = main:NKRk1XYo/dfd9fcDqgotUJg2DTDHWp5ny+Ba7WzRjgE=
+            extra-substituters = https://nix-cache.tinyland.dev/main
+            extra-trusted-public-keys = main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA=
+
+      - name: Verify runner Nix toolchain
+        run: nix --version
 
       - name: Nix flake check
-        run: nix flake check
+        run: nix flake check --accept-flake-config
 
       - name: Verify devShell Rust version
         run: |
-          VERSION="$(nix develop --command rustc --version)"
+          VERSION="$(nix develop --accept-flake-config --command rustc --version)"
           echo "$VERSION"
           echo "$VERSION" | grep -q "1.93.0"
 
-      - name: Build all packages
-        run: nix build .#tcfsd .#tcfs-cli .#tcfs-tui .#tcfs-mcp
+      - name: Build tcfsd
+        run: nix build --accept-flake-config --fallback .#tcfsd
+
+      - name: Build tcfs-cli
+        run: nix build --accept-flake-config --fallback .#tcfs-cli
+
+      - name: Build tcfs-tui
+        run: nix build --accept-flake-config --fallback .#tcfs-tui
+
+      - name: Build tcfs-mcp
+        run: nix build --accept-flake-config --fallback .#tcfs-mcp
 
   fileprovider-staticlib:
     name: FileProvider staticlib (macOS)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -102,6 +137,8 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Build staticlib
         run: cargo build -p tcfs-file-provider --release
@@ -127,7 +164,7 @@ jobs:
     name: iOS FileProvider typecheck
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -136,6 +173,8 @@ jobs:
           targets: aarch64-apple-ios-sim
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Build iOS staticlib + type-check Swift
         run: bash swift/ios/Scripts/build-ios.sh --simulator
@@ -144,24 +183,32 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          command: check
+          cache-bin: false
+      - name: Install cargo-deny build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check
+        run: cargo deny check
 
   secret-scan:
     name: Secret Scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install gitleaks
         run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+          curl --retry 5 --retry-all-errors --retry-delay 2 -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             | sudo tar xz -C /usr/local/bin gitleaks
       - name: Scan for secrets
         run: |

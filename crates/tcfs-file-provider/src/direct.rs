@@ -7,6 +7,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
+use std::sync::Mutex;
 
 use crate::TcfsProgressCallback;
 
@@ -25,6 +26,132 @@ pub struct TcfsProvider {
     device_id: String,
     /// Master key for E2EE (None = plaintext mode for backwards compatibility)
     master_key: Option<tcfs_crypto::MasterKey>,
+    last_error: Mutex<Option<String>>,
+}
+
+impl TcfsProvider {
+    fn clear_last_error(&self) {
+        if let Ok(mut last_error) = self.last_error.lock() {
+            *last_error = None;
+        }
+    }
+
+    fn set_last_error(&self, error: impl Into<String>) {
+        if let Ok(mut last_error) = self.last_error.lock() {
+            *last_error = Some(error.into());
+        }
+    }
+}
+
+fn parse_manifest_hash_from_index(bytes: &[u8]) -> anyhow::Result<String> {
+    Ok(tcfs_sync::index_entry::parse_index_entry(bytes)?.manifest_hash)
+}
+
+fn parse_file_size_from_index(bytes: &[u8]) -> anyhow::Result<u64> {
+    Ok(tcfs_sync::index_entry::parse_index_entry(bytes)?.size)
+}
+
+fn file_size_from_index(prov: &TcfsProvider, index_key: &str, fallback: u64) -> u64 {
+    prov.runtime
+        .block_on(async {
+            let data = prov.operator.read(index_key).await?;
+            let bytes = data.to_bytes();
+            parse_file_size_from_index(&bytes)
+        })
+        .unwrap_or(fallback)
+}
+
+fn master_key_from_bytes(bytes: &[u8]) -> anyhow::Result<tcfs_crypto::MasterKey> {
+    if bytes.len() != tcfs_crypto::KEY_SIZE {
+        anyhow::bail!(
+            "master key must be {} bytes, got {}",
+            tcfs_crypto::KEY_SIZE,
+            bytes.len()
+        );
+    }
+
+    let mut key = [0u8; tcfs_crypto::KEY_SIZE];
+    key.copy_from_slice(bytes);
+    Ok(tcfs_crypto::MasterKey::from_bytes(key))
+}
+
+fn derive_master_key_from_config(config: &serde_json::Value) -> Option<tcfs_crypto::MasterKey> {
+    if let Some(encoded) = config["master_key_base64"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .ok()?;
+        return master_key_from_bytes(&decoded).ok();
+    }
+
+    if let Some(path) = config["master_key_file"].as_str().filter(|s| !s.is_empty()) {
+        let bytes = std::fs::read(path).ok()?;
+        return master_key_from_bytes(&bytes).ok();
+    }
+
+    let passphrase = config["encryption_passphrase"]
+        .as_str()
+        .filter(|s| !s.is_empty())?;
+
+    if passphrase.split_whitespace().count() >= 12 {
+        return tcfs_crypto::mnemonic_to_master_key(passphrase).ok();
+    }
+
+    let salt_str = config["encryption_salt"]
+        .as_str()
+        .unwrap_or("tcfs-default-salt!");
+    let mut salt = [0u8; 16];
+    let salt_bytes = salt_str.as_bytes();
+    let copy_len = salt_bytes.len().min(16);
+    salt[..copy_len].copy_from_slice(&salt_bytes[..copy_len]);
+
+    let params = tcfs_crypto::kdf::KdfParams {
+        mem_cost_kib: config["argon2_mem_cost_kib"].as_u64().unwrap_or(65536) as u32,
+        time_cost: config["argon2_time_cost"].as_u64().unwrap_or(3) as u32,
+        parallelism: config["argon2_parallelism"].as_u64().unwrap_or(4) as u32,
+    };
+
+    tcfs_crypto::derive_master_key(&SecretString::from(passphrase.to_string()), &salt, &params).ok()
+}
+
+fn error_code_for_fetch_error(error: &anyhow::Error) -> TcfsError {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<opendal::Error>()
+            .is_some_and(|e| e.kind() == opendal::ErrorKind::NotFound)
+    }) {
+        TcfsError::TcfsErrorNotFound
+    } else {
+        TcfsError::TcfsErrorStorage
+    }
+}
+
+/// Return the last backend error message recorded on this provider.
+///
+/// The caller owns the returned string and must free it with `tcfs_string_free`.
+///
+/// # Safety
+///
+/// `provider` must be a valid pointer from `tcfs_provider_new`.
+#[no_mangle]
+pub unsafe extern "C" fn tcfs_provider_last_error(provider: *mut TcfsProvider) -> *mut c_char {
+    if provider.is_null() {
+        return ptr::null_mut();
+    }
+
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let prov = unsafe { &*provider };
+        prov.last_error
+            .lock()
+            .ok()
+            .and_then(|last_error| last_error.clone())
+            .map(|message| to_c_string(&message))
+            .unwrap_or(ptr::null_mut())
+    }));
+
+    result.unwrap_or(ptr::null_mut())
 }
 
 /// Create a new provider from a JSON configuration string.
@@ -50,10 +177,6 @@ pub unsafe extern "C" fn tcfs_provider_new(config_json: *const c_char) -> *mut T
             Err(_) => return ptr::null_mut(),
         };
 
-        let endpoint = config["s3_endpoint"].as_str().unwrap_or_default();
-        let bucket = config["s3_bucket"].as_str().unwrap_or("tcfs");
-        let access = config["s3_access"].as_str().unwrap_or_default();
-        let secret = config["s3_secret"].as_str().unwrap_or_default();
         let prefix = config["remote_prefix"]
             .as_str()
             .unwrap_or("default")
@@ -63,32 +186,10 @@ pub unsafe extern "C" fn tcfs_provider_new(config_json: *const c_char) -> *mut T
             .unwrap_or("unknown")
             .to_string();
 
-        // Derive master key from encryption_passphrase if provided (enables E2EE)
-        let master_key = config["encryption_passphrase"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .and_then(|passphrase| {
-                let salt_str = config["encryption_salt"]
-                    .as_str()
-                    .unwrap_or("tcfs-default-salt!");
-                let mut salt = [0u8; 16];
-                let salt_bytes = salt_str.as_bytes();
-                let copy_len = salt_bytes.len().min(16);
-                salt[..copy_len].copy_from_slice(&salt_bytes[..copy_len]);
-
-                let params = tcfs_crypto::kdf::KdfParams {
-                    mem_cost_kib: config["argon2_mem_cost_kib"].as_u64().unwrap_or(65536) as u32,
-                    time_cost: config["argon2_time_cost"].as_u64().unwrap_or(3) as u32,
-                    parallelism: config["argon2_parallelism"].as_u64().unwrap_or(4) as u32,
-                };
-
-                tcfs_crypto::derive_master_key(
-                    &SecretString::from(passphrase.to_string()),
-                    &salt,
-                    &params,
-                )
-                .ok()
-            });
+        // Derive master key from encryption_passphrase if provided (enables E2EE).
+        // Mnemonic recovery phrases must use the same derivation path as `tcfs init`;
+        // generic passphrases keep the per-vault salt and Argon2 params.
+        let master_key = derive_master_key_from_config(&config);
 
         // Single-threaded tokio runtime to avoid deadlock with fileproviderd.
         // Multi-threaded runtime spawns worker threads that contend with XPC
@@ -102,18 +203,11 @@ pub unsafe extern "C" fn tcfs_provider_new(config_json: *const c_char) -> *mut T
             Err(_) => return ptr::null_mut(),
         };
 
-        let operator =
-            tcfs_storage::operator::build_operator(&tcfs_storage::operator::StorageConfig {
-                endpoint: endpoint.to_string(),
-                region: "us-east-1".to_string(),
-                bucket: bucket.to_string(),
-                access_key_id: access.to_string(),
-                secret_access_key: secret.to_string(),
-            });
+        let operator = crate::storage_bounds::build_operator_from_json(&config);
 
         let operator = match operator {
-            Ok(op) => op,
-            Err(_) => return ptr::null_mut(),
+            Some(op) => op,
+            None => return ptr::null_mut(),
         };
 
         Box::into_raw(Box::new(TcfsProvider {
@@ -122,6 +216,7 @@ pub unsafe extern "C" fn tcfs_provider_new(config_json: *const c_char) -> *mut T
             remote_prefix: prefix,
             device_id,
             master_key,
+            last_error: Mutex::new(None),
         }))
     }));
 
@@ -211,6 +306,12 @@ pub unsafe extern "C" fn tcfs_provider_enumerate(
                 format!("{}/{}", rel_path.trim_matches('/'), child_name)
             };
 
+            let file_size = if is_dir {
+                0
+            } else {
+                file_size_from_index(prov, entry_path, entry.metadata().content_length())
+            };
+
             // item_id is the relative path (e.g. "ansible/roles") — NOT the
             // full S3 key. Swift uses item_id as containerIdentifier.rawValue
             // which becomes rel_path on the next enumerate call. Using the
@@ -218,11 +319,7 @@ pub unsafe extern "C" fn tcfs_provider_enumerate(
             items.push(TcfsFileItem {
                 item_id: to_c_string(&item_id),
                 filename: to_c_string(child_name),
-                file_size: if is_dir {
-                    0
-                } else {
-                    entry.metadata().content_length()
-                },
+                file_size,
                 modified_timestamp: 0,
                 is_directory: is_dir,
                 content_hash: to_c_string(""),
@@ -265,6 +362,7 @@ pub unsafe extern "C" fn tcfs_provider_fetch(
         let prov = unsafe { &*provider };
         let c_item = unsafe { CStr::from_ptr(item_id) };
         let c_dest = unsafe { CStr::from_ptr(dest_path) };
+        prov.clear_last_error();
 
         let item_str = match c_item.to_str() {
             Ok(s) => s,
@@ -285,18 +383,7 @@ pub unsafe extern "C" fn tcfs_provider_fetch(
             // Read the index entry to get manifest hash
             let data = prov.operator.read(&index_key).await?;
             let bytes = data.to_bytes();
-            let text = String::from_utf8_lossy(&bytes);
-
-            let mut manifest_hash = String::new();
-            for line in text.lines() {
-                if let Some(val) = line.strip_prefix("manifest_hash=") {
-                    manifest_hash = val.to_string();
-                }
-            }
-
-            if manifest_hash.is_empty() {
-                anyhow::bail!("no manifest_hash in index entry");
-            }
+            let manifest_hash = parse_manifest_hash_from_index(&bytes)?;
 
             let manifest_path = format!(
                 "{}/manifests/{}",
@@ -357,7 +444,12 @@ pub unsafe extern "C" fn tcfs_provider_fetch(
 
         match fetch_result {
             Ok(()) => TcfsError::TcfsErrorNone,
-            Err(_) => TcfsError::TcfsErrorStorage,
+            Err(e) => {
+                let message = format!("{e:#}");
+                tracing::error!(item_id = item_str, error = %message, "tcfs_provider_fetch failed");
+                prov.set_last_error(message);
+                error_code_for_fetch_error(&e)
+            }
         }
     }));
 
@@ -394,6 +486,7 @@ pub unsafe extern "C" fn tcfs_provider_fetch_with_progress(
         let prov = unsafe { &*provider };
         let c_item = unsafe { CStr::from_ptr(item_id) };
         let c_dest = unsafe { CStr::from_ptr(dest_path) };
+        prov.clear_last_error();
 
         let item_str = match c_item.to_str() {
             Ok(s) => s,
@@ -412,17 +505,7 @@ pub unsafe extern "C" fn tcfs_provider_fetch_with_progress(
             );
             let data = prov.operator.read(&index_key).await?;
             let bytes = data.to_bytes();
-            let text = String::from_utf8_lossy(&bytes);
-
-            let mut manifest_hash = String::new();
-            for line in text.lines() {
-                if let Some(val) = line.strip_prefix("manifest_hash=") {
-                    manifest_hash = val.to_string();
-                }
-            }
-            if manifest_hash.is_empty() {
-                anyhow::bail!("no manifest_hash in index entry");
-            }
+            let manifest_hash = parse_manifest_hash_from_index(&bytes)?;
 
             let manifest_path = format!(
                 "{}/manifests/{}",
@@ -493,7 +576,16 @@ pub unsafe extern "C" fn tcfs_provider_fetch_with_progress(
 
         match fetch_result {
             Ok(()) => TcfsError::TcfsErrorNone,
-            Err(_) => TcfsError::TcfsErrorStorage,
+            Err(e) => {
+                let message = format!("{e:#}");
+                tracing::error!(
+                    item_id = item_str,
+                    error = %message,
+                    "tcfs_provider_fetch_with_progress failed"
+                );
+                prov.set_last_error(message);
+                error_code_for_fetch_error(&e)
+            }
         }
     }));
 
@@ -578,20 +670,17 @@ pub unsafe extern "C" fn tcfs_provider_upload(
             );
             if let Ok(existing_data) = prov.operator.read(&existing_index_key).await {
                 let existing_bytes = existing_data.to_bytes();
-                let existing_text = String::from_utf8_lossy(&existing_bytes);
-                for line in existing_text.lines() {
-                    if let Some(hash) = line.strip_prefix("manifest_hash=") {
-                        let manifest_path = format!(
-                            "{}/manifests/{}",
-                            prov.remote_prefix.trim_end_matches('/'),
-                            hash
-                        );
-                        if let Ok(mb) = prov.operator.read(&manifest_path).await {
-                            if let Ok(existing_manifest) =
-                                tcfs_sync::manifest::SyncManifest::from_bytes(&mb.to_bytes())
-                            {
-                                vclock.merge(&existing_manifest.vclock);
-                            }
+                if let Ok(hash) = parse_manifest_hash_from_index(&existing_bytes) {
+                    let manifest_path = format!(
+                        "{}/manifests/{}",
+                        prov.remote_prefix.trim_end_matches('/'),
+                        hash
+                    );
+                    if let Ok(mb) = prov.operator.read(&manifest_path).await {
+                        if let Ok(existing_manifest) =
+                            tcfs_sync::manifest::SyncManifest::from_bytes(&mb.to_bytes())
+                        {
+                            vclock.merge(&existing_manifest.vclock);
                         }
                     }
                 }
@@ -623,6 +712,7 @@ pub unsafe extern "C" fn tcfs_provider_upload(
                 rel_path: Some(remote_str.to_string()),
                 mode: None,
                 encrypted_file_key,
+                wrapped_file_keys: Vec::new(),
             };
 
             let manifest_json = serde_json::to_vec_pretty(&manifest)?;
@@ -639,13 +729,17 @@ pub unsafe extern "C" fn tcfs_provider_upload(
                 prov.remote_prefix.trim_end_matches('/'),
                 remote_str.trim_start_matches('/')
             );
-            let index_entry = format!(
-                "manifest_hash={}\nsize={}\nchunks={}\n",
+            let index_entry = tcfs_sync::index_entry::RemoteIndexEntry::new(
                 file_hash,
-                data.len(),
-                chunks.len()
+                data.len() as u64,
+                chunks.len(),
             );
-            prov.operator.write(&index_key, index_entry).await?;
+            tcfs_sync::index_entry::write_committed_index_entry(
+                &prov.operator,
+                &index_key,
+                &index_entry,
+            )
+            .await?;
 
             Ok::<(), anyhow::Error>(())
         });
@@ -683,29 +777,12 @@ pub unsafe extern "C" fn tcfs_provider_delete(
         };
 
         let delete_result = prov.runtime.block_on(async {
-            // Reconstruct full S3 key from relative item_id
-            let index_key = format!(
-                "{}/index/{}",
-                prov.remote_prefix.trim_end_matches('/'),
-                item_str.trim_start_matches('/')
-            );
-            let index_data = prov.operator.read(&index_key).await;
-            if let Ok(data) = index_data {
-                let bytes = data.to_bytes();
-                let text = String::from_utf8_lossy(&bytes);
-                for line in text.lines() {
-                    if let Some(hash) = line.strip_prefix("manifest_hash=") {
-                        let manifest_path = format!(
-                            "{}/manifests/{}",
-                            prov.remote_prefix.trim_end_matches('/'),
-                            hash
-                        );
-                        let _ = prov.operator.delete(&manifest_path).await;
-                    }
-                }
-            }
-
-            prov.operator.delete(&index_key).await?;
+            tcfs_sync::engine::delete_remote_index_entry(
+                &prov.operator,
+                item_str,
+                &prov.remote_prefix,
+            )
+            .await?;
             Ok::<(), anyhow::Error>(())
         });
 
@@ -716,6 +793,29 @@ pub unsafe extern "C" fn tcfs_provider_delete(
     }));
 
     result.unwrap_or(TcfsError::TcfsErrorInternal)
+}
+
+/// Mark an item as unsynced without deleting remote storage.
+///
+/// The direct backend has no daemon-local materialization state to evict, so
+/// this is intentionally a no-op. Swift uses this separate entry point for the
+/// FileProvider "Free Up Space" action so the action cannot accidentally share
+/// the destructive remote-delete path.
+///
+/// # Safety
+///
+/// - `provider` must be a valid pointer from `tcfs_provider_new`.
+/// - `item_id` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn tcfs_provider_unsync(
+    provider: *mut TcfsProvider,
+    item_id: *const c_char,
+) -> TcfsError {
+    if provider.is_null() || item_id.is_null() {
+        return TcfsError::TcfsErrorInvalidArg;
+    }
+
+    TcfsError::TcfsErrorNone
 }
 
 /// Create a directory under the given parent path.
@@ -801,6 +901,28 @@ pub unsafe extern "C" fn tcfs_provider_enumerate_changes(
     TcfsError::TcfsErrorNone
 }
 
+/// Start a background change watch.
+///
+/// The direct backend has no daemon event stream. Export a no-op symbol so the
+/// Swift extension can link against either backend; callers should use explicit
+/// re-enumeration for direct-mode refresh.
+///
+/// # Safety
+///
+/// `provider` must be a valid pointer from `tcfs_provider_new`.
+#[no_mangle]
+pub unsafe extern "C" fn tcfs_provider_start_watch(
+    provider: *mut TcfsProvider,
+    _callback: crate::TcfsWatchCallback,
+    _callback_context: *const std::ffi::c_void,
+) -> TcfsError {
+    if provider.is_null() {
+        return TcfsError::TcfsErrorInvalidArg;
+    }
+
+    TcfsError::TcfsErrorNone
+}
+
 /// Free a provider handle.
 ///
 /// # Safety
@@ -822,6 +944,31 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
+    #[test]
+    fn mnemonic_config_uses_recovery_derivation() {
+        let (words, expected) = tcfs_crypto::generate_mnemonic().unwrap();
+        let config = serde_json::json!({
+            "encryption_passphrase": words,
+            "encryption_salt": "ignored-for-mnemonic",
+        });
+
+        let actual = derive_master_key_from_config(&config).unwrap();
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn raw_master_key_config_takes_precedence_over_passphrase() {
+        let expected = tcfs_crypto::MasterKey::from_bytes([7u8; tcfs_crypto::KEY_SIZE]);
+        let config = serde_json::json!({
+            "master_key_base64": base64::engine::general_purpose::STANDARD.encode(expected.as_bytes()),
+            "encryption_passphrase": "stale passphrase",
+            "encryption_salt": "stale salt",
+        });
+
+        let actual = derive_master_key_from_config(&config).unwrap();
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
+    }
+
     /// Create a TcfsProvider backed by opendal::services::Memory (no network).
     fn memory_provider(prefix: &str) -> *mut TcfsProvider {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -839,6 +986,7 @@ mod tests {
             remote_prefix: prefix.to_string(),
             device_id: "test-device".to_string(),
             master_key: None,
+            last_error: Mutex::new(None),
         };
 
         Box::into_raw(Box::new(provider))
@@ -895,8 +1043,7 @@ mod tests {
             let name = CStr::from_ptr(item.filename).to_str().unwrap();
             assert_eq!(name, "hello.txt");
             assert!(!item.is_directory);
-            // file_size comes from index entry metadata (content_length),
-            // not the actual file — exact value depends on backend.
+            assert_eq!(item.file_size, b"Hello, TCFS!".len() as u64);
 
             crate::tcfs_file_items_free(items, count);
             tcfs_provider_free(prov);
@@ -971,6 +1118,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn delete_one_duplicate_content_path_preserves_other_path() {
+        let prov = memory_provider("dedup-delete");
+        let dir = tempfile::tempdir().unwrap();
+
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        let data = b"same content for both remote paths";
+        std::fs::write(&a, data).unwrap();
+        std::fs::write(&b, data).unwrap();
+
+        unsafe {
+            let c_a_local = CString::new(a.to_str().unwrap()).unwrap();
+            let c_a_remote = CString::new("a.txt").unwrap();
+            let err = tcfs_provider_upload(prov, c_a_local.as_ptr(), c_a_remote.as_ptr());
+            assert_eq!(err, TcfsError::TcfsErrorNone);
+
+            let c_b_local = CString::new(b.to_str().unwrap()).unwrap();
+            let c_b_remote = CString::new("b.txt").unwrap();
+            let err = tcfs_provider_upload(prov, c_b_local.as_ptr(), c_b_remote.as_ptr());
+            assert_eq!(err, TcfsError::TcfsErrorNone);
+
+            let err = tcfs_provider_delete(prov, c_a_remote.as_ptr());
+            assert_eq!(err, TcfsError::TcfsErrorNone);
+
+            let fetched = dir.path().join("b-fetched.txt");
+            let c_fetched = CString::new(fetched.to_str().unwrap()).unwrap();
+            let err = tcfs_provider_fetch(prov, c_b_remote.as_ptr(), c_fetched.as_ptr());
+            assert_eq!(err, TcfsError::TcfsErrorNone);
+            assert_eq!(std::fs::read(fetched).unwrap(), data);
+
+            tcfs_provider_free(prov);
+        }
+    }
+
     // ── Create directory ─────────────────────────────────────────────────
     // Note: create_dir writes trailing-slash keys which the Memory backend
     // does not support (it rejects directory-like paths). S3 backends
@@ -1029,6 +1211,14 @@ mod tests {
             let err = tcfs_provider_fetch(prov, c_item.as_ptr(), c_dest.as_ptr());
             // Should fail (storage error or not found)
             assert_ne!(err, TcfsError::TcfsErrorNone);
+            let last_error = tcfs_provider_last_error(prov);
+            assert!(!last_error.is_null());
+            let message = CStr::from_ptr(last_error).to_string_lossy();
+            assert!(
+                message.contains("does-not-exist.txt") || !message.is_empty(),
+                "last error should describe the failed fetch"
+            );
+            crate::tcfs_string_free(last_error);
             // Destination should not have been created
             assert!(!dest.exists());
 

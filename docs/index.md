@@ -1,8 +1,8 @@
 # tcfs — TummyCrypt Filesystem
 
-**FOSS self-hosted odrive replacement**
+**FOSS self-hosted odrive-style encrypted sync target**
 
-tcfs is a self-hosted encrypted file sync system backed by [SeaweedFS](https://github.com/seaweedfs/seaweedfs) with end-to-end [age](https://age-encryption.org) encryption, content-defined chunking, on-demand hydration via `.tc` stub files, and multi-machine fleet sync with vector clocks. Linux is the best-supported runtime today; Apple desktop and mobile surfaces exist but are still experimental.
+tcfs is a self-hosted encrypted file sync system backed by [SeaweedFS](https://github.com/seaweedfs/seaweedfs) with core file-content XChaCha20-Poly1305 encryption, SOPS/age-managed credentials, content-defined chunking, Linux FUSE clean-name on-demand hydration, physical `.tc`/`.tcf` stubs for offline/dehydrated paths, and multi-machine fleet sync with vector clocks. Linux is the best-supported runtime today; Apple desktop and mobile surfaces exist but are still experimental.
 
 ## Installation
 
@@ -15,26 +15,33 @@ default here.
 Download the latest release from [GitHub Releases](https://github.com/Jesssullivan/tummycrypt/releases):
 
 ```bash
-# Linux (x86_64)
-curl -fsSL https://github.com/Jesssullivan/tummycrypt/releases/latest/download/install.sh | sh
-
 # macOS (Homebrew, current manual tap flow)
 brew tap --custom-remote Jesssullivan/tummycrypt https://github.com/Jesssullivan/tummycrypt.git
 git -C "$(brew --repo Jesssullivan/tummycrypt)" fetch origin homebrew-tap
 git -C "$(brew --repo Jesssullivan/tummycrypt)" checkout homebrew-tap
 brew install Jesssullivan/tummycrypt/tcfs
 
-# Debian/Ubuntu
+# Ubuntu 24.04+ / Debian 13+
 sudo dpkg -i tcfsd-*.deb tcfs-*.deb
 
-# RPM (Fedora/RHEL/Rocky, daemon-only today)
+# RPM (Fedora 42 x86_64 proven; RHEL/Rocky pending, daemon-only today)
 sudo rpm -i tcfsd-*.rpm
+
+# Nix tagged profile install
+TAG=v0.12.12
+nix profile install \
+  "github:Jesssullivan/tummycrypt?ref=${TAG}#tcfsd" \
+  "github:Jesssullivan/tummycrypt?ref=${TAG}#tcfs-cli"
+
+# Linux/macOS tarball convenience installer
+# Fast CLI install, but not part of the canonical release-proof surface.
+curl -fsSL https://github.com/Jesssullivan/tummycrypt/releases/latest/download/install.sh | sh
 ```
 
 ### Container (K8s worker mode)
 
 ```bash
-podman pull ghcr.io/jesssullivan/tcfsd:latest
+podman pull --arch amd64 ghcr.io/jesssullivan/tcfsd:v0.12.12
 ```
 
 ### From Source
@@ -57,10 +64,10 @@ nix develop github:Jesssullivan/tummycrypt
 
 ## How It Works
 
-1. **Push**: Files are split into content-defined chunks (FastCDC), compressed (zstd), encrypted (age), and uploaded to SeaweedFS via S3. Vector clock is ticked and SyncManifest v2 (JSON) is written.
+1. **Push**: Files are split into content-defined chunks (FastCDC), compressed (zstd), encrypted client-side with XChaCha20-Poly1305, and uploaded to SeaweedFS via S3. Vector clock is ticked and SyncManifest v2 (JSON) is written.
 2. **Pull**: Manifests describe the chunk layout. Chunks are fetched, verified (BLAKE3), decrypted, decompressed, and reassembled. Vector clock is merged with remote.
-3. **Mount**: The local filesystem surface presents remote files as local. On Linux this is exercised primarily through FUSE. Apple desktop surfaces are still evolving and should be treated as experimental.
-4. **Unsync**: Convert hydrated files back to stubs, reclaiming disk space while keeping the remote copy.
+3. **Mount**: The local filesystem surface presents remote files as local names and hydrates on open. On Linux this is exercised primarily through FUSE. Apple desktop surfaces are still evolving and should be treated as experimental.
+4. **Unsync**: Convert hydrated files back to physical `.tc` stubs or platform placeholders, reclaiming disk space while keeping the remote copy.
 5. **Fleet Sync**: NATS JetStream distributes `StateEvent` messages across devices. Vector clocks detect conflicts; pluggable resolvers handle them (auto, interactive, or defer).
 
 ## Architecture
@@ -70,7 +77,7 @@ flowchart TD
     cli["tcfs (CLI)"] -->|gRPC| daemon["tcfsd (daemon)"]
     tui["tcfs-tui"] -->|gRPC| daemon
     mcp["tcfs-mcp"] -->|gRPC| daemon
-    daemon --> fuse["FUSE mount"]
+    daemon --> fuse["Linux FUSE mount"]
     daemon --> secrets["tcfs-secrets\n(age/SOPS/KeePassXC)"]
     daemon --> chunks["tcfs-chunks\n(FastCDC + zstd + BLAKE3)"]
     daemon --> storage["tcfs-storage\n(OpenDAL → S3/SeaweedFS)"]
@@ -87,7 +94,7 @@ flowchart TD
 | Binary | Purpose |
 |--------|---------|
 | `tcfs` | CLI: push, pull, sync-status, mount, unmount, unsync, device management |
-| `tcfsd` | Daemon: 11 gRPC RPCs, FUSE mounts, NATS state sync, Prometheus metrics, systemd notify |
+| `tcfsd` | Daemon: gRPC service, Linux FUSE mounts, NATS state sync, Prometheus metrics, systemd notify |
 | `tcfs-tui` | Terminal UI: 5-tab dashboard (Dashboard, Config, Mounts, Secrets, Conflicts) |
 | `tcfs-mcp` | MCP server: 8 tools for AI agent integration (stdio transport) |
 
@@ -98,11 +105,12 @@ flowchart TD
 | `tcfs status` | Show daemon status, device identity, NATS connection |
 | `tcfs config show` | Display active configuration |
 | `tcfs push <path>` | Upload files with chunking, encryption, vector clock tick |
-| `tcfs pull <remote> <local>` | Download files with conflict detection |
+| `tcfs pull <manifest> [local]` | Download files from a manifest path with conflict detection |
 | `tcfs sync-status <path>` | Check sync state of a file |
-| `tcfs mount <source> <target>` | FUSE mount with on-demand hydration |
+| `tcfs index inspect <path>` | Read-only remote index and manifest diagnostic for one logical path |
+| `tcfs mount <source> <target>` | Linux FUSE mount with clean-name on-demand hydration |
 | `tcfs unmount <path>` | Unmount FUSE directory |
-| `tcfs unsync <path>` | Convert hydrated file back to `.tc` stub |
+| `tcfs unsync <path>` | Convert clean tracked files/directories back to physical `.tc` stubs |
 | `tcfs device enroll` | Generate keypair and register in S3 |
 | `tcfs device list` | Show all enrolled devices |
 | `tcfs device revoke <name>` | Mark a device as revoked |
@@ -123,18 +131,29 @@ Build locally: `task docs:pdf` (outputs to `dist/docs/`)
 ### Guides (Markdown)
 
 - [Contributing](CONTRIBUTING.md) — development setup, PR workflow
-- [Benchmarks](BENCHMARKS.md) — performance characteristics
+- [Benchmarks](BENCHMARKS.md) — partial benchmark snapshot
 - [Changelog](../CHANGELOG.md) — release history
 
 ### Ops Runbooks
 - [Product Reality and Priority](ops/product-reality-and-priority.md) — current proof surface, honest product posture, and prioritized backlog
+- [TCFS Alpha/Beta QA Readiness](ops/tcfs-alpha-beta-qa-readiness-2026-05-19.md) — current alpha/beta claim boundary, Linear gate map, and daily-driver stop rules
+- [TCFS Feature and Objective Matrix](ops/feature-objective-matrix-2026-05-09.md) — cross-linked feature readiness, GitHub/Linear tracker map, and next-workstream todo list
+- [TCFS Next Workstream Queue](ops/next-workstream-queue-2026-05-09.md) — execution order for production Finder, distribution, fleet, on-prem, Civo, and tinyland gates
 - [Distribution Smoke Matrix](ops/distribution-smoke-matrix.md) — canonical post-release install proof across Homebrew, `.pkg`, `.deb`, `.rpm`, container, and Nix
+- [Packaged Install To First-Real-Use Acceptance](ops/packaged-install-first-use.md) — the bar after artifact smoke passes and before broader host acceptance
 - [Lab Host Acceptance Matrix](ops/lab-host-acceptance-matrix.md) — real-host acceptance lanes across `honey`, `neo`, and `petting-zoo-mini`
 - [Neo-Honey Live Acceptance](ops/neo-honey-acceptance.md) — named live fleet sync acceptance lane
-- [On-Prem Authority Recovery](ops/onprem-authority-recovery.md) — source-of-truth and recovery path for the Helm-managed `tcfs` backend namespace
-- [Fleet Deployment Guide](ops/fleet-deployment.md) — multi-machine fleet deployment and operational checks
+- [On-Prem Authority Recovery](ops/onprem-authority-recovery.md) — backend-worker Helm recovery plus the on-prem OpenTofu migration boundary
+- [Fleet Deployment Guide](ops/fleet-deployment.md) — legacy Civo-era fleet deployment notes plus operational checks
+- [TCFS Fleet Parity Sprint Plan](ops/fleet-parity-sprint-plan-2026-05-09.md) — next proof sprint for isolated cross-host traversal, hydration, unsync, and rehydrate readiness
+- [Lazy Hydration Demo Acceptance](ops/lazy-hydration-demo.md) — terminal and Finder proof target for lazy `ls`/`cat`/dehydrate flows
+- [Lazy Desktop-to-Honey Evidence](release/lazy-desktop-honey-evidence-2026-04-30.md) — live proof of Desktop-originated remote traversal and `cat` hydration on honey
+- [macOS FileProvider Local Evidence](release/macos-fileprovider-local-evidence-2026-04-30.md) — local CloudStorage enumeration and exact-content hydration proof
+- [macOS Hosted Smoke Backend Bootstrap](release/macos-hosted-smoke-backend-bootstrap-2026-04-30.md) — GitHub environment secret and public S3 backend bootstrap for hosted FileProvider smoke
+- [odrive Parity and Product Horizon](ops/odrive-parity-product-horizon.md) — behavioral parity target, Desktop demo boundaries, and productionization backlog
 - [Apple Surface Status](ops/apple-surface-status.md) — current reality for macOS and iOS claims
 - [macOS Finder and FileProvider Reality](ops/macos-fileprovider-reality.md) — current macOS desktop workflow, proof gaps, and manual acceptance lane
+- [macOS FileProvider Testing-Mode Strategy](ops/macos-fileprovider-testing-mode-strategy.md) — Apple profile-type constraints, registered-Mac CI plan, and testing-mode proof gates
 - [iOS Surface Status](ops/ios-surface-status.md) — current iOS scope, proof bar, and maintenance expectation
 
 ### RFCs
@@ -142,18 +161,20 @@ Build locally: `task docs:pdf` (outputs to `dist/docs/`)
 - [RFC 0001: Fleet Sync Integration](rfc/0001-fleet-sync-integration.md) — multi-machine sync design and rollout plan
 - [RFC 0002: Darwin FUSE Strategy](rfc/0002-darwin-fuse-strategy.md) — FileProvider as primary macOS/iOS path
 - [RFC 0003: iOS File Provider](rfc/0003-ios-file-provider.md) — UniFFI bridge and experimental iOS scaffold architecture
+- [RFC 0004: FUSE-Free Architecture](rfc/0004-fuse-free-architecture.md) — draft target architecture for FUSE-free/client-integrated paths
 
 ## Platform Support
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| Linux x86_64 | Full | FUSE mount, CLI, daemon, TUI, MCP |
-| Linux aarch64 | Full | FUSE mount, CLI, daemon, TUI, MCP |
+| Linux x86_64 | Proven primary lane | Host-proven FUSE lifecycle plus CLI/daemon surfaces; packaged first-use/systemd remains a separate gate |
+| Linux aarch64 | Available | Release tarball and `.deb`; FUSE is not built in the current cross-compiled release artifact |
 | macOS (Apple Silicon) | Experimental | CLI and daemon build, release `.pkg`, and FileProvider packaging exist, but user-facing acceptance coverage is still limited |
 | macOS (Intel) | Experimental | CLI binaries ship, but the desktop integration story is not yet as proven as Linux |
-| Windows x86_64 | CLI only | Cloud Files API skeleton; no FUSE or daemon |
-| iOS | Proof-of-concept | Read-only FileProvider direction; CI type-checks Swift, but there is no continuously proven TestFlight/App Store lane |
-| NixOS | Full | Flake + NixOS module + Home Manager module |
+| Windows x86_64 | Planned / skeleton | Cloud Files API skeleton; no release-grade CLI, daemon, or Explorer flow |
+| iOS | Proof-of-concept | FileProvider direction with unproven write hooks; CI type-checks Swift, but there is no continuously proven device/TestFlight/App Store lane |
+| Nix package/profile | Available / Darwin evidence current | Flake package/profile install is proven on Darwin for `v0.12.12`; Linux Nix install proof and NixOS module host proof are separate |
+| NixOS module | Available / host evidence pending | NixOS and Home Manager modules exist, but current evidence is not a NixOS host acceptance run |
 
 ## License
 

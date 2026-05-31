@@ -131,6 +131,14 @@ impl From<opendal::Error> for ProviderError {
     }
 }
 
+fn parse_manifest_hash_from_index(bytes: &[u8], path: &str) -> Result<String, ProviderError> {
+    tcfs_sync::index_entry::parse_index_entry(bytes)
+        .map(|entry| entry.manifest_hash)
+        .map_err(|e| ProviderError::Storage {
+            message: format!("parsing index entry {path}: {e}"),
+        })
+}
+
 /// The TCFS provider — holds a tokio runtime and OpenDAL operator.
 ///
 /// Created once and shared across FileProvider extension calls.
@@ -155,6 +163,13 @@ impl TcfsProviderHandle {
     pub fn new(config: ProviderConfig) -> Result<Arc<Self>, ProviderError> {
         let master_key = if config.encryption_passphrase.is_empty() {
             None
+        } else if config.encryption_passphrase.split_whitespace().count() >= 12 {
+            let key = tcfs_crypto::mnemonic_to_master_key(&config.encryption_passphrase).map_err(
+                |e| ProviderError::Decryption {
+                    message: e.to_string(),
+                },
+            )?;
+            Some(key)
         } else {
             let mut salt = [0u8; 16];
             let salt_bytes = config.encryption_salt.as_bytes();
@@ -183,17 +198,15 @@ impl TcfsProviderHandle {
             message: format!("failed to create tokio runtime: {e}"),
         })?;
 
-        let operator =
-            tcfs_storage::operator::build_operator(&tcfs_storage::operator::StorageConfig {
-                endpoint: config.s3_endpoint,
-                region: "us-east-1".to_string(),
-                bucket: config.s3_bucket,
-                access_key_id: config.access_key,
-                secret_access_key: config.s3_secret,
-            })
-            .map_err(|e| ProviderError::Storage {
-                message: e.to_string(),
-            })?;
+        let operator = crate::storage_bounds::build_operator_from_parts_with_env(
+            config.s3_endpoint,
+            config.s3_bucket,
+            config.access_key,
+            config.s3_secret,
+        )
+        .map_err(|e| ProviderError::Storage {
+            message: e.to_string(),
+        })?;
 
         Ok(Arc::new(Self {
             runtime,
@@ -276,20 +289,7 @@ impl TcfsProviderHandle {
         self.runtime.block_on(async {
             let data = self.operator.read(item_id).await?;
             let bytes = data.to_bytes();
-            let text = String::from_utf8_lossy(&bytes);
-
-            let mut manifest_hash = String::new();
-            for line in text.lines() {
-                if let Some(val) = line.strip_prefix("manifest_hash=") {
-                    manifest_hash = val.to_string();
-                }
-            }
-
-            if manifest_hash.is_empty() {
-                return Err(ProviderError::NotFound {
-                    path: item_id.to_string(),
-                });
-            }
+            let manifest_hash = parse_manifest_hash_from_index(&bytes, item_id)?;
 
             let manifest_path = format!(
                 "{}/manifests/{}",
@@ -385,20 +385,7 @@ impl TcfsProviderHandle {
             // Read index entry
             let data = self.operator.read(item_id).await?;
             let bytes = data.to_bytes();
-            let text = String::from_utf8_lossy(&bytes);
-
-            let mut manifest_hash = String::new();
-            for line in text.lines() {
-                if let Some(val) = line.strip_prefix("manifest_hash=") {
-                    manifest_hash = val.to_string();
-                }
-            }
-
-            if manifest_hash.is_empty() {
-                return Err(ProviderError::NotFound {
-                    path: item_id.to_string(),
-                });
-            }
+            let manifest_hash = parse_manifest_hash_from_index(&bytes, item_id)?;
 
             // Fetch manifest
             let manifest_path = format!(
@@ -536,20 +523,19 @@ impl TcfsProviderHandle {
             );
             if let Ok(existing_data) = self.operator.read(&existing_index_key).await {
                 let existing_bytes = existing_data.to_bytes();
-                let existing_text = String::from_utf8_lossy(&existing_bytes);
-                for line in existing_text.lines() {
-                    if let Some(hash) = line.strip_prefix("manifest_hash=") {
-                        let manifest_path = format!(
-                            "{}/manifests/{}",
-                            self.remote_prefix.trim_end_matches('/'),
-                            hash
-                        );
-                        if let Ok(mb) = self.operator.read(&manifest_path).await {
-                            if let Ok(existing_manifest) =
-                                tcfs_sync::manifest::SyncManifest::from_bytes(&mb.to_bytes())
-                            {
-                                vclock.merge(&existing_manifest.vclock);
-                            }
+                if let Ok(hash) =
+                    parse_manifest_hash_from_index(&existing_bytes, &existing_index_key)
+                {
+                    let manifest_path = format!(
+                        "{}/manifests/{}",
+                        self.remote_prefix.trim_end_matches('/'),
+                        hash
+                    );
+                    if let Ok(mb) = self.operator.read(&manifest_path).await {
+                        if let Ok(existing_manifest) =
+                            tcfs_sync::manifest::SyncManifest::from_bytes(&mb.to_bytes())
+                        {
+                            vclock.merge(&existing_manifest.vclock);
                         }
                     }
                 }
@@ -583,6 +569,7 @@ impl TcfsProviderHandle {
                 rel_path: Some(remote_path.to_string()),
                 mode: None,
                 encrypted_file_key,
+                wrapped_file_keys: Vec::new(),
             };
 
             let manifest_json =
@@ -601,13 +588,18 @@ impl TcfsProviderHandle {
                 self.remote_prefix.trim_end_matches('/'),
                 remote_path.trim_start_matches('/')
             );
-            let index_entry = format!(
-                "manifest_hash={}\nsize={}\nchunks={}\n",
+            let index_entry = tcfs_sync::index_entry::RemoteIndexEntry::new(
                 file_hash,
-                data.len(),
-                chunks.len()
+                data.len() as u64,
+                chunks.len(),
             );
-            self.operator.write(&index_key, index_entry).await?;
+            tcfs_sync::index_entry::write_committed_index_entry(
+                &self.operator,
+                &index_key,
+                &index_entry,
+            )
+            .await
+            .map_err(ProviderError::from)?;
 
             Ok(())
         })
@@ -616,23 +608,13 @@ impl TcfsProviderHandle {
     /// Delete a file or directory by its item ID.
     pub fn delete_item(&self, item_id: &str) -> Result<(), ProviderError> {
         self.runtime.block_on(async {
-            if let Ok(data) = self.operator.read(item_id).await {
-                let bytes = data.to_bytes();
-                let text = String::from_utf8_lossy(&bytes);
-                for line in text.lines() {
-                    if let Some(hash) = line.strip_prefix("manifest_hash=") {
-                        let manifest_path = format!(
-                            "{}/manifests/{}",
-                            self.remote_prefix.trim_end_matches('/'),
-                            hash
-                        );
-                        let _ = self.operator.delete(&manifest_path).await;
-                    }
-                }
-            }
-
-            self.operator.delete(item_id).await?;
-            Ok(())
+            tcfs_sync::engine::delete_remote_index_entry(
+                &self.operator,
+                item_id,
+                &self.remote_prefix,
+            )
+            .await
+            .map_err(ProviderError::from)
         })
     }
 
@@ -763,7 +745,10 @@ impl TcfsProviderHandle {
 
     /// Process a device enrollment invite (from QR code or deep link).
     ///
-    /// Returns credentials extracted from the invite for auto-configuration.
+    /// Direct iOS enrollment cannot verify admin-signed invites today because
+    /// the new device does not yet have the fleet signing key. Until the
+    /// pairing flow supplies a verifiable trust path, fail closed instead of
+    /// extracting brokered credentials from an attacker-controlled payload.
     #[cfg(feature = "uniffi")]
     pub fn process_enrollment_invite(
         &self,
@@ -792,24 +777,18 @@ impl TcfsProviderHandle {
             });
         }
 
-        // Create a session from the enrollment
-        let session =
-            tcfs_auth::Session::new(&self.device_id, &self.device_id, "enrollment").with_expiry(24);
-        let token = session.token.clone();
-        self.runtime.block_on(self.session_store.insert(session));
-
         Ok(EnrollmentResult {
-            success: true,
-            error_message: String::new(),
-            device_id: invite.created_by.clone(),
-            storage_endpoint: invite.storage_endpoint.unwrap_or_default(),
-            storage_bucket: invite.storage_bucket.unwrap_or_default(),
-            access_key: invite.storage_access_key.unwrap_or_default(),
-            s3_secret: invite.storage_secret_key.unwrap_or_default(),
-            remote_prefix: invite.remote_prefix.unwrap_or_else(|| "default".into()),
-            encryption_passphrase: invite.encryption_passphrase.unwrap_or_default(),
-            encryption_salt: invite.encryption_salt.unwrap_or_default(),
-            session_token: token,
+            success: false,
+            error_message: "enrollment invite signature cannot be verified on this device yet; use daemon-mediated enrollment or a trusted operator bootstrap config".into(),
+            device_id: String::new(),
+            storage_endpoint: String::new(),
+            storage_bucket: String::new(),
+            access_key: String::new(),
+            s3_secret: String::new(),
+            remote_prefix: String::new(),
+            encryption_passphrase: String::new(),
+            encryption_salt: String::new(),
+            session_token: String::new(),
         })
     }
 
@@ -882,6 +861,57 @@ fn verify_bootstrap_signature(
     Ok(diff == 0)
 }
 
+#[cfg(all(test, feature = "uniffi"))]
+mod tests {
+    use super::*;
+
+    fn test_provider() -> Arc<TcfsProviderHandle> {
+        TcfsProviderHandle::new(ProviderConfig {
+            s3_endpoint: "http://127.0.0.1:8333".into(),
+            s3_bucket: "tcfs-test".into(),
+            access_key: "test-access".into(),
+            s3_secret: "test-secret".into(),
+            remote_prefix: "default".into(),
+            device_id: "ios-test".into(),
+            encryption_passphrase: String::new(),
+            encryption_salt: String::new(),
+        })
+        .expect("provider config should be valid")
+    }
+
+    #[test]
+    fn process_enrollment_invite_rejects_unverifiable_brokered_credentials() {
+        let signing_key = [42u8; 32];
+        let mut invite = tcfs_auth::EnrollmentInvite::new(
+            "admin-device",
+            &signing_key,
+            24,
+            tcfs_auth::session::DevicePermissions::default(),
+        );
+        invite.storage_endpoint = Some("https://s3.example.invalid".into());
+        invite.storage_bucket = Some("tcfs".into());
+        invite.storage_access_key = Some("access-key".into());
+        invite.storage_secret_key = Some("secret-key".into());
+        invite.remote_prefix = Some("tenant-a".into());
+        invite.encryption_passphrase = Some("phrase".into());
+        invite.encryption_salt = Some("salt".into());
+        invite.refresh_signature(&signing_key);
+
+        let provider = test_provider();
+        let result = provider
+            .process_enrollment_invite(&invite.encode_compact().expect("invite encodes"))
+            .expect("well-formed invite should return a denial result");
+
+        assert!(!result.success);
+        assert!(result.error_message.contains("cannot be verified"));
+        assert_eq!(result.storage_endpoint, "");
+        assert_eq!(result.storage_bucket, "");
+        assert_eq!(result.access_key, "");
+        assert_eq!(result.s3_secret, "");
+        assert_eq!(result.encryption_passphrase, "");
+    }
+}
+
 impl TcfsProviderHandle {
     /// Internal async conflict check — used by both `check_conflict` and `list_items`.
     async fn check_conflict_async(&self, item_id: &str) -> Result<Option<String>, ProviderError> {
@@ -890,18 +920,10 @@ impl TcfsProviderHandle {
             Err(_) => return Ok(None),
         };
         let bytes = data.to_bytes();
-        let text = String::from_utf8_lossy(&bytes);
-
-        let mut manifest_hash = String::new();
-        for line in text.lines() {
-            if let Some(val) = line.strip_prefix("manifest_hash=") {
-                manifest_hash = val.to_string();
-            }
-        }
-
-        if manifest_hash.is_empty() {
-            return Ok(None);
-        }
+        let manifest_hash = match parse_manifest_hash_from_index(&bytes, item_id) {
+            Ok(hash) => hash,
+            Err(_) => return Ok(None),
+        };
 
         let manifest_path = format!(
             "{}/manifests/{}",

@@ -6,7 +6,7 @@
 #
 # Targets:
 #   - Linux x86_64 (with FUSE)
-#   - Linux aarch64 (with FUSE)
+#   - Linux aarch64 (cross-compiled without FUSE in current release matrix)
 #   - macOS x86_64 (no FUSE, CLI-only — mount disabled)
 #   - macOS aarch64 (no FUSE, CLI-only — mount disabled)
 #   - Container image (k8s-worker mode)
@@ -14,10 +14,12 @@
 # Produces:
 #   - Binary tarballs (.tar.gz) per platform
 #   - .deb package (x86_64 + aarch64)
-#   - .rpm package (x86_64 + aarch64)
+#   - .rpm package (x86_64 daemon package only today)
+#   - macOS FileProvider app archive (.zip)
+#   - macOS installer package (.pkg)
 #   - Shell installer script (curl | sh)
 #   - Homebrew formula
-#   - Container image (GHCR, multi-arch)
+#   - Container image (GHCR, linux/amd64 + linux/arm64/v8)
 #   - SHA256SUMS.txt
 
 name: Release
@@ -29,9 +31,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.2.0)"
+        description: "Release tag (for example v0.12.13-rc1; must be vX.Y.Z or vX.Y.Z-PRERELEASE)"
         required: true
-        default: "latest"
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,6 +55,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       image_repo: ${{ steps.version.outputs.image_repo }}
+      image_tags: ${{ steps.version.outputs.image_tags }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      make_latest: ${{ steps.version.outputs.make_latest }}
     steps:
       - name: Determine version
         id: version
@@ -67,12 +71,37 @@ jobs:
           else
             TAG="${{ github.event.inputs.tag }}"
           fi
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Release tag must look like vX.Y.Z or vX.Y.Z-PRERELEASE (e.g. v0.12.13, v0.12.13-rc1, v1.0.0-beta.2), got ${TAG}"
+            exit 1
+          fi
           VERSION="${TAG#v}"  # strip leading v
           OWNER_LOWER="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_REPO="${{ env.REGISTRY }}/${OWNER_LOWER}/${{ env.IMAGE_NAME }}"
+          IS_PRERELEASE=false
+          MAKE_LATEST=true
+          if [[ "${VERSION}" == *-* ]]; then
+            IS_PRERELEASE=true
+            MAKE_LATEST=false
+          fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "image_repo=${{ env.REGISTRY }}/${OWNER_LOWER}/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+          echo "image_repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "make_latest=${MAKE_LATEST}" >> "$GITHUB_OUTPUT"
+          {
+            echo "image_tags<<EOF"
+            echo "${IMAGE_REPO}:${TAG}"
+            echo "${IMAGE_REPO}:${VERSION}"
+            if [[ "${IS_PRERELEASE}" != "true" ]]; then
+              echo "${IMAGE_REPO}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
           echo "Building release: ${TAG} (version ${VERSION})"
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            echo "Prerelease tag detected: release will not be marked Latest and container :latest will not move."
+          fi
 
   # ── Build client binaries ─────────────────────────────────────────────────
 
@@ -142,7 +171,7 @@ jobs:
           #   rpm: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -154,6 +183,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          cache-bin: false
 
       - name: Install Linux cross-compilation tools
         if: matrix.cross
@@ -439,8 +469,9 @@ jobs:
     name: Build container image
     runs-on: ubuntu-latest
     needs: plan
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -448,6 +479,11 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU for arm64 image builds
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -458,12 +494,9 @@ jobs:
         with:
           context: .
           file: ./Containerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64/v8
           push: true
-          tags: |
-            ${{ needs.plan.outputs.image_repo }}:${{ needs.plan.outputs.tag }}
-            ${{ needs.plan.outputs.image_repo }}:${{ needs.plan.outputs.version }}
-            ${{ needs.plan.outputs.image_repo }}:latest
+          tags: ${{ needs.plan.outputs.image_tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: |
@@ -497,20 +530,20 @@ jobs:
     runs-on: ubuntu-latest
     needs: plan
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
-            extra-substituters = https://nix-cache.fuzzy-dev.tinyland.dev/main
-            extra-trusted-public-keys = main:NKRk1XYo/dfd9fcDqgotUJg2DTDHWp5ny+Ba7WzRjgE=
+            extra-substituters = https://nix-cache.tinyland.dev/main
+            extra-trusted-public-keys = main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA=
 
       - name: Configure Attic
         run: |
           nix profile install nixpkgs#attic-client
           if [ -n "${{ secrets.ATTIC_TOKEN }}" ]; then
-            attic login tinyland https://nix-cache.fuzzy-dev.tinyland.dev ${{ secrets.ATTIC_TOKEN }}
+            attic login tinyland https://nix-cache.tinyland.dev ${{ secrets.ATTIC_TOKEN }}
             attic use main || echo "::warning::Failed to configure Attic substituter"
             echo "ATTIC_CONFIGURED=true" >> $GITHUB_ENV
           else
@@ -522,7 +555,7 @@ jobs:
         run: |
           for pkg in tcfsd tcfs-cli tcfs-tui tcfs-mcp; do
             echo "Building ${pkg}..."
-            nix build .#${pkg} -o result-${pkg}
+            nix build --accept-flake-config .#${pkg} -o result-${pkg}
           done
 
       - name: Push to Attic cache
@@ -539,7 +572,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: plan
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Generate shell installer
         run: |
@@ -612,43 +645,10 @@ jobs:
           # tcfs installer for Windows (PowerShell)
           $ErrorActionPreference = "Stop"
 
-          $repo = "__REPO__"
           $tag = "__TAG__"
-          $version = $tag.TrimStart("v")
-          $platform = "windows-x86_64"
-          $tarball = "tcfs-${version}-${platform}.zip"
-          $url = "https://github.com/${repo}/releases/download/${tag}/${tarball}"
-
-          $installDir = if ($env:TCFS_INSTALL_DIR) { $env:TCFS_INSTALL_DIR } else { "$env:LOCALAPPDATA\tcfs\bin" }
-
-          Write-Host "Downloading tcfs ${tag} for Windows..."
-          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-
-          $tmpFile = [System.IO.Path]::GetTempFileName() + ".zip"
-          Invoke-WebRequest -Uri $url -OutFile $tmpFile
-
-          $tmpDir = [System.IO.Path]::GetTempFileName() + "_extract"
-          Expand-Archive -Path $tmpFile -DestinationPath $tmpDir -Force
-
-          Copy-Item "${tmpDir}\tcfs-${version}-${platform}\tcfs.exe" "${installDir}\tcfs.exe" -Force
-          Copy-Item "${tmpDir}\tcfs-${version}-${platform}\tcfsd.exe" "${installDir}\tcfsd.exe" -Force
-          Copy-Item "${tmpDir}\tcfs-${version}-${platform}\tcfs-tui.exe" "${installDir}\tcfs-tui.exe" -Force
-
-          Remove-Item -Recurse -Force $tmpFile, $tmpDir
-
-          # Add to PATH if not already there
-          $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-          if ($userPath -notlike "*${installDir}*") {
-            [Environment]::SetEnvironmentVariable("PATH", "${installDir};${userPath}", "User")
-            Write-Host "Added ${installDir} to PATH"
-          }
-
-          Write-Host ""
-          Write-Host "tcfs ${tag} installed successfully!"
-          Write-Host "  Restart your shell, then run: tcfs status"
+          Write-Error "tcfs ${tag} does not publish Windows artifacts. Windows support is planned, but this release has no tcfs-*-windows-x86_64.zip asset."
           PSINSTALLER
 
-          sed -i "s|__REPO__|${{ github.repository }}|g" install.ps1
           sed -i "s|__TAG__|${{ needs.plan.outputs.tag }}|g" install.ps1
 
       - name: Upload installers
@@ -667,7 +667,7 @@ jobs:
     runs-on: macos-14
     needs: plan
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -675,6 +675,8 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Build staticlib
         run: cargo build -p tcfs-file-provider --release --no-default-features --features grpc
@@ -685,9 +687,8 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           if [ -z "$APPLE_CERTIFICATE_BASE64" ]; then
-            echo "::warning::APPLE_CERTIFICATE_BASE64 not set, using ad-hoc signing"
-            echo "SIGNING_IDENTITY=-" >> $GITHUB_ENV
-            exit 0
+            echo "::error::APPLE_CERTIFICATE_BASE64 is required for release FileProvider signing"
+            exit 1
           fi
           KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
@@ -727,9 +728,45 @@ jobs:
             echo "SIGNING_IDENTITY=$IDENTITY" >> $GITHUB_ENV
             echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
           else
-            echo "::warning::No Developer ID found in keychain, using ad-hoc"
-            echo "SIGNING_IDENTITY=-" >> $GITHUB_ENV
+            echo "::error::No Developer ID Application identity found in keychain"
+            exit 1
           fi
+
+      - name: Import FileProvider provisioning profiles
+        if: env.SIGNING_IDENTITY != '-'
+        env:
+          TCFS_HOST_PROVISIONING_PROFILE_BASE64: ${{ secrets.TCFS_HOST_PROVISIONING_PROFILE_BASE64 }}
+          TCFS_EXTENSION_PROVISIONING_PROFILE_BASE64: ${{ secrets.TCFS_EXTENSION_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TCFS_HOST_PROVISIONING_PROFILE_BASE64" ]; then
+            echo "::error::TCFS_HOST_PROVISIONING_PROFILE_BASE64 is required for Developer ID FileProvider signing"
+            exit 1
+          fi
+          if [ -z "$TCFS_EXTENSION_PROVISIONING_PROFILE_BASE64" ]; then
+            echo "::error::TCFS_EXTENSION_PROVISIONING_PROFILE_BASE64 is required for Developer ID FileProvider signing"
+            exit 1
+          fi
+
+          HOST_PROFILE="$RUNNER_TEMP/tcfs-host-developer-id.provisionprofile"
+          EXTENSION_PROFILE="$RUNNER_TEMP/tcfs-fileprovider-developer-id.provisionprofile"
+          mkdir -p "$RUNNER_TEMP"
+
+          echo "$TCFS_HOST_PROVISIONING_PROFILE_BASE64" | base64 -d > "$HOST_PROFILE"
+          echo "$TCFS_EXTENSION_PROVISIONING_PROFILE_BASE64" | base64 -d > "$EXTENSION_PROFILE"
+
+          security cms -D -i "$HOST_PROFILE" >/dev/null
+          security cms -D -i "$EXTENSION_PROFILE" >/dev/null
+          scripts/macos-fileprovider-profile-inventory.sh \
+            --profiles-dir "$RUNNER_TEMP" \
+            --strict
+
+          {
+            echo "TCFS_HOST_PROVISIONING_PROFILE=$HOST_PROFILE"
+            echo "TCFS_EXTENSION_PROVISIONING_PROFILE=$EXTENSION_PROFILE"
+            echo "TCFS_REQUIRE_PRODUCTION_SIGNING=1"
+          } >> "$GITHUB_ENV"
 
       - name: Build FileProvider extension
         run: |
@@ -784,12 +821,12 @@ jobs:
     runs-on: macos-14
     needs: [plan, build-binaries, build-fileprovider]
     if: |
-      !cancelled() && (
+      success() && (
         startsWith(github.ref, 'refs/tags/v') ||
         (github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v'))
       )
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download macOS CLI binaries
         uses: actions/download-artifact@v4
@@ -809,9 +846,8 @@ jobs:
           APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
         run: |
           if [ -z "$APPLE_INSTALLER_CERTIFICATE_BASE64" ]; then
-            echo "::warning::No installer cert, building unsigned .pkg"
-            echo "PKG_SIGNING_IDENTITY=" >> $GITHUB_ENV
-            exit 0
+            echo "::error::APPLE_INSTALLER_CERTIFICATE_BASE64 is required for release .pkg signing"
+            exit 1
           fi
           KEYCHAIN_PATH="$RUNNER_TEMP/pkg-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
@@ -844,98 +880,20 @@ jobs:
             echo "PKG_SIGNING_IDENTITY=$IDENTITY" >> $GITHUB_ENV
             echo "PKG_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
           else
-            echo "::warning::No Developer ID Installer found"
-            echo "PKG_SIGNING_IDENTITY=" >> $GITHUB_ENV
+            echo "::error::No Developer ID Installer identity found in keychain"
+            exit 1
           fi
-
-      - name: Assemble .pkg payload
-        run: |
-          VERSION="${{ needs.plan.outputs.version }}"
-          PKG_ROOT="$RUNNER_TEMP/pkg-root"
-          mkdir -p "${PKG_ROOT}/usr/local/bin"
-          mkdir -p "${PKG_ROOT}/Applications"
-
-          # Extract CLI binaries
-          tar xzf cli-dist/tcfs-${VERSION}-macos-aarch64.tar.gz -C "$RUNNER_TEMP"
-          cp "$RUNNER_TEMP/tcfs-${VERSION}-macos-aarch64/tcfs" "${PKG_ROOT}/usr/local/bin/"
-          cp "$RUNNER_TEMP/tcfs-${VERSION}-macos-aarch64/tcfsd" "${PKG_ROOT}/usr/local/bin/" 2>/dev/null || true
-          cp "$RUNNER_TEMP/tcfs-${VERSION}-macos-aarch64/tcfs-tui" "${PKG_ROOT}/usr/local/bin/" 2>/dev/null || true
-          cp "$RUNNER_TEMP/tcfs-${VERSION}-macos-aarch64/tcfs-mcp" "${PKG_ROOT}/usr/local/bin/" 2>/dev/null || true
-          chmod +x "${PKG_ROOT}/usr/local/bin/"*
-
-          # Extract FileProvider app
-          FP_ZIP=$(find fp-dist -name 'TCFSProvider-*.zip' | head -1)
-          /usr/bin/ditto -x -k "$FP_ZIP" "${PKG_ROOT}/Applications/"
-
-      - name: Create scripts
-        run: |
-          SCRIPTS="$RUNNER_TEMP/pkg-scripts"
-          mkdir -p "$SCRIPTS"
-
-          cat > "$SCRIPTS/postinstall" << 'SCRIPT'
-          #!/bin/bash
-          # Register FileProvider extension
-          if [ -d "/Applications/TCFSProvider.app" ]; then
-            /usr/bin/pluginkit -a "/Applications/TCFSProvider.app/Contents/Extensions/TCFSFileProvider.appex" 2>/dev/null || true
-          fi
-
-          # Install launchd plist for daemon
-          PLIST_DIR="$HOME/Library/LaunchAgents"
-          PLIST_PATH="${PLIST_DIR}/io.tinyland.tcfsd.plist"
-          mkdir -p "$PLIST_DIR"
-          if [ ! -f "$PLIST_PATH" ]; then
-            cat > "$PLIST_PATH" << 'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>Label</key>
-            <string>io.tinyland.tcfsd</string>
-            <key>ProgramArguments</key>
-            <array>
-              <string>/usr/local/bin/tcfsd</string>
-              <string>--mode</string>
-              <string>daemon</string>
-            </array>
-            <key>RunAtLoad</key>
-            <true/>
-            <key>KeepAlive</key>
-            <true/>
-            <key>StandardOutPath</key>
-            <string>/tmp/tcfsd.stdout.log</string>
-            <key>StandardErrorPath</key>
-            <string>/tmp/tcfsd.stderr.log</string>
-          </dict>
-          </plist>
-          PLIST
-          fi
-          exit 0
-          SCRIPT
-          chmod +x "$SCRIPTS/postinstall"
 
       - name: Build .pkg
         run: |
           VERSION="${{ needs.plan.outputs.version }}"
-          PKG_ROOT="$RUNNER_TEMP/pkg-root"
-          SCRIPTS="$RUNNER_TEMP/pkg-scripts"
-          UNSIGNED_PKG="$RUNNER_TEMP/tcfs-${VERSION}-unsigned.pkg"
-          FINAL_PKG="tcfs-${VERSION}-macos-aarch64.pkg"
-
-          pkgbuild \
-            --root "$PKG_ROOT" \
-            --scripts "$SCRIPTS" \
-            --identifier io.tinyland.tcfs \
+          FP_ZIP="$(find fp-dist -name 'TCFSProvider-*.zip' | head -1)"
+          scripts/macos-build-pkg.sh \
             --version "$VERSION" \
-            --install-location / \
-            "$UNSIGNED_PKG"
-
-          if [ -n "$PKG_SIGNING_IDENTITY" ]; then
-            echo "Signing .pkg with: $PKG_SIGNING_IDENTITY"
-            productsign --sign "$PKG_SIGNING_IDENTITY" \
-              "$UNSIGNED_PKG" "$FINAL_PKG"
-          else
-            cp "$UNSIGNED_PKG" "$FINAL_PKG"
-          fi
+            --cli-tar "cli-dist/tcfs-${VERSION}-macos-aarch64.tar.gz" \
+            --fileprovider-zip "$FP_ZIP" \
+            --output "tcfs-${VERSION}-macos-aarch64.pkg" \
+            --sign "${PKG_SIGNING_IDENTITY:-}"
 
       - name: Notarize .pkg
         if: env.PKG_SIGNING_IDENTITY != ''
@@ -944,19 +902,32 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
         run: |
+          set -euo pipefail
+
           VERSION="${{ needs.plan.outputs.version }}"
           PKG="tcfs-${VERSION}-macos-aarch64.pkg"
+
+          for required in APPLE_ID APPLE_TEAM_ID APPLE_NOTARIZE_PASSWORD; do
+            if [ -z "${!required:-}" ]; then
+              echo "::error::${required} is required for signed .pkg notarization"
+              exit 1
+            fi
+          done
+
           echo "Submitting .pkg for notarization..."
-          if xcrun notarytool submit "$PKG" \
+          xcrun notarytool submit "$PKG" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_NOTARIZE_PASSWORD" \
-            --wait; then
-            xcrun stapler staple "$PKG" \
-              || echo "::warning::.pkg stapling failed (non-fatal)"
-          else
-            echo "::warning::.pkg notarization failed (non-fatal)"
-          fi
+            --wait
+
+          xcrun stapler staple "$PKG"
+          xcrun stapler validate -v "$PKG"
+          scripts/macos-pkg-structure-smoke.sh \
+            --pkg "$PKG" \
+            --require-signature \
+            --require-gatekeeper-install \
+            --require-stapled-ticket
 
       - name: Upload .pkg artifact
         uses: actions/upload-artifact@v4
@@ -977,9 +948,9 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [plan, build-binaries, build-image, generate-installers, build-fileprovider, build-pkg]
+    needs: [plan, build-binaries, generate-installers, build-fileprovider, build-pkg]
     if: |
-      !cancelled() && (
+      success() && (
         startsWith(github.ref, 'refs/tags/v') ||
         (github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v'))
       )
@@ -1023,9 +994,12 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GH_RELEASE_TOKEN || github.token }}
           tag_name: ${{ needs.plan.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: tcfs ${{ needs.plan.outputs.tag }}
+          prerelease: ${{ needs.plan.outputs.is_prerelease }}
+          make_latest: ${{ needs.plan.outputs.make_latest }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: release/*
@@ -1034,13 +1008,13 @@ jobs:
 
             ### Quick Install
 
-            **macOS (.pkg installer — recommended):**
+            **macOS (.pkg installer path; Finder/FileProvider remains experimental):**
             ```bash
             curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/tcfs-${{ needs.plan.outputs.version }}-macos-aarch64.pkg
             sudo installer -pkg tcfs-${{ needs.plan.outputs.version }}-macos-aarch64.pkg -target /
             ```
 
-            **Linux / macOS (shell script):**
+            **Linux/macOS tarball convenience installer (CLI-first, not a release-proof surface):**
             ```bash
             curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/install.sh | sh
             ```
@@ -1053,12 +1027,13 @@ jobs:
             brew install ${{ github.repository }}/tcfs
             ```
 
-            **Container image:**
+            **Container image (published by the parallel `Build container image` job; do not claim container support until that job is green):**
             ```bash
-            podman pull ${{ needs.plan.outputs.image_repo }}:${{ needs.plan.outputs.tag }}
+            podman pull --arch amd64 ${{ needs.plan.outputs.image_repo }}:${{ needs.plan.outputs.tag }}
+            podman pull --arch arm64 ${{ needs.plan.outputs.image_repo }}:${{ needs.plan.outputs.tag }}
             ```
 
-            **Debian/Ubuntu:**
+            **Ubuntu 24.04+ / Debian 13+:**
             ```bash
             curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/tcfsd-${{ needs.plan.outputs.version }}-amd64.deb
             curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/tcfs-${{ needs.plan.outputs.version }}-amd64.deb
@@ -1091,14 +1066,15 @@ jobs:
 
             ### macOS artifacts
             macOS CLI binaries are Developer ID signed when Apple credentials are configured.
-            FileProvider and `.pkg` notarization is attempted for Apple artifacts, but release
-            publication does not fail if Apple's notarization service or account agreements are unavailable.
+            FileProvider app notarization is attempted for Apple artifacts. Signed `.pkg`
+            release jobs require notarization, stapling, Gatekeeper install assessment, and
+            package policy smoke before the package artifact is uploaded.
 
             ### Binaries included
             | Binary | Purpose |
             |--------|---------|
             | `tcfs` | CLI: push, pull, sync-status, mount, unsync |
-            | `tcfsd` | Daemon: gRPC socket, FUSE, Prometheus metrics |
+            | `tcfsd` | Daemon: gRPC socket, Linux FUSE, Prometheus metrics |
             | `tcfs-tui` | Terminal UI for interactive management |
             | `tcfs-mcp` | MCP server for AI agent integration |
 
@@ -1109,13 +1085,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: [plan, create-release]
     if: |
-      !cancelled() && (
+      success() && (
         startsWith(github.ref, 'refs/tags/v') ||
         (github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v'))
       )
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download release checksums
         run: |

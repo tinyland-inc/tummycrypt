@@ -1,0 +1,360 @@
+# TCFS Fleet Parity Sprint Plan - 2026-05-09
+
+This sprint follows the usage-reality proof packet. Its job is to move from
+separate lane proofs to one grounded "work from any machine" acceptance packet
+for TCFS, without overstating Finder, on-prem, or release-artifact readiness.
+
+Storage-posture evidence base after the May 13 follow-through:
+
+- repo: `Jesssullivan/tummycrypt`
+- branch: `main`
+- commit: `9428513be22f9b55f45cda3713881130b612e9c0`
+- open PRs: none
+- open GitHub issues: `#280`, `#298`, `#309`, `#312`, `#327`
+- closed prerequisite: `#308`
+
+Planning-pass validation:
+
+- GitHub API confirmed the same five open issues and no open PRs.
+- Linear comments for `TIN-131`, `TIN-133`, and `TIN-720` were checked against
+  the repo docs and current issue boundaries.
+- `task docs:links` passed: 261 links checked, 0 errors.
+- `task lazy:check` passed after adding the fleet-pilot, same-fixture, reverse
+  same-fixture, Linux-mounted reverse-read, delete/rename current-behavior,
+  cross-host conflict, manual keep-both conflict recovery, independent sibling
+  conflict progress, linux-xr shadow, FileProvider cleanup, and focused CLI
+  unsync/resync gates.
+- `cargo test -p tcfs-cli cli_unsync` passed: 6 tests.
+- `cargo test -p tcfs-cli cli_pull` passed: 2 tests.
+- `cargo test -p tcfs-vfs --test vfs_lifecycle_test` passed: 20 tests.
+- `cargo test -p tcfsd unsync` passed: 1 test.
+- `docs/release/evidence/fleet-pilot-20260509T1919Z/` was archived after a live
+  run: seed to disposable SeaweedFS prefix, honey mounted traversal/hydration,
+  and live `neo-honey` SeaweedFS/NATS smoke.
+- `docs/release/evidence/fleet-pilot-extended-20260509T2152Z/` was archived
+  after a live run: seed to disposable SeaweedFS prefix, honey mounted
+  traversal/hydration, honey Linux lifecycle companion for mounted
+  write/readback, cache clear/rehydrate, recursive safe-unsync refusal/success,
+  and live `neo-honey` SeaweedFS/NATS smoke.
+- `task lazy:home-canary-linux-xr-shadow` now creates the next real-project
+  shadow lane. It inventories `/Users/jess/git/linux-xr` read-only, copies a
+  full isolated shadow under `~/TCFS Pilot/real-canaries/`, writes disposable
+  raw `.git`/hidden-dir TCFS config, and archives symlinks/special files as
+  parity gates. Current live evidence is archived in
+  `docs/release/evidence/home-canary-linux-xr-shadow-20260511T040325Z/`: the
+  completed 7.7 GB push was reused, honey mounted `find -maxdepth 8` and
+  selected hydration passed, all 85 mounted symlink targets matched via
+  `readlink`, and the Linux lifecycle companion passed. This closes the scoped
+  isolated-shadow project-tree parity bar only; it does not claim broad home
+  takeover, production Finder, or production S3 posture.
+- PR `#367` landed opt-in fresh-prefix file upload concurrency plus
+  timeout/retry telemetry. The current storage-posture packet
+  `docs/release/evidence/home-canary-linux-xr-storage-posture-20260514T021513Z/`
+  completes the 7.7 GB shadow with `file_upload_concurrency=8`,
+  `chunk_upload_concurrency=8`, no retry or error rows, and reduced raw Git
+  `.pack`/`.rev` object counts; the same prefix now also has honey mounted
+  traversal/hydration and all 85 mounted symlink target checks. The exact `.tc`
+  filename follow-up
+  `docs/release/evidence/home-canary-linux-xr-storage-posture-tc-extfix-20260514T202343Z/`
+  drops mounted S3 `NoSuchKey` warnings from 274 to 0. The lifecycle companion
+  `docs/release/evidence/home-canary-linux-xr-storage-posture-lifecycle-20260514T213826Z/`
+  reuses that same prefix and reports `scoped-project-tree-parity-evidence-complete`.
+  The `linux-xr-fast` blocker then identified Git pack indexes as the next
+  raw-Git object-count problem; source now routes `.git/objects/pack/*.idx`
+  through the large sequential profile. Treat the next step as a
+  candidate-package rerun plus generated-large-file, socket-accounting, and
+  endpoint/TLS closure, not another client-concurrency bump.
+- `task lazy:macos-fileprovider-neo-cleanup-packet` archives neo FileProvider
+  divergence before cleanup and can install the published `.pkg`; it requires
+  strict production signing preflight before any production-adjacent Finder
+  smoke is claimed.
+- `task lazy:neo-honey-unsynced-rehydrate-plan` stages the focused
+  same-fixture QA row: neo pushes and unsyncs a file, honey mutates that file
+  through a mounted clean-name view, then neo pulls the same relative path and
+  verifies exact honey bytes plus stale `.tc` cleanup. Live M3 evidence is
+  archived in
+  `docs/release/evidence/neo-honey-unsynced-rehydrate-20260510T015644Z/`;
+  reverse physical-root M6 is archived below, while mounted reverse-read M4
+  and full conflict permutations remain open. M8 delete/rename current
+  behavior is archived below, but clean stale-placeholder UX remains open.
+- `task lazy:neo-honey-reverse-unsynced-rehydrate-plan` now stages the reverse
+  same-fixture row: honey pulls and unsyncs a physical copy, neo mutates and
+  pushes the same relative path, then honey pulls exact neo bytes and verifies
+  stale `.tc` cleanup. Live M6 evidence is archived in
+  `docs/release/evidence/neo-honey-reverse-unsynced-rehydrate-20260510T022858Z/`;
+  the earlier `20260510T022657Z` attempt is retained as stale-honey-binary
+  blocker evidence.
+- `task lazy:honey-mounted-reverse-read-plan` now stages and has green live
+  Linux-equivalent mounted reverse-read evidence: honey pulls and unsyncs a
+  physical copy, neo mutates and pushes the same path, then honey reads exact
+  neo bytes through a mounted clean-name view while the physical root remains
+  stub-only. Live evidence is archived in
+  `docs/release/evidence/honey-mounted-reverse-read-20260510T042203Z/`.
+  This is mounted VFS proof, not a neo/macOS or production Finder closure.
+- `task lazy:neo-mounted-reverse-read-plan` now stages the M4 mounted reverse
+  read row: honey publishes, neo pulls and unsyncs a physical copy, honey
+  publishes newer bytes, then neo reads exact honey bytes through a mounted
+  clean-name surface while the physical root remains stub-only. Live blocker
+  evidence is archived in
+  `docs/release/evidence/neo-mounted-reverse-read-20260510T035826Z/`: honey
+  push and neo physical unsync passed, but neo/macOS NFS loopback mount failed
+  with `Operation not permitted`, before mounted `cat`.
+- `task lazy:neo-honey-delete-rename-unsynced-plan` now stages the M8
+  delete/rename row as current-behavior proof: honey is unsynced to physical
+  `.tc` stubs, neo deletes one path and renames another, honey old-path pulls
+  fail, and the renamed new path hydrates exact bytes. Live current-behavior
+  evidence is archived in
+  `docs/release/evidence/neo-honey-delete-rename-unsynced-20260510T040456Z/`.
+  This is not a clean stale-stub cleanup claim; tombstone/placeholder semantics
+  remain a product decision.
+- `task lazy:neo-honey-conflict-plan` now stages and has green live
+  cross-host conflict evidence: honey pulls and edits a file, neo pushes a
+  divergent version, then honey attempts to push its local version. Live
+  evidence is archived in
+  `docs/release/evidence/neo-honey-conflict-20260510T043741Z/`; honey reports
+  `sync state: conflict`, preserves local bytes, and remote pullback proves neo
+  bytes were not overwritten.
+- `task lazy:neo-honey-conflict-keep-both-plan` extends that row with green live
+  manual recovery evidence in
+  `docs/release/evidence/neo-honey-conflict-keep-both-20260510T045908Z/`: after
+  conflict detection, honey copies the losing bytes to
+  `Projects/shared/conflict-notes.conflict-honey.md`, pulls the original path
+  back to neo's bytes, pushes the sibling copy, and neo pulls both paths back
+  with exact hash matches. This is not daemon-backed `tcfs resolve` UX.
+- `task lazy:neo-honey-conflict-sibling-plan` adds green live independent
+  descendant evidence in
+  `docs/release/evidence/neo-honey-conflict-sibling-20260510T051328Z/`: honey
+  keeps one file in conflict while an edited sibling descendant pushes
+  successfully and reports `sync state: synced`; pullbacks prove the conflicted
+  file still has neo bytes while the sibling has honey bytes.
+- `task lazy:neo-honey-conflict-daemon-keep-both-plan` now archives the
+  daemon-backed `tcfs resolve --strategy keep-both` blocker. The bounded packet
+  in `docs/release/evidence/neo-honey-conflict-daemon-keep-both-20260510T054611Z/`
+  reaches isolated honey `tcfsd 0.12.12` under auth bypass, but the CLI RPC
+  times out after partial keep-both side effects. This is not clean resolution
+  UX.
+- Production hosted macOS `.pkg` attempt `25613963424` passed published
+  package install/signing/installed-CLI/config gates, then failed before daemon
+  and Finder because the public Cloudflare quick-tunnel endpoint no longer
+  resolved from GitHub-hosted macOS.
+- May 17 neo production package packets now prove authenticated install of the
+  notarized workflow artifact, stale user-app quarantine after inventory,
+  strict installed preflight, package daemon storage `[ok]`, domain add,
+  CloudStorage enumeration, and host-app `requestDownload`. The current
+  production Finder blocker is exact FileProvider read: `cat` of
+  `shared/alpha-test.txt` returns `Operation timed out`.
+- PR `#367` merged on green. The May 13 merge push for `9428513` has Docs
+  green in run `25816193832`; CI `25816193953` later failed only in
+  `watcher_debounce_coalesces_rapid_writes` after Linux emitted multiple
+  notify paths for one rapid-write burst. The follow-up fix narrows the test to
+  the product contract, per-target-path coalescing, and the focused local test
+  passes. Treat the next remote CI run as the closure gate for this doc/evidence
+  refresh.
+
+## Readiness Answer
+
+Short answer: TCFS is close to an isolated pilot for "browse a tree, hydrate
+what I open, edit, unsync, and rehydrate elsewhere" on Linux, but it is not yet
+ready to manage real `~/Documents` or `~/git` across arbitrary machines.
+
+| Host/surface | Ready today | Not ready yet |
+| --- | --- | --- |
+| `honey` Linux mounted surface | Strongest lane. The archived lifecycle proof shows clean-name traversal before hydration, exact `cat` hydration, mounted write/readback, cache clear, exact rehydrate, dirty recursive `tcfs unsync` refusal, clean recursive `.tc` conversion, and persisted `sync state: not_synced`. | Treating packaged Linux install, systemd first-use, and every distro/service-manager path as continuously proven. |
+| `neo` Darwin workstation | Useful release-adjacent control host and CLI participant for live backend sync. The `fleet-pilot-extended-20260509T2152Z` packet includes a green live `neo-honey` smoke from this host, and May 17 packets prove installed Developer ID package preflight plus domain/enumeration/requestDownload. | Not a production Finder success yet. Exact FileProvider read currently times out, so hydration, evict/rehydrate, mutation, and conflict/status remain `#309` gates. |
+| `petting-zoo-mini` FileProvider lab | Strong non-production Apple lane. Testing-mode package/smoke proof covers enumerate, hydrate, evict, rehydrate, mutation, CLI conflict state, and exact content preservation. | Not production Developer ID clean-host Finder acceptance. Badges/progress remain observational until reliable assertions exist. |
+| Live on-prem backend | Usable enough for live smoke via named endpoints, and source-owned migration commands are renderable. | Not source-owned/storage-mobile yet. Do not couple the parity sprint to live OpenTofu mutation unless `#327` has a named downtime window and rollback owner. |
+
+The isolated fleet-pilot evidence bundle now exists at
+`docs/release/evidence/fleet-pilot-extended-20260509T2152Z/`. It uses a
+disposable remote prefix and pilot directories, not real `~/Documents` or
+`~/git`. Do not make real home subtrees the default sync roots until the staged
+rollout gates below are archived.
+
+## Product Semantics
+
+Use these names consistently in docs, issues, and release notes:
+
+| Name | Meaning |
+| --- | --- |
+| `tcfs` | The product and protocol surface: CLI, daemon, sync state, VFS, fleet sync, storage, encryption, mounts, and operator tooling. |
+| `tcfs` binary | User CLI for status, push, pull, mount, unsync, and device commands. |
+| `tcfsd` | Daemon process for gRPC, Linux FUSE/NFS mount support, NATS fleet sync, metrics, and FileProvider-facing services. |
+| `TCFSProvider.app` | macOS host app. It provisions shared config, registers the FileProvider domain, and can request download/eviction. It is not the whole TCFS product and not the daemon. |
+| `TCFSFileProvider.appex` | macOS/iOS FileProvider extension process used by Finder/CloudStorage or Files.app for enumerate, hydrate, and mutation hooks. |
+| Linux mounted view | Clean filenames from remote index plus local cache hydration. Users should not see `.tc` names here. |
+| Physical sync root | Real files plus `.tc`/`.tcf` stubs for dehydrated content. This is the CLI/offline representation, not the Finder representation. |
+| macOS CloudStorage root | Finder placeholders/APFS dataless files managed by FileProvider. Raw `.tc` stubs are not the intended Finder UX. |
+
+This distinction matters for the home-directory goal: a Linux FUSE mount,
+physical sync-root stubs, and macOS FileProvider placeholders are three product
+representations of the same remote tree, not three unrelated products.
+
+## Sprint Goal
+
+Produce one repo-archived parity packet that proves an isolated project tree can
+move between `neo`, `honey`, and the Apple lab without forcing full hydration.
+
+Minimum acceptable packet:
+
+1. Seed an isolated tree from one host into a disposable remote prefix.
+2. Browse the tree on another host without hydrating all file bodies.
+3. Hydrate exact selected content on demand.
+4. Edit through the mounted or provider-backed view and prove exact remote
+   pullback.
+5. Dehydrate/unsync clean descendants and refuse dirty descendants unless
+   `--force` is used.
+6. Rehydrate exact content after cache clear or placeholder eviction.
+7. Record CLI/daemon/FileProvider status where each surface can currently
+   report it.
+8. Archive transcript, config, remote prefix, host names, run IDs, and redacted
+   metadata under `docs/release/evidence/`.
+
+## Work Packets
+
+| Packet | Tracker | Work | Acceptance |
+| --- | --- | --- | --- |
+| A. Fleet pilot packet | `TIN-133`, `#309` adjacent | Create a cross-host evidence lane from isolated `neo` or `honey` pilot roots, not real home directories. Reuse `task lazy:fleet-pilot-plan`, the helper's `--run-linux-lifecycle` companion, `task lazy:linux-lifecycle-demo`, `just neo-honey-smoke`, and lab host acceptance docs. | One archived bundle shows traversal, hydrate, edit, unsync, rehydrate, and exact content across at least `neo` and `honey`; PZM can be included as Apple lab proof but does not replace production Finder. |
+| A1. Same-fixture unsynced rehydrate | `TIN-133`, `#309` adjacent | Run `task lazy:neo-honey-unsynced-rehydrate-plan` with a disposable remote prefix. This is the QA permutation where one machine has removed the local copy and another machine mutates the same file. | One archived bundle shows neo `tcfs unsync`, honey mounted traversal/mutation, neo `tcfs pull`, exact honey content, `sync-status`, and no stale adjacent `.tc` stub. |
+| A1b. Reverse same-fixture unsynced rehydrate | `TIN-133`, `#309` adjacent | Run `task lazy:neo-honey-reverse-unsynced-rehydrate-plan` with a disposable remote prefix. This mirrors A1 by putting honey in the unsynced state before neo mutates and pushes. | Green in `docs/release/evidence/neo-honey-reverse-unsynced-rehydrate-20260510T022858Z/`: honey `tcfs pull`, honey `tcfs unsync`, neo mutation/push, honey rehydrate/pull, exact neo content, `sync-status`, and no stale adjacent `.tc` stub. Stale-binary blocker `20260510T022657Z` is retained. |
+| A1b-M4. Mounted reverse read | `TIN-133`, `#309` adjacent | Run `task lazy:neo-mounted-reverse-read-plan` for neo/macOS, or `task lazy:honey-mounted-reverse-read-plan` for the Linux-equivalent mounted VFS row, with a disposable remote prefix. This is the QA permutation where one peer has only a physical `.tc` stub, another peer publishes newer bytes, and the first peer reads latest content through the mounted clean-name surface. | Linux-equivalent green in `docs/release/evidence/honey-mounted-reverse-read-20260510T042203Z/`: honey mounted `ls`/`find`/`cat` returned exact neo bytes while the physical root stayed stub-only. Neo/macOS remains blocked in `docs/release/evidence/neo-mounted-reverse-read-20260510T035826Z/` because NFS loopback mount failed with `Operation not permitted`. |
+| A1c. Delete/rename while peer-unsynced | `TIN-133`, `#309` adjacent | Run `task lazy:neo-honey-delete-rename-unsynced-plan` with a disposable remote prefix. This records current behavior when one peer has only physical `.tc` stubs and another peer deletes or renames those paths. | Green for current behavior in `docs/release/evidence/neo-honey-delete-rename-unsynced-20260510T040456Z/`: old-path pulls fail deterministically, renamed new path hydrates exact bytes, and stale old stub state is explicitly recorded as present. Helper coverage now records repeated old-path pull failure, repeated new-path hydrate success, and stale-stub `sync-status` in future packets. Do not claim clean delete/rename UX until tombstone or stale-stub cleanup semantics are accepted. |
+| A1d. Cross-host conflict | `TIN-133`, `#309` adjacent | Run `task lazy:neo-honey-conflict-plan` with a disposable remote prefix, `task lazy:neo-honey-conflict-keep-both-plan` for manual recovery, `task lazy:neo-honey-conflict-sibling-plan` for sibling progress while one path remains conflicted, and `task lazy:neo-honey-conflict-daemon-keep-both-plan` for the daemon-backed resolution lane. This records current behavior when honey has a hydrated edited copy and neo pushes a divergent version before honey attempts to push. | Detection is green in `docs/release/evidence/neo-honey-conflict-20260510T043741Z/`: honey push reports `CONFLICT`, skips upload, `sync-status` reports conflict, honey local bytes are preserved, and remote pullback still has neo bytes. Manual keep-both recovery is green in `docs/release/evidence/neo-honey-conflict-keep-both-20260510T045908Z/`: original path remains neo bytes and sibling conflict copy preserves honey bytes. Independent sibling progress is green in `docs/release/evidence/neo-honey-conflict-sibling-20260510T051328Z/`: the conflicted file stays `conflict`, the sibling reaches `synced`, and remote pullbacks match expected bytes. Daemon keep-both is blocked in `docs/release/evidence/neo-honey-conflict-daemon-keep-both-20260510T054611Z/`: the request reaches `tcfsd` but the CLI times out after partial side effects. Finder/provider conflict visibility remains open. |
+| A2. Real project-tree shadow | `TIN-133`, `#309` adjacent | Run `task lazy:home-canary-linux-xr-shadow` against `/Users/jess/git/linux-xr` with a disposable remote prefix. Do not mutate the live repo; do not broaden to `~/Documents`, `~/.local`, dotfiles, or all `~/git`. | Green scoped isolated-shadow parity in `docs/release/evidence/home-canary-linux-xr-shadow-20260511T040325Z/`: source/shadow inventories, raw `.git`/hidden-dir/symlink config, completed 7.7 GB push, honey mounted bounded traversal/hydration, all 85 symlink targets verified through mounted `readlink`, and Linux lifecycle companion. This remains project-tree functional evidence only, not production Finder or production S3 posture. |
+| A2a. Generic git repo canary | `TIN-133`, `#309` adjacent | Run `task lazy:git-repo-canary` against one clean git worktree, defaulting to `~/git/oauth-mux`. The helper refuses dirty sources unless explicitly allowed, snapshots into `~/TCFS Pilot/real-canaries/`, and writes a packet that says no live repo, Finder, broad `~/git`, or home takeover is claimed. Use `task lazy:git-repo-restore-proof` against a completed packet before any live repo move. | Small-repo parity is green for source-built binaries in `docs/release/evidence/git-repo-canary-oauth-mux-sourcebin-fresh-20260515T014640Z/` and for explicit current Nix flake package binaries in `docs/release/evidence/git-repo-canary-oauth-mux-nixpkg-20260515T133843Z/`: fresh-prefix push, 0 skipped symlinks, honey mounted traversal/hydration, 9 mounted symlink target checks, and Linux lifecycle companion. The original Nix restore timeout remains archived at `docs/release/evidence/git-repo-canary-oauth-mux-nixpkg-20260515T133843Z/restore-proof/`. Source-built `restore-proof-source-fix-empty-dirs-20260515T183805Z/` and rebuilt Nix-package `restore-proof-nixpkg-current-empty-dirs-20260515T200359Z/` both prove fresh-tree restore for 4,601 regular files, 9 symlinks, synced state for all 4,610 restored paths, and all 12 empty dirs with `--require-empty-dirs`. `~/git/linux-xr-fast` is now green for source-built shadow push, honey traversal/hydration, and Linux lifecycle in `docs/release/evidence/git-repo-canary-linux-xr-fast-sourcefix-index-20260516T045054Z/`, but its fresh-tree restore remains blocked: 2,036 of 2,038 regular files restored and all 6 empty dirs matched, while two multi-GB raw Git pack files failed after transient chunk read errors. Homebrew remains blocked because installed Homebrew `tcfs 0.12.12` skips symlinks. Next proof should rerun `~/git/linux-xr-fast` with a selected candidate package/binary, enough local free space for full restore, and hardened download retry posture; package-backed restore/rollback remains required before any live repo move. |
+| B. Safe-unsync hardening | `TIN-133`, code | Keep recursive `tcfs unsync <directory>` behavior product-grade: clean descendants convert, dirty descendants refuse, `--force` preserves tracked remote metadata, state flips to `NotSynced` before destructive file/stub operations. | `cargo test -p tcfs-cli cli_unsync`, `tcfs-vfs` lifecycle tests, daemon RPC unsync tests, and host transcript stay green. |
+| C. Production Finder lane | `TIN-133`, `#309` | Select a true production Developer ID clean-host executor and run the published `.pkg` path through app install, host launch, domain add, CloudStorage enumeration, hydrate, mutate/conflict if reliable, and log capture. On `neo`, archive `task lazy:macos-fileprovider-neo-cleanup-packet` first and use the published `.pkg`, not stale `~/Applications` or build-tree apps. | `#309` gets one tagged production clean-host run. PZM testing-mode remains regression evidence only. `TCFS_REQUIRE_PRODUCTION_SIGNING=1 task lazy:macos-finder-preflight` must be green before any production-adjacent local Finder smoke is described as such. |
+| D. Distribution proof closure | `TIN-131`, `#280` | Keep `v0.12.12` proof boundaries explicit and finish next-tag native `linux/arm64/v8` GHCR proof. Tie macOS `.pkg` closure to Packet C. | `#280` can narrow to only future policy decisions after production macOS and native arm64 container proof land. |
+| E. On-prem cutover | `TIN-720`, `#327`, `#298` | Keep the parity sprint on disposable prefixes unless a maintenance window is named. If scheduled, run preflight, inventory, plan, retained-PVC migration, candidate workload/service cutover, smoke, and rollback proof. | `#327` only moves with live plan/apply evidence, assigned rollback owner, and post-cut smoke owner. `#298` remains blocked until then. |
+| F. Remote branch hygiene | `#312` | Decide whether to approve or defer the 44-branch Tranche A tinyland prune proposal. | No deletion happens without explicit operator approval. Decision is recorded either way. |
+| G. iOS posture | Apple docs | Keep iOS as compile/typecheck proof-of-concept unless a real Files.app device lane is scheduled. | CI keeps simulator typecheck green; no public write/FileProvider device claim is added. |
+
+## Home Directory Rollout Gates
+
+Do not jump straight to real `~/Documents` or `~/git`. Use staged gates:
+
+1. Disposable remote prefix plus tiny pilot tree.
+2. Isolated `~/TCFS Pilot/Documents` and `~/TCFS Pilot/git` roots.
+3. One real but expendable project repo, with `.git` behavior and exclusions
+   explicitly checked.
+4. Several real project repos, with conflict/status and unsync behavior
+   archived on at least two machines.
+5. Opt-in subtrees under `~/Documents` or `~/git`.
+6. Only then consider broader default management.
+
+Each gate needs an exit transcript and a rollback story. For project repos,
+include at least `.git`, hidden files, symlinks if supported, large binaries,
+permissions, ignored/build directories, and network-interruption behavior.
+
+## Test Matrix
+
+Run these before claiming a sprint packet is green.
+
+Local and CI:
+
+```bash
+task lazy:check
+cargo test -p tcfs-cli cli_unsync
+cargo test -p tcfs-cli cli_pull_after_unsync_hydrates_latest_remote_and_removes_stub
+cargo test -p tcfs-cli cli_pull_adjacent_stub_cleanup_ignores_non_tcfs_files
+cargo test -p tcfs-vfs --test vfs_lifecycle_test
+cargo test -p tcfsd unsync
+task docs:links
+```
+
+Host evidence:
+
+```bash
+task lazy:git-repo-canary
+task lazy:home-canary-linux-xr-shadow
+task lazy:fleet-pilot-plan
+TCFS_FLEET_PILOT_RUN_LINUX_LIFECYCLE=1 task lazy:fleet-pilot-plan
+PUSH=1 RUN_HONEY=1 task lazy:neo-honey-unsynced-rehydrate-plan
+PUSH=1 RUN_HONEY=1 task lazy:neo-honey-reverse-unsynced-rehydrate-plan
+PUSH=1 RUN_HONEY=1 HONEY_START_MOUNT=1 task lazy:honey-mounted-reverse-read-plan
+PUSH=1 RUN_HONEY=1 NEO_START_MOUNT=1 NEO_NFS=1 task lazy:neo-mounted-reverse-read-plan
+PUSH=1 RUN_HONEY=1 task lazy:neo-honey-delete-rename-unsynced-plan
+PUSH=1 RUN_HONEY=1 task lazy:neo-honey-conflict-plan
+PUSH=1 RUN_HONEY=1 HONEY_RECOVER_KEEP_BOTH=1 task lazy:neo-honey-conflict-keep-both-plan
+PUSH=1 RUN_HONEY=1 HONEY_INDEPENDENT_SIBLING=1 task lazy:neo-honey-conflict-sibling-plan
+PUSH=1 RUN_HONEY=1 HONEY_TCFSD_BIN=/path/to/current/tcfsd task lazy:neo-honey-conflict-daemon-keep-both-plan
+task lazy:linux-lifecycle-demo
+just neo-honey-smoke
+```
+
+Apple lab evidence:
+
+```bash
+scripts/macos-fileprovider-testing-mode-dispatch.sh \
+  --exercise-conflict-status
+```
+
+Production Apple evidence:
+
+- run the release `.pkg` on a true clean Developer ID macOS host
+- capture package install, signing/notarization checks, host policy probe,
+  FileProvider domain add, CloudStorage enumeration, exact hydrate, and at
+  least one desktop follow-on such as mutation or conflict/status if reliable
+
+Distribution evidence:
+
+- Homebrew current tag fresh install and upgrade
+- Nix tagged profile install
+- Ubuntu 24.04+ and Debian 13+ `.deb` fresh/upgrade proof
+- Fedora 42 RPM daemon-only proof unless CLI support changes
+- GHCR amd64 and native `linux/arm64/v8` pull/version/startup proof after the
+  next multi-arch tag
+
+Kubernetes/on-prem evidence, only if Packet E is scheduled:
+
+- `TCFS_CONTEXT=honey just onprem-preflight`
+- `TCFS_CONTEXT=honey just onprem-data-inventory`
+- `just onprem-tofu-validate`
+- rendered migration plan archived before any mutation
+- post-cut `just neo-honey-smoke`
+
+## Tracker Update Plan
+
+| Tracker | Next update should say |
+| --- | --- |
+| `#280` / `TIN-131` | Current release proof is Homebrew/Nix/Linux packages/amd64 container; remaining blockers are production macOS `.pkg` clean-host Finder and native arm64 container proof on a future tag. No release artifact cut unless explicitly scheduled. |
+| `#309` / `TIN-133` | Extended fleet packet `docs/release/evidence/fleet-pilot-extended-20260509T2152Z/`, same-fixture packet `docs/release/evidence/neo-honey-unsynced-rehydrate-20260510T015644Z/`, reverse same-fixture packet `docs/release/evidence/neo-honey-reverse-unsynced-rehydrate-20260510T022858Z/`, Linux-mounted reverse-read packet `docs/release/evidence/honey-mounted-reverse-read-20260510T042203Z/`, M8 current-behavior packet `docs/release/evidence/neo-honey-delete-rename-unsynced-20260510T040456Z/`, cross-host conflict packet `docs/release/evidence/neo-honey-conflict-20260510T043741Z/`, manual keep-both recovery packet `docs/release/evidence/neo-honey-conflict-keep-both-20260510T045908Z/`, independent sibling progress packet `docs/release/evidence/neo-honey-conflict-sibling-20260510T051328Z/`, and scoped linux-xr isolated-shadow parity packet `docs/release/evidence/home-canary-linux-xr-shadow-20260511T040325Z/` are archived. Link linux-xr as scoped project-tree functional evidence only: it proves the isolated shadow, raw `.git`/hidden dirs, all 85 mounted symlink targets, and Linux lifecycle, but not broad home takeover, production Finder, or production S3 posture. Link neo cleanup packets as FileProvider divergence/blocker evidence, not production Finder readiness. Neo/macOS M4 mounted reverse read still has blocker evidence at mount permission. M8 still needs tombstone/stale-stub semantics before a clean user-facing delete/rename claim. Conflict detection, manual recovery, and independent sibling progress have evidence; daemon-backed resolution UX remains open. Linux and PZM lab evidence are strong, but production Developer ID clean-host Finder remains open. |
+| `#312` | Record approve/defer for Tranche A branch pruning. Do not delete tinyland branches without explicit approval. |
+| `#327` / `TIN-720` | Record whether a downtime window exists. If not, state that parity proof uses disposable prefixes and no live OpenTofu cutover occurred. |
+| `#298` | Keep blocked on `#327` unless an operator makes a separate Civo retirement decision. |
+| `#308` | No new work; already closed. |
+
+## Definition Of Done
+
+The sprint is done when all of these are true:
+
+1. An archived fleet-parity evidence directory exists under
+   `docs/release/evidence/`.
+2. The bundle proves clean traversal, exact hydrate, edit, unsync/dehydrate,
+   exact rehydrate, and status/conflict visibility at the strongest available
+   surface.
+3. Production Finder remains accurately labeled: either green via Developer ID
+   clean-host proof, or still open in `#309`.
+4. Distribution state remains accurate in `#280` and `TIN-131`.
+5. On-prem work remains explicitly deferred or has named downtime, rollback,
+   and post-cut smoke evidence.
+6. Docs link to the evidence bundle from product reality, lazy hydration,
+   workstream reality, and the relevant tracker comments.
+
+## Non-Goals
+
+- No automatic takeover of real `~/Documents` or `~/git`.
+- No production Finder claim from PZM testing-mode evidence.
+- No live OpenTofu cutover without a named window and rollback owner.
+- No tinyland branch deletion without explicit operator approval.
+- No new release artifact unless release work is explicitly scheduled.
+
+## Related Docs
+
+- [TCFS Feature and Objective Matrix - 2026-05-09](feature-objective-matrix-2026-05-09.md)
+- [TCFS Lazy Traversal QA Permutation Matrix - 2026-05-09](lazy-traversal-qa-permutation-matrix-2026-05-09.md)
+- [Product Reality and Priority](product-reality-and-priority.md)
+- [Lazy Hydration Demo Acceptance](lazy-hydration-demo.md)
+- [macOS Finder and FileProvider Reality](macos-fileprovider-reality.md)
+- [Distribution Smoke Matrix](distribution-smoke-matrix.md)
+- [Neo-Honey Live Acceptance](neo-honey-acceptance.md)
+- [On-Prem Authority Recovery](onprem-authority-recovery.md)

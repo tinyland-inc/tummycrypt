@@ -18,7 +18,7 @@ on:
 
 env:
   # Public Attic endpoint shared with flake.nix and other workflows.
-  ATTIC_SERVER: https://nix-cache.fuzzy-dev.tinyland.dev
+  ATTIC_SERVER: https://nix-cache.tinyland.dev
   ATTIC_CACHE: main
 
 jobs:
@@ -26,62 +26,71 @@ jobs:
     name: Flake Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install Nix
+      - name: Bootstrap Nix CLI
         uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
-            extra-substituters = https://nix-cache.fuzzy-dev.tinyland.dev/main
-            extra-trusted-public-keys = main:NKRk1XYo/dfd9fcDqgotUJg2DTDHWp5ny+Ba7WzRjgE=
+            extra-substituters = https://nix-cache.tinyland.dev/main
+            extra-trusted-public-keys = main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA=
+
+      - name: Verify runner Nix toolchain
+        run: nix --version
 
       - name: Nix flake check
-        run: nix flake check
+        run: nix flake check --accept-flake-config
 
   build-linux-x86_64:
     name: Build Linux x86_64
     runs-on: ubuntu-latest
     needs: flake-check
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install Nix
+      - name: Bootstrap Nix CLI
         uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
-            extra-substituters = https://nix-cache.fuzzy-dev.tinyland.dev/main
-            extra-trusted-public-keys = main:NKRk1XYo/dfd9fcDqgotUJg2DTDHWp5ny+Ba7WzRjgE=
+            extra-substituters = https://nix-cache.tinyland.dev/main
+            extra-trusted-public-keys = main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA=
+
+      - name: Verify runner cache endpoints
+        run: |
+          echo "ATTIC_SERVER=${ATTIC_SERVER}"
+          echo "ATTIC_CACHE=${ATTIC_CACHE}"
+          echo "BAZEL_REMOTE_CACHE=${BAZEL_REMOTE_CACHE:-unset}"
 
       - name: Configure Attic
         run: |
           nix profile install nixpkgs#attic-client
           if [ -n "${{ secrets.ATTIC_TOKEN }}" ]; then
-            attic login tinyland ${{ env.ATTIC_SERVER }} ${{ secrets.ATTIC_TOKEN }}
-            attic use ${{ env.ATTIC_CACHE }} || echo "::warning::Failed to configure Attic substituter"
-            echo "ATTIC_CONFIGURED=true" >> $GITHUB_ENV
+            attic login tinyland "${{ env.ATTIC_SERVER }}" "${{ secrets.ATTIC_TOKEN }}"
+            attic use "${{ env.ATTIC_CACHE }}" || echo "::warning::Failed to configure Attic substituter"
+            echo "ATTIC_CONFIGURED=true" >> "$GITHUB_ENV"
           else
             echo "::warning::ATTIC_TOKEN not set, skipping cache push"
-            echo "ATTIC_CONFIGURED=false" >> $GITHUB_ENV
+            echo "ATTIC_CONFIGURED=false" >> "$GITHUB_ENV"
           fi
 
       - name: Build tcfsd
-        run: nix build .#tcfsd
+        run: nix build --accept-flake-config --fallback .#tcfsd
 
       - name: Build tcfs-cli
-        run: nix build .#tcfs-cli
+        run: nix build --accept-flake-config --fallback .#tcfs-cli
 
       - name: Build tcfs-tui
-        run: nix build .#tcfs-tui
+        run: nix build --accept-flake-config --fallback .#tcfs-tui
 
       - name: Build tcfs-mcp
-        run: nix build .#tcfs-mcp
+        run: nix build --accept-flake-config --fallback .#tcfs-mcp
 
       - name: Push to Attic
         if: env.ATTIC_CONFIGURED == 'true' && github.event_name == 'push'
         run: |
           for pkg in tcfsd tcfs-cli tcfs-tui tcfs-mcp; do
-            nix build .#${pkg} -o result-${pkg}
-            attic push ${{ env.ATTIC_CACHE }} result-${pkg} || echo "::warning::Failed to push ${pkg} to Attic"
+            nix build --accept-flake-config --fallback ".#${pkg}" -o "result-${pkg}"
+            attic push "${{ env.ATTIC_CACHE }}" "result-${pkg}" || echo "::warning::Failed to push ${pkg} to Attic"
           done
 
   build-macos-aarch64:
@@ -89,40 +98,40 @@ jobs:
     runs-on: macos-14
     needs: flake-check
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
-            extra-substituters = https://nix-cache.fuzzy-dev.tinyland.dev/main
-            extra-trusted-public-keys = main:NKRk1XYo/dfd9fcDqgotUJg2DTDHWp5ny+Ba7WzRjgE=
+            extra-substituters = https://nix-cache.tinyland.dev/main
+            extra-trusted-public-keys = main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA=
 
       - name: Configure Attic
         run: |
           nix profile install nixpkgs#attic-client
           if [ -n "${{ secrets.ATTIC_TOKEN }}" ]; then
-            attic login tinyland ${{ env.ATTIC_SERVER }} ${{ secrets.ATTIC_TOKEN }}
-            attic use ${{ env.ATTIC_CACHE }} || echo "::warning::Failed to configure Attic substituter"
-            echo "ATTIC_CONFIGURED=true" >> $GITHUB_ENV
+            attic login tinyland "${{ env.ATTIC_SERVER }}" "${{ secrets.ATTIC_TOKEN }}"
+            attic use "${{ env.ATTIC_CACHE }}" || echo "::warning::Failed to configure Attic substituter"
+            echo "ATTIC_CONFIGURED=true" >> "$GITHUB_ENV"
           else
             echo "::warning::ATTIC_TOKEN not set, skipping cache push"
-            echo "ATTIC_CONFIGURED=false" >> $GITHUB_ENV
+            echo "ATTIC_CONFIGURED=false" >> "$GITHUB_ENV"
           fi
 
       - name: Build tcfs-cli (no FUSE on macOS)
-        run: nix build .#tcfs-cli
+        run: nix build --accept-flake-config --fallback .#tcfs-cli
 
       - name: Build tcfs-tui
-        run: nix build .#tcfs-tui
+        run: nix build --accept-flake-config --fallback .#tcfs-tui
 
       - name: Build tcfs-mcp
-        run: nix build .#tcfs-mcp
+        run: nix build --accept-flake-config --fallback .#tcfs-mcp
 
       - name: Push to Attic
         if: env.ATTIC_CONFIGURED == 'true' && github.event_name == 'push'
         run: |
           for pkg in tcfs-cli tcfs-tui tcfs-mcp; do
-            nix build .#${pkg} -o result-${pkg}
-            attic push ${{ env.ATTIC_CACHE }} result-${pkg} || echo "::warning::Failed to push ${pkg} to Attic"
+            nix build --accept-flake-config --fallback ".#${pkg}" -o "result-${pkg}"
+            attic push "${{ env.ATTIC_CACHE }}" "result-${pkg}" || echo "::warning::Failed to push ${pkg} to Attic"
           done

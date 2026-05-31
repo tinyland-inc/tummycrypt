@@ -11,12 +11,17 @@
 //! # Security Model
 //!
 //! - Invites are signed with the admin device's key (BLAKE3-HMAC)
+//! - The signature covers the full invite payload except the signature itself
 //! - Each invite has a single-use nonce and expiry
 //! - Invite can be scoped to specific permissions
 //! - Revocation is immediate (admin removes device from registry)
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::RwLock;
 
 use crate::session::DevicePermissions;
 
@@ -37,7 +42,7 @@ pub struct EnrollmentInvite {
     pub expires_at: DateTime<Utc>,
     /// Permissions granted to the enrolled device.
     pub permissions: DevicePermissions,
-    /// BLAKE3-HMAC signature of the invite fields (signed by admin's master key).
+    /// BLAKE3-HMAC signature of the invite payload (signed by admin's master key).
     pub signature: String,
     /// Optional: NATS server URL for the fleet.
     pub nats_url: Option<String>,
@@ -101,17 +106,16 @@ impl EnrollmentInvite {
         invite
     }
 
-    /// Compute BLAKE3-keyed-MAC of the invite fields.
+    /// Recompute the invite signature after mutating optional payload fields.
+    pub fn refresh_signature(&mut self, master_key: &[u8; 32]) {
+        self.signature = self.compute_signature(master_key);
+    }
+
+    /// Compute BLAKE3-keyed-MAC of the invite payload.
     fn compute_signature(&self, master_key: &[u8; 32]) -> String {
-        let payload = format!(
-            "{}:{}:{}:{}:{}",
-            self.invite_id,
-            self.nonce,
-            self.created_by,
-            self.created_at.timestamp(),
-            self.expires_at.timestamp(),
-        );
-        let mac = blake3::keyed_hash(master_key, payload.as_bytes());
+        let payload = serde_json::to_vec(&InviteSignaturePayload::from_invite(self))
+            .expect("serialize invite signature payload");
+        let mac = blake3::keyed_hash(master_key, &payload);
         mac.to_hex().to_string()
     }
 
@@ -204,6 +208,47 @@ impl EnrollmentInvite {
     }
 }
 
+#[derive(Serialize)]
+struct InviteSignaturePayload<'a> {
+    invite_id: &'a str,
+    nonce: &'a str,
+    created_by: &'a str,
+    created_at: i64,
+    expires_at: i64,
+    permissions: &'a DevicePermissions,
+    nats_url: Option<&'a str>,
+    storage_endpoint: Option<&'a str>,
+    storage_bucket: Option<&'a str>,
+    storage_access_key: Option<&'a str>,
+    storage_secret_key: Option<&'a str>,
+    remote_prefix: Option<&'a str>,
+    encryption_passphrase: Option<&'a str>,
+    encryption_salt: Option<&'a str>,
+    description: Option<&'a str>,
+}
+
+impl<'a> InviteSignaturePayload<'a> {
+    fn from_invite(invite: &'a EnrollmentInvite) -> Self {
+        Self {
+            invite_id: &invite.invite_id,
+            nonce: &invite.nonce,
+            created_by: &invite.created_by,
+            created_at: invite.created_at.timestamp(),
+            expires_at: invite.expires_at.timestamp(),
+            permissions: &invite.permissions,
+            nats_url: invite.nats_url.as_deref(),
+            storage_endpoint: invite.storage_endpoint.as_deref(),
+            storage_bucket: invite.storage_bucket.as_deref(),
+            storage_access_key: invite.storage_access_key.as_deref(),
+            storage_secret_key: invite.storage_secret_key.as_deref(),
+            remote_prefix: invite.remote_prefix.as_deref(),
+            encryption_passphrase: invite.encryption_passphrase.as_deref(),
+            encryption_salt: invite.encryption_salt.as_deref(),
+            description: invite.description.as_deref(),
+        }
+    }
+}
+
 /// Compact invite representation with short keys for QR-friendly encoding.
 ///
 /// Field mapping:
@@ -211,10 +256,10 @@ impl EnrollmentInvite {
 /// - `c` = created_at (unix ts), `x` = expires_at (unix ts)
 /// - `p` = permissions (bitfield: mount=1, push=2, pull=4, admin=8)
 /// - `g` = signature
-/// - `e` = storage_endpoint, `k` = storage_bucket
+/// - `u` = nats_url, `e` = storage_endpoint, `k` = storage_bucket
 /// - `a` = storage_access_key, `s` = storage_secret_key
 /// - `r` = remote_prefix, `w` = encryption_passphrase
-/// - `t` = encryption_salt
+/// - `t` = encryption_salt, `d` = description
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompactInvite {
     i: String,
@@ -224,6 +269,8 @@ struct CompactInvite {
     x: i64,
     p: u8,
     g: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    u: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     e: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,6 +285,8 @@ struct CompactInvite {
     w: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     t: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    d: Option<String>,
 }
 
 impl CompactInvite {
@@ -254,6 +303,7 @@ impl CompactInvite {
             x: inv.expires_at.timestamp(),
             p: perms,
             g: inv.signature.clone(),
+            u: inv.nats_url.clone(),
             e: inv.storage_endpoint.clone(),
             k: inv.storage_bucket.clone(),
             a: inv.storage_access_key.clone(),
@@ -261,6 +311,7 @@ impl CompactInvite {
             r: inv.remote_prefix.clone(),
             w: inv.encryption_passphrase.clone(),
             t: inv.encryption_salt.clone(),
+            d: inv.description.clone(),
         }
     }
 
@@ -279,7 +330,7 @@ impl CompactInvite {
                 allowed_prefixes: vec![],
             },
             signature: self.g.clone(),
-            nats_url: None,
+            nats_url: self.u.clone(),
             storage_endpoint: self.e.clone(),
             storage_bucket: self.k.clone(),
             storage_access_key: self.a.clone(),
@@ -287,7 +338,7 @@ impl CompactInvite {
             remote_prefix: self.r.clone(),
             encryption_passphrase: self.w.clone(),
             encryption_salt: self.t.clone(),
-            description: None,
+            description: self.d.clone(),
         }
     }
 }
@@ -334,6 +385,136 @@ pub struct EnrollmentResult {
     pub encryption_salt: Option<String>,
     /// Auth methods available (e.g., ["totp", "webauthn"]).
     pub available_auth_methods: Vec<String>,
+}
+
+/// Secret bootstrap material returned to a joining device.
+///
+/// This payload must be encrypted to the joining device's public key before it
+/// crosses an enrollment boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrollmentBootstrap {
+    /// NATS server URL (if fleet sync is enabled).
+    pub nats_url: Option<String>,
+    /// Storage endpoint URL.
+    pub storage_endpoint: Option<String>,
+    /// S3 bucket name.
+    pub storage_bucket: Option<String>,
+    /// S3 access key.
+    pub storage_access_key: Option<String>,
+    /// S3 secret key.
+    pub storage_secret_key: Option<String>,
+    /// Remote prefix for file sync.
+    pub remote_prefix: Option<String>,
+    /// Base64-encoded TCFS master key for the current shared-master fleet.
+    pub master_key_base64: Option<String>,
+    /// Encryption salt (if passphrase-based E2EE is enabled).
+    pub encryption_salt: Option<String>,
+}
+
+/// Audit record for an invite that has already been redeemed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteRedemption {
+    /// Redeemed invite ID.
+    pub invite_id: String,
+    /// Redeemed invite nonce.
+    pub nonce: String,
+    /// UTC timestamp when the daemon accepted the redemption.
+    pub redeemed_at: DateTime<Utc>,
+    /// Device name requested during redemption.
+    pub device_name: String,
+    /// Device public key presented during redemption.
+    pub public_key: String,
+    /// Device platform presented during redemption.
+    pub platform: String,
+}
+
+#[derive(Debug, Error)]
+pub enum InviteRedemptionError {
+    #[error("invite {invite_id} has already been redeemed")]
+    AlreadyRedeemed { invite_id: String },
+}
+
+/// Thread-safe single-use invite redemption ledger.
+///
+/// The key is `(invite_id, nonce)` so a malicious client cannot replay an
+/// otherwise valid invite payload after the first successful enrollment.
+#[derive(Clone, Default)]
+pub struct InviteRedemptionStore {
+    redemptions: Arc<RwLock<HashMap<String, InviteRedemption>>>,
+}
+
+impl InviteRedemptionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn key(invite_id: &str, nonce: &str) -> String {
+        format!("{invite_id}:{nonce}")
+    }
+
+    /// Claim an invite nonce. Returns an error if it has already been used.
+    pub async fn claim(
+        &self,
+        invite_id: &str,
+        nonce: &str,
+        device_name: &str,
+        public_key: &str,
+        platform: &str,
+    ) -> Result<InviteRedemption, InviteRedemptionError> {
+        let key = Self::key(invite_id, nonce);
+        let mut redemptions = self.redemptions.write().await;
+        if redemptions.contains_key(&key) {
+            return Err(InviteRedemptionError::AlreadyRedeemed {
+                invite_id: invite_id.to_string(),
+            });
+        }
+
+        let redemption = InviteRedemption {
+            invite_id: invite_id.to_string(),
+            nonce: nonce.to_string(),
+            redeemed_at: Utc::now(),
+            device_name: device_name.to_string(),
+            public_key: public_key.to_string(),
+            platform: platform.to_string(),
+        };
+        redemptions.insert(key, redemption.clone());
+        Ok(redemption)
+    }
+
+    pub async fn is_redeemed(&self, invite_id: &str, nonce: &str) -> bool {
+        self.redemptions
+            .read()
+            .await
+            .contains_key(&Self::key(invite_id, nonce))
+    }
+
+    pub async fn count(&self) -> usize {
+        self.redemptions.read().await.len()
+    }
+
+    pub async fn save_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let redemptions = self.redemptions.read().await;
+        let data = serde_json::to_string_pretty(&*redemptions)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(path, data).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_from_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let data = tokio::fs::read_to_string(path).await?;
+        let loaded: HashMap<String, InviteRedemption> = serde_json::from_str(&data)?;
+        let mut redemptions = self.redemptions.write().await;
+        redemptions.clear();
+        redemptions.extend(loaded);
+        Ok(())
+    }
 }
 
 // Need hex for nonce encoding
@@ -424,6 +605,9 @@ mod tests {
         invite.storage_access_key = Some("AKIAIOSFODNN7EXAMPLE".into());
         invite.storage_secret_key = Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into());
         invite.remote_prefix = Some("default".into());
+        invite.nats_url = Some("nats://nats.example.com:4222".into());
+        invite.description = Some("test invite".into());
+        invite.refresh_signature(&master_key);
 
         let compact = invite.encode_compact().unwrap();
         let full = invite.encode().unwrap();
@@ -441,6 +625,8 @@ mod tests {
         assert_eq!(invite.invite_id, decoded.invite_id);
         assert_eq!(invite.storage_endpoint, decoded.storage_endpoint);
         assert_eq!(invite.storage_access_key, decoded.storage_access_key);
+        assert_eq!(invite.nats_url, decoded.nats_url);
+        assert_eq!(invite.description, decoded.description);
         assert!(decoded.verify_signature(&master_key));
 
         // Roundtrip via decode_any (auto-detect compact)
@@ -465,6 +651,7 @@ mod tests {
         invite.storage_bucket = Some("tcfs".into());
         invite.storage_access_key = Some("TESTKEY123".into());
         invite.storage_secret_key = Some("TESTSECRET456".into());
+        invite.refresh_signature(&master_key);
 
         let link = invite.to_compact_deep_link().unwrap();
         assert!(link.starts_with("tcfs://enroll?data="));
@@ -481,5 +668,103 @@ mod tests {
             "compact payload {} bytes, should be under 500 for QR",
             data.len()
         );
+    }
+
+    #[test]
+    fn test_signature_covers_brokered_payload_fields() {
+        let master_key = [42u8; 32];
+        let mut invite =
+            EnrollmentInvite::new("admin-device", &master_key, 24, DevicePermissions::admin());
+        invite.storage_endpoint = Some("https://s3.example.com".into());
+        invite.storage_bucket = Some("tcfs".into());
+        invite.storage_access_key = Some("AKIAIOSFODNN7EXAMPLE".into());
+        invite.storage_secret_key = Some("secret-before".into());
+        invite.remote_prefix = Some("tenant/a".into());
+        invite.encryption_passphrase = Some("passphrase-before".into());
+        invite.refresh_signature(&master_key);
+
+        assert!(invite.verify_signature(&master_key));
+
+        let mut tampered_secret = invite.clone();
+        tampered_secret.storage_secret_key = Some("secret-after".into());
+        assert!(!tampered_secret.verify_signature(&master_key));
+
+        let mut tampered_prefix = invite.clone();
+        tampered_prefix.remote_prefix = Some("tenant/b".into());
+        assert!(!tampered_prefix.verify_signature(&master_key));
+
+        let mut tampered_permissions = invite.clone();
+        tampered_permissions.permissions.can_admin = false;
+        assert!(!tampered_permissions.verify_signature(&master_key));
+    }
+
+    #[tokio::test]
+    async fn test_invite_redemption_store_rejects_reuse() {
+        let master_key = [42u8; 32];
+        let invite = EnrollmentInvite::new(
+            "admin-device",
+            &master_key,
+            24,
+            DevicePermissions::default(),
+        );
+        let store = InviteRedemptionStore::new();
+
+        let first = store
+            .claim(
+                &invite.invite_id,
+                &invite.nonce,
+                "laptop",
+                "age1test",
+                "linux-x86_64",
+            )
+            .await;
+        assert!(first.is_ok());
+        assert!(store.is_redeemed(&invite.invite_id, &invite.nonce).await);
+
+        let second = store
+            .claim(
+                &invite.invite_id,
+                &invite.nonce,
+                "tablet",
+                "age1other",
+                "ios",
+            )
+            .await;
+        assert!(matches!(
+            second,
+            Err(InviteRedemptionError::AlreadyRedeemed { .. })
+        ));
+        assert_eq!(store.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_invite_redemption_store_save_load_roundtrip() {
+        let master_key = [42u8; 32];
+        let invite = EnrollmentInvite::new(
+            "admin-device",
+            &master_key,
+            24,
+            DevicePermissions::default(),
+        );
+        let store = InviteRedemptionStore::new();
+        store
+            .claim(
+                &invite.invite_id,
+                &invite.nonce,
+                "laptop",
+                "age1test",
+                "linux-x86_64",
+            )
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invite-redemptions.json");
+        store.save_to_file(&path).await.unwrap();
+
+        let loaded = InviteRedemptionStore::new();
+        loaded.load_from_file(&path).await.unwrap();
+        assert!(loaded.is_redeemed(&invite.invite_id, &invite.nonce).await);
+        assert_eq!(loaded.count().await, 1);
     }
 }

@@ -1,27 +1,122 @@
 # Apple Surface Status
 
-As of April 15, 2026, Apple support is a buildable and manually explorable lane,
-not a continuously proven release target.
+As of May 17, 2026, Apple support is a buildable and partially proven lane. The
+macOS FileProvider testing-mode lab now has green enumerate, hydrate, evict,
+rehydrate, mutation upload/readback, and deterministic conflict/status content
+preservation proof on PZM, but Apple surfaces are still not a full
+release-grade desktop or iOS product.
 
 ## macOS: Proven Today
 
-- CI proves the Rust staticlib and Swift build surfaces needed for FileProvider
-  packaging.
+- CI proves the Rust staticlib/header needed for FileProvider packaging, plus
+  the iOS Swift type-check lane. The regular CI workflow does not yet build the
+  macOS FileProvider Swift bundle.
 - Release automation can build Apple Silicon artifacts, package
   `TCFSProvider.app`, and publish `.pkg` plus tarball assets.
 - The repo contains real macOS daemon, launchd, NFS loopback, and FileProvider
   code paths.
+- The `petting-zoo-mini` lab lane can build a non-production testing-mode
+  package with Mac App Development profiles and Apple's
+  `com.apple.developer.fileprovider.testing-mode` entitlement.
+- PZM smoke run `25446601375` on `v0.12.11` proved package install,
+  signing/profile checks, shared-Keychain config, live S3/E2EE access, daemon
+  startup, FileProvider registration, CloudStorage enumeration,
+  `requestDownload`, and exact-content hydration.
+- PZM smoke run `25562087555` on `v0.12.12` with the installed
+  `TCFS FileProvider Lab Gatekeeper Rules` profile proved installed host
+  policy launch, shared-Keychain config, live S3/E2EE access, daemon startup,
+  FileProvider registration, CloudStorage enumeration, `requestDownload`,
+  `evict`, re-`requestDownload`, and exact-content hydration.
+- PZM package run `25565895586` and smoke run `25565943781` extended the same
+  testing-mode lane into mutation proof: write through CloudStorage, exact
+  remote pull of the 68-byte mutated file, and post-mutation `tcfs status`
+  showing storage `[ok]`.
+- PZM package run `25569345240` and smoke run `25569596910` extended the lane
+  into deterministic conflict/status proof: CLI status reported
+  `sync state: conflict` and FileProvider readback preserved exact content.
+  Finder badges/progress remain observational.
+- Local neo cleanup packet
+  `docs/release/evidence/macos-fileprovider-neo-pkg-install-20260516T024006Z/`
+  verifies the published `v0.12.12` `.pkg` signature/notarization and
+  quarantines the stale `~/Applications/TCFSProvider.app`, but the package did
+  not install because non-interactive `sudo` required a password.
+- Local neo source-built signed app packet
+  `docs/release/evidence/macos-fileprovider-signed-app-preflight-20260516T183213Z/`
+  proves the build script can embed the compatible local Developer ID host and
+  extension profiles and pass strict signing-only preflight. It does not prove
+  `.pkg` install, PlugInKit cleanup, or Finder lifecycle.
+- Local neo candidate package packet
+  `docs/release/evidence/macos-fileprovider-candidate-pkg-20260516T190702Z/`
+  proves the signed app can be wrapped with current source-built `tcfs`/`tcfsd`
+  into a Developer ID Installer signed `.pkg` whose payload and postinstall
+  structure pass the non-installing smoke. It does not install or register the
+  app.
+- Follow-up packet
+  `docs/release/evidence/macos-fileprovider-candidate-pkg-assessment-20260516T194612Z/`
+  confirms the same candidate package has a valid Developer ID Installer
+  signature and expected expanded payload, but Gatekeeper install assessment
+  rejects it as `Unnotarized Developer ID` and `stapler validate` reports no
+  stapled ticket.
+- Remote proof packet
+  `docs/release/evidence/macos-fileprovider-pkg-notarization-proof-20260516T211425Z/`
+  records GitHub Actions run `25973109986`: a source-built arm64 macOS package
+  was Developer ID signed, submitted to Apple notary service, accepted,
+  stapled, validated, accepted by Gatekeeper install assessment, and passed
+  strict package smoke with signature, Gatekeeper, and stapled-ticket checks
+  required. This is a workflow artifact proof, not a published release asset or
+  an installed Finder lifecycle proof.
+- Local neo packet
+  `docs/release/evidence/macos-fileprovider-neo-notarized-pkg-inventory-20260516T222519Z/`
+  downloads that notarized workflow artifact, verifies SHA-256
+  `c6fd1a6fd18638c53f0d0b88bc79249e65d08766d99853bef6896ee69bcd6d45`, and
+  reruns strict package smoke locally with signature, Gatekeeper, and
+  stapled-ticket checks required. The same inventory still shows no canonical
+  `/Applications/TCFSProvider.app` and a stale user-app PlugInKit registration.
+- Local neo install packet
+  `docs/release/evidence/macos-fileprovider-neo-notarized-pkg-install-20260516T222606Z/`
+  attempts the real `/` install from that notarized package and records the
+  historical blocker: `sudo -n installer` requires a password, so no payload
+  was installed and strict production preflight still fails on the missing
+  `/Applications/TCFSProvider.app`.
+- Local neo install packet
+  `docs/release/evidence/macos-fileprovider-neo-notarized-pkg-install-auth-20260517T005618Z/`
+  supersedes that admin-auth blocker for the workflow artifact: the notarized
+  package installed into `/Applications` with authenticated `osascript`, but
+  strict preflight still found duplicate PlugInKit registrations.
+- Local neo cleanup and preflight packets
+  `docs/release/evidence/macos-fileprovider-neo-stale-userapp-quarantine-20260517T010423Z/`
+  and
+  `docs/release/evidence/macos-fileprovider-neo-strict-preflight-installed-20260517T010916Z/`
+  intentionally quarantine the stale user app after inventory, then prove
+  strict installed preflight with one PlugInKit registration under
+  `/Applications/TCFSProvider.app`.
+- Local neo daemon packet
+  `docs/release/evidence/macos-fileprovider-neo-package-daemon-env-20260517T012916Z/`
+  removes the stale user daemon from the bounded process set and proves package
+  `tcfsd 0.12.12` reaches storage `[ok]` from file-backed credentials.
+- Local neo Finder packets now reach production-signed domain add,
+  CloudStorage enumeration, and host-app `requestDownload`; the current
+  blocker packet
+  `docs/release/evidence/macos-fileprovider-neo-finder-release-smoke-directhost-catread-20260517T020417Z/`
+  still fails the real read with `Operation timed out`.
+- GitHub Actions links for the current PZM runs are indexed in
+  [Release Evidence Index](../release/evidence/README.md).
 
 ## macOS: Not Yet Proven As A Release-Grade Desktop Surface
 
-- There is no continuously exercised Finder/FileProvider acceptance lane from
-  install through register, enumerate, hydrate, mutate, and conflict handling.
+- There is no continuously exercised production Finder/FileProvider acceptance
+  lane from Developer ID package install through user enablement, enumerate,
+  hydrate, mutate, and conflict handling.
 - Finder badges, progress UI, and notification behavior are not release gates.
-- Post-release smoke on April 15, 2026 showed that `v0.12.1` could install on
-  Apple Silicon, but the shipped `tcfsd` failed at runtime because it linked
-  Homebrew OpenSSL dylibs with an incompatible Team ID.
-- Packaged macOS artifacts therefore still require explicit post-cut smoke even
-  when CI and packaging are green.
+- The green PZM lane is intentionally non-production testing-mode evidence; it
+  does not mean arbitrary clean production Macs will auto-enable the provider.
+- Published macOS artifacts still require explicit post-cut smoke even when CI
+  and packaging are green; the notarized workflow artifact does not replace
+  current-tag release install evidence.
+- Neo local dogfood has an authenticated install, intentional stale-registration
+  cleanup after inventory, full strict production preflight, and package daemon
+  storage proof. It still needs exact-content FileProvider hydration through
+  the installed production app before any Finder readiness claim.
 
 ## iOS: Current Posture
 
@@ -36,14 +131,15 @@ not a continuously proven release target.
 
 Use:
 
-- `macOS: CLI/daemon plus experimental FileProvider desktop surfaces`
+- `macOS: CLI/daemon plus lab-proven experimental FileProvider lifecycle`
 - `iOS: proof-of-concept FileProvider direction`
 
 Avoid:
 
 - `macOS: full` or `production-ready`
 - `iOS: active release target`
-- claims that Finder badges, hydration, or conflict UX are release-verified
+- claims that production Finder badges, mutation, conflict UX, or arbitrary
+  clean-host enablement are release-verified
 
 ## Validation Path
 
@@ -52,8 +148,9 @@ Avoid:
   [Distribution Smoke Matrix](distribution-smoke-matrix.md).
 - Use [macOS Finder and FileProvider Reality](macos-fileprovider-reality.md) for
   the current desktop acceptance path and proof gaps.
-- Add a named macOS Finder/FileProvider smoke path before upgrading the public
-  posture.
+- Keep extending the named macOS Finder/FileProvider smoke path, but do not
+  upgrade the public desktop posture until production Developer ID clean-host
+  acceptance is green.
 - Add simulator or device-backed iOS acceptance before claiming an active iOS
   product surface.
 
@@ -81,7 +178,8 @@ They are related, but they do not represent the same shipping surface.
 
 ## Exit Criteria To Become An Active Release Target
 
-- A real macOS Finder/FileProvider smoke path
+- A production macOS Finder/FileProvider smoke path for clean-host enablement
+  plus mutate/conflict/status behavior
 - Simulator or device-backed acceptance coverage for iOS
 - A repeatable TestFlight or equivalent Apple distribution lane
 - Docs that can point to those validation surfaces directly

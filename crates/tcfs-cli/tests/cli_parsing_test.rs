@@ -51,6 +51,10 @@ enum Commands {
         #[arg(long, env = "TCFS_STATE_PATH")]
         state: Option<PathBuf>,
     },
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
     Mount {
         remote: String,
         mountpoint: PathBuf,
@@ -64,6 +68,10 @@ enum Commands {
     Unmount {
         mountpoint: PathBuf,
     },
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     Unsync {
         path: PathBuf,
         #[arg(long)]
@@ -72,6 +80,16 @@ enum Commands {
     Init {
         #[arg(long)]
         device_name: Option<String>,
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        skip_config: bool,
+        #[arg(long)]
+        force_config: bool,
+        #[arg(long)]
+        config_out: Option<PathBuf>,
+        #[arg(long)]
+        fileprovider_config_out: Option<PathBuf>,
         #[arg(long)]
         non_interactive: bool,
         #[arg(long, env = "TCFS_MASTER_PASSWORD", hide_env_values = true)]
@@ -82,6 +100,30 @@ enum Commands {
 #[derive(clap::Subcommand, Debug)]
 enum ConfigAction {
     Show,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum IndexAction {
+    Inspect {
+        rel_path: String,
+        #[arg(long, short = 'p')]
+        prefix: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum CacheAction {
+    Stats,
+    Clear,
+    Evict {
+        rel_path: String,
+        #[arg(long, short = 'p')]
+        prefix: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -181,6 +223,36 @@ fn parse_sync_status_with_path() {
 }
 
 #[test]
+fn parse_index_inspect() {
+    let cli = Cli::try_parse_from([
+        "tcfs",
+        "index",
+        "inspect",
+        "Projects/tcfs-odrive-parity/honey-readme.txt",
+        "--prefix",
+        "data",
+        "--json",
+    ])
+    .expect("index inspect should parse");
+
+    if let Commands::Index {
+        action:
+            IndexAction::Inspect {
+                rel_path,
+                prefix,
+                json,
+            },
+    } = cli.command
+    {
+        assert_eq!(rel_path, "Projects/tcfs-odrive-parity/honey-readme.txt");
+        assert_eq!(prefix, Some("data".to_string()));
+        assert!(json);
+    } else {
+        panic!("expected Index Inspect");
+    }
+}
+
+#[test]
 fn parse_mount() {
     let cli = Cli::try_parse_from([
         "tcfs",
@@ -239,6 +311,36 @@ fn parse_unmount() {
 }
 
 #[test]
+fn parse_cache_evict() {
+    let cli = Cli::try_parse_from([
+        "tcfs",
+        "cache",
+        "evict",
+        "Projects/tcfs-odrive-parity/honey-readme.txt",
+        "--prefix",
+        "data",
+        "--json",
+    ])
+    .expect("cache evict should parse");
+
+    if let Commands::Cache {
+        action:
+            CacheAction::Evict {
+                rel_path,
+                prefix,
+                json,
+            },
+    } = cli.command
+    {
+        assert_eq!(rel_path, "Projects/tcfs-odrive-parity/honey-readme.txt");
+        assert_eq!(prefix, Some("data".to_string()));
+        assert!(json);
+    } else {
+        panic!("expected Cache Evict");
+    }
+}
+
+#[test]
 fn parse_unsync() {
     let cli = Cli::try_parse_from(["tcfs", "unsync", "/path/to/file.txt"]).expect("unsync");
     if let Commands::Unsync { path, force } = cli.command {
@@ -265,12 +367,59 @@ fn parse_init() {
         .expect("init");
     if let Commands::Init {
         device_name,
+        check,
+        skip_config,
+        force_config,
+        config_out,
+        fileprovider_config_out,
         non_interactive,
         ..
     } = cli.command
     {
         assert_eq!(device_name, Some("neo".to_string()));
+        assert!(!check);
+        assert!(!skip_config);
+        assert!(!force_config);
+        assert!(config_out.is_none());
+        assert!(fileprovider_config_out.is_none());
         assert!(non_interactive);
+    } else {
+        panic!("expected Init");
+    }
+}
+
+#[test]
+fn parse_init_first_run_config_paths() {
+    let cli = Cli::try_parse_from([
+        "tcfs",
+        "init",
+        "--check",
+        "--skip-config",
+        "--force-config",
+        "--config-out",
+        "/tmp/tcfs/config.toml",
+        "--fileprovider-config-out",
+        "/tmp/tcfs/fileprovider/config.json",
+    ])
+    .expect("init config paths");
+
+    if let Commands::Init {
+        check,
+        skip_config,
+        force_config,
+        config_out,
+        fileprovider_config_out,
+        ..
+    } = cli.command
+    {
+        assert!(check);
+        assert!(skip_config);
+        assert!(force_config);
+        assert_eq!(config_out, Some(PathBuf::from("/tmp/tcfs/config.toml")));
+        assert_eq!(
+            fileprovider_config_out,
+            Some(PathBuf::from("/tmp/tcfs/fileprovider/config.json"))
+        );
     } else {
         panic!("expected Init");
     }

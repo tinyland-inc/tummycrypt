@@ -20,14 +20,33 @@ Set these before running the lane:
 
 ```bash
 export TCFS_E2E_LIVE=1
-export TCFS_S3_ENDPOINT=http://100.120.66.67:8333
+export TCFS_S3_ENDPOINT=http://seaweedfs-tcfs:8333
 export TCFS_S3_BUCKET=tcfs
 export AWS_ACCESS_KEY_ID=<from seaweedfs-admin secret>
 export AWS_SECRET_ACCESS_KEY=<from seaweedfs-admin secret>
-export TCFS_NATS_URL=nats://100.71.19.127:4222
+export TCFS_NATS_URL=nats://nats-tcfs:4222
 ```
 
 ## Canonical operator command
+
+Before running the mutating smoke, run the read-only G2/G3 preflight:
+
+```bash
+task lazy:honey-backbone-preflight
+```
+
+That helper writes an evidence packet under
+`docs/release/evidence/honey-backbone-preflight-<UTC>/` and checks daemon
+storage/NATS status, NATS endpoint reachability from both hosts, device
+registry convergence, and placeholder-shaped device public keys. Use
+`--strict` directly when a failing shell status is desired:
+
+```bash
+scripts/honey-backbone-preflight.sh --strict
+```
+
+The preflight does not enroll devices, edit configs, restart services, or move
+data.
 
 ```bash
 just neo-honey-smoke
@@ -58,6 +77,8 @@ The lane passes only if all of the following are true:
 
 - If SeaweedFS health fails, treat the lane as infrastructure-unavailable.
 - If NATS connectivity or JetStream listing fails, treat the lane as fleet-sync-unavailable.
+- If the read-only preflight reports split NATS endpoints or divergent device
+  registries, treat G2/G3 as blocked before running the mutating smoke.
 - If the two-device smoke fails after both backends are reachable, treat the lane
   as a product regression in the live sync path.
 
