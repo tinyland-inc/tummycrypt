@@ -4,6 +4,7 @@
 //! Uses opendal Memory backend — no network or FUSE mount required.
 
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use opendal::Operator;
@@ -15,10 +16,18 @@ fn memory_vfs(prefix: &str) -> TcfsVfs {
     let op = Operator::new(opendal::services::Memory::default())
         .unwrap()
         .finish();
+    memory_vfs_with_op(
+        op,
+        prefix,
+        std::path::PathBuf::from("/tmp/tcfs-vfs-test-cache"),
+    )
+}
+
+fn memory_vfs_with_op(op: Operator, prefix: &str, cache_dir: PathBuf) -> TcfsVfs {
     TcfsVfs::new(
         op,
         prefix.to_string(),
-        std::path::PathBuf::from("/tmp/tcfs-vfs-test-cache"),
+        cache_dir,
         64 * 1024 * 1024,
         Duration::from_secs(30),
         "test-device".to_string(),
@@ -78,6 +87,790 @@ async fn mkdir_appears_in_readdir() {
 }
 
 #[tokio::test]
+async fn readdir_after_create_uses_clean_names() {
+    let vfs = memory_vfs("test");
+
+    vfs.mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+
+    let (fh, _) = vfs
+        .create("/docs", OsStr::new("README.md"), 0o644)
+        .await
+        .expect("create README");
+    vfs.write(fh, 0, b"# Clean mounted names")
+        .await
+        .expect("write README");
+    vfs.release(fh).await.expect("release README");
+
+    let entries = vfs.readdir("/docs").await.expect("readdir /docs");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+    assert!(
+        names.contains(&"README.md"),
+        "mounted VFS should expose clean filenames: {names:?}"
+    );
+    assert!(
+        !names.contains(&"README.md.tc"),
+        "mounted VFS should not expose physical stub suffixes: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn real_tc_extension_is_not_treated_as_stub_suffix() {
+    let vfs = memory_vfs("test");
+
+    vfs.mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+    let (fh, _) = vfs
+        .create("/docs", OsStr::new("ftrace.tc"), 0o644)
+        .await
+        .expect("create real .tc file");
+    vfs.write(fh, 0, b"real project file with .tc extension")
+        .await
+        .expect("write real .tc file");
+    vfs.release(fh).await.expect("release real .tc file");
+
+    let entries = vfs.readdir("/docs").await.expect("readdir /docs");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"ftrace.tc"),
+        "real .tc filenames should remain visible: {names:?}"
+    );
+    assert!(
+        !names.contains(&"ftrace"),
+        "real .tc filenames must not be exposed as stripped stub names: {names:?}"
+    );
+
+    assert!(
+        vfs.getattr("/docs/ftrace").await.is_err(),
+        "clean path without .tc should not alias a real .tc file"
+    );
+    let attr = vfs
+        .getattr("/docs/ftrace.tc")
+        .await
+        .expect("getattr exact .tc file");
+    assert_eq!(attr.kind, tcfs_vfs::types::VfsFileType::RegularFile);
+
+    let (read_fh, data) = vfs
+        .open("/docs/ftrace.tc")
+        .await
+        .expect("open exact .tc file");
+    assert_eq!(&data, b"real project file with .tc extension");
+    vfs.release(read_fh).await.expect("release exact .tc file");
+}
+
+#[tokio::test]
+async fn readdir_getattr_and_readlink_preserve_symlink_entries() {
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let cache = tempfile::tempdir().unwrap();
+    let vfs = memory_vfs_with_op(op.clone(), "test", cache.path().join("cache"));
+
+    let entry = tcfs_sync::index_entry::RemoteIndexEntry::new_symlink("linkhash", "target.txt");
+    tcfs_sync::index_entry::write_committed_index_entry(&op, "test/index/link.txt", &entry)
+        .await
+        .expect("write symlink index entry");
+
+    let entries = vfs.readdir("/").await.expect("readdir root");
+    let link = entries
+        .iter()
+        .find(|entry| entry.name == "link.txt")
+        .expect("link entry");
+    assert_eq!(link.kind, tcfs_vfs::types::VfsFileType::Symlink);
+
+    let attr = vfs.getattr("/link.txt").await.expect("getattr symlink");
+    assert_eq!(attr.kind, tcfs_vfs::types::VfsFileType::Symlink);
+    assert_eq!(attr.size, "target.txt".len() as u64);
+
+    let target = vfs.readlink("/link.txt").await.expect("readlink");
+    assert_eq!(target, "target.txt");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pushed_symlink_json_index_reads_through_vfs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source_root = tmp.path().join("source");
+    let docs = source_root.join("docs");
+    std::fs::create_dir_all(&docs).expect("create source docs");
+    std::fs::write(docs.join("target.txt"), b"pushed symlink target").expect("write target");
+    std::os::unix::fs::symlink("target.txt", docs.join("link.txt")).expect("create symlink");
+
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "pushed-symlink-json-contract";
+    let mut state =
+        tcfs_sync::state::StateCache::open(&tmp.path().join("state.json")).expect("state cache");
+    let collect = tcfs_sync::engine::CollectConfig {
+        preserve_symlinks: true,
+        sync_empty_dirs: false,
+        ..Default::default()
+    };
+
+    let (uploaded, skipped, _) = tcfs_sync::engine::push_tree_with_device(
+        &op,
+        &source_root,
+        prefix,
+        &mut state,
+        None,
+        "",
+        Some(&collect),
+        None,
+    )
+    .await
+    .expect("push source tree");
+    assert_eq!(uploaded, 2);
+    assert_eq!(skipped, 0);
+
+    let raw_index = op
+        .read(&format!("{prefix}/index/docs/link.txt"))
+        .await
+        .expect("read symlink index")
+        .to_bytes();
+    let raw_index = String::from_utf8_lossy(&raw_index);
+    assert!(
+        raw_index.trim_start().starts_with('{'),
+        "sync push should write versioned JSON for symlinks: {raw_index}"
+    );
+    assert!(
+        raw_index.contains(r#""kind": "symlink""#),
+        "symlink index should carry v3 kind discriminator: {raw_index}"
+    );
+
+    let reader = memory_vfs_with_op(op, prefix, tmp.path().join("reader-cache"));
+    let entries = reader.readdir("/docs").await.expect("readdir /docs");
+    let link = entries
+        .iter()
+        .find(|entry| entry.name == "link.txt")
+        .expect("link entry from pushed index");
+    assert_eq!(link.kind, tcfs_vfs::types::VfsFileType::Symlink);
+
+    let attr = reader
+        .getattr("/docs/link.txt")
+        .await
+        .expect("getattr pushed symlink");
+    assert_eq!(attr.kind, tcfs_vfs::types::VfsFileType::Symlink);
+    assert_eq!(attr.size, "target.txt".len() as u64);
+
+    let target = reader
+        .readlink("/docs/link.txt")
+        .await
+        .expect("readlink pushed symlink");
+    assert_eq!(target, "target.txt");
+}
+
+#[tokio::test]
+async fn readdir_is_lazy_and_open_hydrates_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "lazy-contract";
+    let content = b"remote content should hydrate only on open";
+
+    let writer = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("writer-cache"));
+    writer
+        .mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+    writer
+        .mkdir("/docs", OsStr::new("deep"), 0o755)
+        .await
+        .expect("mkdir docs/deep");
+    let (fh, _) = writer
+        .create("/docs/deep", OsStr::new("remote.txt"), 0o644)
+        .await
+        .expect("create remote file");
+    writer
+        .write(fh, 0, content)
+        .await
+        .expect("write remote file");
+    writer.release(fh).await.expect("flush remote file");
+
+    let reader = memory_vfs_with_op(op, prefix, tmp.path().join("reader-cache"));
+    let before = reader.disk_cache().stats().await.expect("cache stats");
+    assert_eq!(before.entry_count, 0, "reader cache starts empty");
+
+    let docs_entries = reader.readdir("/docs").await.expect("readdir /docs");
+    let docs_names: Vec<&str> = docs_entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        docs_names.contains(&"deep"),
+        "remote directory should be visible before hydration: {docs_names:?}"
+    );
+
+    let deep_entries = reader
+        .readdir("/docs/deep")
+        .await
+        .expect("readdir /docs/deep");
+    let deep_names: Vec<&str> = deep_entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        deep_names.contains(&"remote.txt"),
+        "remote file should be visible before hydration: {deep_names:?}"
+    );
+    assert!(
+        !deep_names.contains(&"remote.txt.tc"),
+        "mounted view should not expose physical stub suffixes: {deep_names:?}"
+    );
+
+    let after_readdir = reader
+        .disk_cache()
+        .stats()
+        .await
+        .expect("cache stats after readdir");
+    assert_eq!(
+        after_readdir.entry_count, 0,
+        "readdir should not hydrate file content"
+    );
+    assert_eq!(
+        after_readdir.total_bytes, 0,
+        "readdir should leave the content cache empty"
+    );
+
+    let (read_fh, hydrated) = reader
+        .open("/docs/deep/remote.txt")
+        .await
+        .expect("open remote file");
+    assert_eq!(&hydrated, content);
+    reader.release(read_fh).await.expect("release remote file");
+
+    let after_open = reader
+        .disk_cache()
+        .stats()
+        .await
+        .expect("cache stats after open");
+    assert_eq!(after_open.entry_count, 1, "open should hydrate one file");
+    assert_eq!(
+        after_open.total_bytes,
+        content.len() as u64,
+        "cache should store the hydrated file bytes"
+    );
+}
+
+#[tokio::test]
+async fn unsync_path_evicts_cache_and_rehydrates_on_demand() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "mounted-unsync-rehydrate-contract";
+    let content = b"cached bytes should leave the machine and rehydrate on demand";
+
+    let writer = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("writer-cache"));
+    writer
+        .mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+    let (fh, _) = writer
+        .create("/docs", OsStr::new("remote.txt"), 0o644)
+        .await
+        .expect("create remote file");
+    writer
+        .write(fh, 0, content)
+        .await
+        .expect("write remote file");
+    writer.release(fh).await.expect("flush remote file");
+
+    let reader = memory_vfs_with_op(op, prefix, tmp.path().join("reader-cache"));
+    let (read_fh, hydrated) = reader
+        .open("/docs/remote.txt")
+        .await
+        .expect("initial hydrate");
+    assert_eq!(&hydrated, content);
+    reader.release(read_fh).await.expect("release initial read");
+    assert_eq!(
+        reader
+            .disk_cache()
+            .stats()
+            .await
+            .expect("cache stats after initial hydrate")
+            .entry_count,
+        1,
+        "initial open should populate the reader cache"
+    );
+
+    let unsynced = reader
+        .unsync_path("/docs/remote.txt")
+        .await
+        .expect("unsync mounted path");
+    assert_eq!(unsynced.path, "/docs/remote.txt");
+    assert!(unsynced.was_cached, "unsync should evict cached bytes");
+    assert_eq!(unsynced.bytes_freed, content.len() as u64);
+    assert_eq!(
+        reader
+            .disk_cache()
+            .stats()
+            .await
+            .expect("cache stats after unsync")
+            .entry_count,
+        0,
+        "unsync should leave no local cached content"
+    );
+
+    let entries = reader.readdir("/docs").await.expect("readdir after unsync");
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert!(
+        names.contains(&"remote.txt"),
+        "unsynced remote entry should remain listable through the clean mounted name: {names:?}"
+    );
+    assert!(
+        !names.contains(&"remote.txt.tc"),
+        "mounted unsync should not expose a physical stub suffix: {names:?}"
+    );
+
+    let already_unsynced = reader
+        .unsync_path("/docs/remote.txt")
+        .await
+        .expect("unsync already-uncached mounted path");
+    assert!(
+        !already_unsynced.was_cached,
+        "second unsync should report no local bytes to evict"
+    );
+    assert_eq!(already_unsynced.bytes_freed, 0);
+
+    let (rehydrated_fh, rehydrated) = reader
+        .open("/docs/remote.txt")
+        .await
+        .expect("rehydrate after unsync");
+    assert_eq!(&rehydrated, content);
+    reader
+        .release(rehydrated_fh)
+        .await
+        .expect("release rehydrated file");
+    assert_eq!(
+        reader
+            .disk_cache()
+            .stats()
+            .await
+            .expect("cache stats after rehydrate")
+            .entry_count,
+        1,
+        "open after unsync should restore exactly one cached entry"
+    );
+}
+
+#[tokio::test]
+async fn remote_create_after_negative_lookup_hydrates_after_invalidate_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "mounted-negative-cache-invalidate-contract";
+    let content = b"peer-created bytes after negative lookup";
+
+    let reader = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("reader-cache"));
+    assert!(
+        reader.getattr("/docs/new.txt").await.is_err(),
+        "missing path should seed the reader negative cache"
+    );
+
+    let writer = memory_vfs_with_op(op, prefix, tmp.path().join("writer-cache"));
+    writer
+        .mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+    let (fh, _) = writer
+        .create("/docs", OsStr::new("new.txt"), 0o644)
+        .await
+        .expect("create peer file");
+    writer.write(fh, 0, content).await.expect("write peer file");
+    writer.release(fh).await.expect("flush peer file");
+
+    assert!(
+        reader.getattr("/docs/new.txt").await.is_err(),
+        "negative cache should suppress the new peer file until invalidated"
+    );
+
+    reader.invalidate_path("/docs/new.txt");
+
+    let attr = reader
+        .getattr("/docs/new.txt")
+        .await
+        .expect("getattr after invalidation");
+    assert_eq!(attr.kind, tcfs_vfs::types::VfsFileType::RegularFile);
+    assert_eq!(attr.size, content.len() as u64);
+
+    let entries = reader
+        .readdirplus("/docs")
+        .await
+        .expect("readdirplus after invalidation");
+    let entry = entries
+        .iter()
+        .find(|entry| entry.name == "new.txt")
+        .expect("new file entry");
+    assert_eq!(entry.kind, tcfs_vfs::types::VfsFileType::RegularFile);
+    assert_eq!(
+        entry.attr.as_ref().map(|attr| attr.size),
+        Some(content.len() as u64)
+    );
+
+    let (read_fh, hydrated) = reader
+        .open("/docs/new.txt")
+        .await
+        .expect("hydrate peer-created file after invalidation");
+    assert_eq!(&hydrated, content);
+    reader.release(read_fh).await.expect("release peer file");
+}
+
+#[tokio::test]
+async fn remote_delete_while_unhydrated_drops_mounted_entry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "mounted-delete-peer-unsynced-contract";
+    let content = b"remote bytes that should never hydrate before delete";
+
+    let writer = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("writer-cache"));
+    writer
+        .mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+    let (fh, _) = writer
+        .create("/docs", OsStr::new("doomed.txt"), 0o644)
+        .await
+        .expect("create doomed");
+    writer.write(fh, 0, content).await.expect("write doomed");
+    writer.release(fh).await.expect("flush doomed");
+
+    let reader = memory_vfs_with_op(op, prefix, tmp.path().join("reader-cache"));
+    let before = reader
+        .readdir("/docs")
+        .await
+        .expect("readdir before delete");
+    let before_names: Vec<&str> = before.iter().map(|entry| entry.name.as_str()).collect();
+    assert!(before_names.contains(&"doomed.txt"));
+    assert_eq!(
+        reader
+            .disk_cache()
+            .stats()
+            .await
+            .expect("cache stats before delete")
+            .entry_count,
+        0,
+        "readdir should leave the peer-unhydrated reader cache empty"
+    );
+
+    writer
+        .unlink("/docs", OsStr::new("doomed.txt"))
+        .await
+        .expect("remote delete");
+
+    let after = reader.readdir("/docs").await.expect("readdir after delete");
+    let after_names: Vec<&str> = after.iter().map(|entry| entry.name.as_str()).collect();
+    assert!(
+        !after_names.contains(&"doomed.txt"),
+        "deleted remote entry should disappear from mounted view: {after_names:?}"
+    );
+    assert!(
+        reader.open("/docs/doomed.txt").await.is_err(),
+        "deleted unhydrated entry should not open from a stale listing"
+    );
+}
+
+#[tokio::test]
+async fn remote_rename_while_unhydrated_hydrates_new_mounted_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "mounted-rename-peer-unsynced-contract";
+    let content = b"remote bytes should hydrate only through the renamed path";
+
+    let writer = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("writer-cache"));
+    writer
+        .mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+    let (fh, _) = writer
+        .create("/docs", OsStr::new("old.txt"), 0o644)
+        .await
+        .expect("create old");
+    writer.write(fh, 0, content).await.expect("write old");
+    writer.release(fh).await.expect("flush old");
+
+    let reader = memory_vfs_with_op(op, prefix, tmp.path().join("reader-cache"));
+    let before = reader
+        .readdir("/docs")
+        .await
+        .expect("readdir before rename");
+    let before_names: Vec<&str> = before.iter().map(|entry| entry.name.as_str()).collect();
+    assert!(before_names.contains(&"old.txt"));
+    assert!(!before_names.contains(&"new.txt"));
+    assert_eq!(
+        reader
+            .disk_cache()
+            .stats()
+            .await
+            .expect("cache stats before rename")
+            .entry_count,
+        0,
+        "reader should still be unhydrated before peer rename"
+    );
+
+    writer
+        .rename(
+            "/docs",
+            OsStr::new("old.txt"),
+            "/docs",
+            OsStr::new("new.txt"),
+        )
+        .await
+        .expect("remote rename");
+
+    let after = reader.readdir("/docs").await.expect("readdir after rename");
+    let after_names: Vec<&str> = after.iter().map(|entry| entry.name.as_str()).collect();
+    assert!(
+        !after_names.contains(&"old.txt"),
+        "old path should disappear after peer rename: {after_names:?}"
+    );
+    assert!(
+        after_names.contains(&"new.txt"),
+        "new path should appear after peer rename: {after_names:?}"
+    );
+    assert!(
+        reader.open("/docs/old.txt").await.is_err(),
+        "old unhydrated path should not hydrate after rename"
+    );
+
+    let (fh, hydrated) = reader
+        .open("/docs/new.txt")
+        .await
+        .expect("hydrate renamed path");
+    assert_eq!(&hydrated, content);
+    reader.release(fh).await.expect("release renamed path");
+}
+
+#[tokio::test]
+async fn hydrated_remote_file_edit_flushes_exact_content() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "mounted-edit-contract";
+    let original = b"original remote-backed content";
+    let edited = b"edited through mounted view with longer exact content";
+
+    let writer = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("writer-cache"));
+    writer
+        .mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+    let (fh, _) = writer
+        .create("/docs", OsStr::new("remote.txt"), 0o644)
+        .await
+        .expect("create remote file");
+    writer.write(fh, 0, original).await.expect("write original");
+    writer.release(fh).await.expect("flush original");
+
+    let editor = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("editor-cache"));
+    let (edit_fh, hydrated) = editor
+        .open("/docs/remote.txt")
+        .await
+        .expect("hydrate remote file for edit");
+    assert_eq!(&hydrated, original);
+    editor
+        .write(edit_fh, 0, edited)
+        .await
+        .expect("write edited content");
+    editor.release(edit_fh).await.expect("flush edited content");
+
+    let verifier = memory_vfs_with_op(op, prefix, tmp.path().join("verifier-cache"));
+    let (verify_fh, verified) = verifier
+        .open("/docs/remote.txt")
+        .await
+        .expect("hydrate edited remote file");
+    assert_eq!(&verified, edited);
+    verifier.release(verify_fh).await.expect("release verifier");
+}
+
+#[tokio::test]
+async fn hydrated_remote_file_replacement_truncates_old_tail() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "mounted-replace-truncate-contract";
+    let original = b"longer original remote-backed content with tail";
+    let edited = b"short edit";
+
+    let writer = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("writer-cache"));
+    writer
+        .mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+    let (fh, _) = writer
+        .create("/docs", OsStr::new("remote.txt"), 0o644)
+        .await
+        .expect("create remote file");
+    writer.write(fh, 0, original).await.expect("write original");
+    writer.release(fh).await.expect("flush original");
+
+    let editor = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("editor-cache"));
+    let (edit_fh, hydrated) = editor
+        .open("/docs/remote.txt")
+        .await
+        .expect("hydrate remote file for replacement");
+    assert_eq!(&hydrated, original);
+    editor
+        .truncate(Some("/docs/remote.txt"), Some(edit_fh), 0)
+        .await
+        .expect("truncate before replacement");
+    editor
+        .write(edit_fh, 0, edited)
+        .await
+        .expect("write shorter replacement");
+    editor
+        .release(edit_fh)
+        .await
+        .expect("flush shorter replacement");
+
+    let verifier = memory_vfs_with_op(op, prefix, tmp.path().join("verifier-cache"));
+    let (verify_fh, verified) = verifier
+        .open("/docs/remote.txt")
+        .await
+        .expect("hydrate replaced remote file");
+    assert_eq!(&verified, edited);
+    verifier.release(verify_fh).await.expect("release verifier");
+}
+
+#[tokio::test]
+async fn sync_push_json_index_hydrates_through_vfs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source_root = tmp.path().join("source");
+    let source_dir = source_root.join("docs/deep");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    let file_path = source_dir.join("from-push.txt");
+    let content = b"sync engine seeded JSON index should hydrate via VFS";
+    std::fs::write(&file_path, content).expect("write source file");
+
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "sync-json-contract";
+    let mut state =
+        tcfs_sync::state::StateCache::open(&tmp.path().join("state.json")).expect("state cache");
+
+    let (uploaded, skipped, uploaded_bytes) =
+        tcfs_sync::engine::push_tree(&op, &source_root, prefix, &mut state, None)
+            .await
+            .expect("push tree");
+    assert_eq!(uploaded, 1);
+    assert_eq!(skipped, 0);
+    assert_eq!(uploaded_bytes, content.len() as u64);
+
+    let raw_index = op
+        .read(&format!("{prefix}/index/docs/deep/from-push.txt"))
+        .await
+        .expect("read index")
+        .to_bytes();
+    assert!(
+        String::from_utf8_lossy(&raw_index)
+            .trim_start()
+            .starts_with('{'),
+        "sync push should write the versioned JSON index format"
+    );
+
+    let reader = memory_vfs_with_op(op, prefix, tmp.path().join("reader-cache"));
+    let before = reader.disk_cache().stats().await.expect("cache stats");
+    assert_eq!(before.entry_count, 0, "reader cache starts empty");
+
+    let entries = reader
+        .readdir("/docs/deep")
+        .await
+        .expect("readdir /docs/deep");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"from-push.txt"),
+        "VFS should enumerate sync-engine JSON index entries: {names:?}"
+    );
+
+    let after_readdir = reader
+        .disk_cache()
+        .stats()
+        .await
+        .expect("cache stats after readdir");
+    assert_eq!(
+        after_readdir.entry_count, 0,
+        "readdir should not hydrate JSON-indexed file content"
+    );
+
+    let (fh, hydrated) = reader
+        .open("/docs/deep/from-push.txt")
+        .await
+        .expect("open JSON-indexed remote file");
+    assert_eq!(&hydrated, content);
+    reader.release(fh).await.expect("release remote file");
+}
+
+#[tokio::test]
+async fn getattr_directory_prefix_placeholder_is_not_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let op = Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let prefix = "directory-prefix-placeholder";
+
+    let writer = memory_vfs_with_op(op.clone(), prefix, tmp.path().join("writer-cache"));
+    writer
+        .mkdir("/", OsStr::new("docs"), 0o755)
+        .await
+        .expect("mkdir docs");
+    writer
+        .mkdir("/docs", OsStr::new("deep"), 0o755)
+        .await
+        .expect("mkdir docs/deep");
+    let (fh, _) = writer
+        .create("/docs/deep", OsStr::new("remote.txt"), 0o644)
+        .await
+        .expect("create remote file");
+    writer
+        .write(fh, 0, b"remote content")
+        .await
+        .expect("write remote file");
+    writer.release(fh).await.expect("release remote file");
+
+    let placeholder_key = format!("{prefix}/index/docs");
+    op.write(&placeholder_key, Vec::<u8>::new())
+        .await
+        .expect("write empty directory prefix object");
+
+    let reader = memory_vfs_with_op(op, prefix, tmp.path().join("reader-cache"));
+
+    let root_entries = reader.readdirplus("/").await.expect("readdirplus root");
+    let docs_entries: Vec<_> = root_entries
+        .iter()
+        .filter(|entry| entry.name == "docs")
+        .collect();
+    assert_eq!(
+        docs_entries.len(),
+        1,
+        "directory prefix placeholder should not create duplicate docs entries: {root_entries:?}"
+    );
+    assert_eq!(
+        docs_entries[0].kind,
+        tcfs_vfs::types::VfsFileType::Directory
+    );
+    assert_eq!(
+        docs_entries[0].attr.as_ref().map(|attr| attr.kind),
+        Some(tcfs_vfs::types::VfsFileType::Directory)
+    );
+
+    let attr = reader.getattr("/docs").await.expect("getattr /docs");
+    assert_eq!(attr.kind, tcfs_vfs::types::VfsFileType::Directory);
+
+    let entries = reader.readdir("/docs").await.expect("readdir /docs");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"deep"),
+        "directory prefix placeholder should not hide child entries: {names:?}"
+    );
+}
+
+#[tokio::test]
 async fn nested_mkdir() {
     let vfs = memory_vfs("test");
 
@@ -117,6 +910,63 @@ async fn create_write_read_roundtrip() {
 
     // Release
     vfs.release(fh).await.expect("release");
+}
+
+#[tokio::test]
+async fn open_accepts_clean_and_legacy_stub_paths() {
+    let vfs = memory_vfs("test");
+
+    let (fh, _) = vfs
+        .create("/", OsStr::new("legacy.txt"), 0o644)
+        .await
+        .expect("create");
+    vfs.write(fh, 0, b"legacy-compatible hydration")
+        .await
+        .expect("write");
+    vfs.release(fh).await.expect("release");
+
+    let (clean_fh, clean_data) = vfs.open("/legacy.txt").await.expect("open clean path");
+    assert_eq!(&clean_data, b"legacy-compatible hydration");
+    vfs.release(clean_fh).await.expect("release clean path");
+
+    let (stub_fh, stub_data) = vfs
+        .open("/legacy.txt.tc")
+        .await
+        .expect("open legacy stub path");
+    assert_eq!(&stub_data, b"legacy-compatible hydration");
+    vfs.release(stub_fh)
+        .await
+        .expect("release legacy stub path");
+}
+
+#[tokio::test]
+async fn exact_tc_file_wins_over_legacy_stub_fallback() {
+    let vfs = memory_vfs("test");
+
+    let (clean_fh, _) = vfs
+        .create("/", OsStr::new("dupe.txt"), 0o644)
+        .await
+        .expect("create clean file");
+    vfs.write(clean_fh, 0, b"clean file content")
+        .await
+        .expect("write clean file");
+    vfs.release(clean_fh).await.expect("release clean file");
+
+    let (tc_fh, _) = vfs
+        .create("/", OsStr::new("dupe.txt.tc"), 0o644)
+        .await
+        .expect("create exact .tc file");
+    vfs.write(tc_fh, 0, b"exact .tc file content")
+        .await
+        .expect("write exact .tc file");
+    vfs.release(tc_fh).await.expect("release exact .tc file");
+
+    let (read_fh, data) = vfs.open("/dupe.txt.tc").await.expect("open exact .tc file");
+    assert_eq!(
+        &data, b"exact .tc file content",
+        "exact remote .tc entry should win over legacy clean-path fallback"
+    );
+    vfs.release(read_fh).await.expect("release exact .tc read");
 }
 
 #[tokio::test]
@@ -224,7 +1074,14 @@ async fn rename_file() {
     let entries = vfs.readdir("/").await.expect("readdir");
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(!names.contains(&"old.txt"), "old name should be gone");
-    // new.txt should exist (as new.txt.tc in stub format)
+    assert!(
+        names.contains(&"new.txt"),
+        "new name should appear as a clean mounted name: {names:?}"
+    );
+    assert!(
+        !names.contains(&"new.txt.tc"),
+        "rename should not expose a physical stub suffix: {names:?}"
+    );
 }
 
 // ── statfs tests ─────────────────────────────────────────────────────────

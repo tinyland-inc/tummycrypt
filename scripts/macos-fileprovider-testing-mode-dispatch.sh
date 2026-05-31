@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+#
+# Dispatch the non-production FileProvider testing-mode package workflow on a
+# registered self-hosted Mac, then feed its package artifact into the same lab
+# macOS post-install smoke lane.
+#
+set -euo pipefail
+
+REPO="${TCFS_GITHUB_REPO:-Jesssullivan/tummycrypt}"
+REF="${TCFS_GITHUB_REF:-main}"
+TAG="${TAG:-v0.12.12}"
+ARTIFACT_NAME="${ARTIFACT_NAME:-dist-testing-mode-pkg}"
+PACKAGE_WORKFLOW="macos-fileprovider-testing-mode-pkg.yml"
+SMOKE_WORKFLOW="macos-postinstall-smoke.yml"
+RUNNER_LABEL="${TCFS_FILEPROVIDER_LAB_RUNNER_LABEL:-petting-zoo-mini}"
+RUN_ID_POLL_ATTEMPTS="${TCFS_GH_RUN_ID_POLL_ATTEMPTS:-10}"
+RUN_ID_POLL_SECONDS="${TCFS_GH_RUN_ID_POLL_SECONDS:-2}"
+SIGNING_KEYCHAIN="${TCFS_FILEPROVIDER_LAB_SIGNING_KEYCHAIN:-}"
+SIGNING_P12_PATH="${TCFS_FILEPROVIDER_LAB_SIGNING_P12_PATH:-}"
+SIGNING_P12_PASSWORD_FILE="${TCFS_FILEPROVIDER_LAB_P12_PASSWORD_FILE:-}"
+PROFILES_DIR="${TCFS_FILEPROVIDER_LAB_PROFILES_DIR:-}"
+LAB_GATEKEEPER_OVERRIDE="${TCFS_FILEPROVIDER_LAB_GATEKEEPER_OVERRIDE:-0}"
+EXERCISE_CONFLICT_STATUS="${TCFS_FILEPROVIDER_LAB_EXERCISE_CONFLICT_STATUS:-0}"
+DRY_RUN=0
+WATCH=1
+SKIP_SECRET_CHECK=0
+SKIP_RUNNER_CHECK="${TCFS_SKIP_LAB_RUNNER_CHECK:-0}"
+PACKAGE_RUN_ID=""
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/macos-fileprovider-testing-mode-dispatch.sh [options]
+
+Options:
+  --tag <tag>             Release tag whose CLI tarball supplies tcfs/tcfsd (default: v0.12.12)
+  --repo <owner/name>     GitHub repository (default: Jesssullivan/tummycrypt)
+  --ref <ref>             Workflow ref to dispatch (default: main)
+  --artifact-name <name>  Package artifact name (default: dist-testing-mode-pkg)
+  --runner-label <label>  Registered self-hosted Mac runner label (default: petting-zoo-mini)
+  --signing-keychain <p>  Optional runner-local keychain path for development signing
+  --signing-p12-path <p>  Optional runner-local .p12 to import into an ephemeral keychain
+  --signing-p12-password-file <p>
+                          Optional runner-local file containing the .p12 import password
+  --profiles-dir <p>      Optional runner-local provisioning profile directory
+  --lab-gatekeeper-override
+                          PZM-only non-production SystemPolicyRule profile gate for installed testing-mode app
+  --exercise-conflict-status
+                          Seed and verify deterministic FileProvider conflict/status fixture in the lab smoke
+  --package-run-id <id>   Skip package workflow dispatch and smoke an existing package run
+  --dry-run               Print the commands without calling gh
+  --no-watch              Do not wait for workflow completion
+  --skip-secret-check     Deprecated no-op; the lab lane uses local runner profiles
+  --skip-runner-check     Allow dispatch even if GitHub does not currently see the runner
+  -h, --help              Show this help
+USAGE
+}
+
+log() {
+  printf '%s\n' "$*" >&2
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_value() {
+  local flag="$1"
+  local value="${2:-}"
+
+  if [[ -z "$value" ]]; then
+    die "$flag requires a value"
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tag)
+      require_value "$1" "${2:-}"
+      TAG="$2"
+      shift 2
+      ;;
+    --repo)
+      require_value "$1" "${2:-}"
+      REPO="$2"
+      shift 2
+      ;;
+    --ref)
+      require_value "$1" "${2:-}"
+      REF="$2"
+      shift 2
+      ;;
+    --artifact-name)
+      require_value "$1" "${2:-}"
+      ARTIFACT_NAME="$2"
+      shift 2
+      ;;
+    --runner-label)
+      require_value "$1" "${2:-}"
+      RUNNER_LABEL="$2"
+      shift 2
+      ;;
+    --signing-keychain)
+      require_value "$1" "${2:-}"
+      SIGNING_KEYCHAIN="$2"
+      shift 2
+      ;;
+    --signing-p12-path)
+      require_value "$1" "${2:-}"
+      SIGNING_P12_PATH="$2"
+      shift 2
+      ;;
+    --signing-p12-password-file)
+      require_value "$1" "${2:-}"
+      SIGNING_P12_PASSWORD_FILE="$2"
+      shift 2
+      ;;
+    --profiles-dir)
+      require_value "$1" "${2:-}"
+      PROFILES_DIR="$2"
+      shift 2
+      ;;
+    --lab-gatekeeper-override)
+      LAB_GATEKEEPER_OVERRIDE=1
+      shift
+      ;;
+    --exercise-conflict-status)
+      EXERCISE_CONFLICT_STATUS=1
+      shift
+      ;;
+    --package-run-id)
+      require_value "$1" "${2:-}"
+      PACKAGE_RUN_ID="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --no-watch)
+      WATCH=0
+      shift
+      ;;
+    --skip-secret-check)
+      SKIP_SECRET_CHECK=1
+      shift
+      ;;
+    --skip-runner-check)
+      SKIP_RUNNER_CHECK=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+if [[ "$TAG" != v* ]]; then
+  die "tag must start with 'v' (got '$TAG')"
+fi
+if [[ -z "$RUNNER_LABEL" ]]; then
+  die "runner label must not be empty"
+fi
+if [[ "$RUNNER_LABEL" == macos-* ]]; then
+  die "FileProvider testing-mode requires a registered self-hosted Mac runner label, not $RUNNER_LABEL"
+fi
+if [[ "$LAB_GATEKEEPER_OVERRIDE" == "1" ]]; then
+  case "$RUNNER_LABEL" in
+    petting-zoo-mini | petting-zoo-mini-tcfs) ;;
+    *)
+      die "--lab-gatekeeper-override is restricted to the petting-zoo-mini lab runner, not $RUNNER_LABEL"
+      ;;
+  esac
+fi
+if [[ -n "$SIGNING_KEYCHAIN" && -n "$SIGNING_P12_PATH" ]]; then
+  die "--signing-keychain and --signing-p12-path are mutually exclusive"
+fi
+if [[ -n "$SIGNING_P12_PASSWORD_FILE" && -z "$SIGNING_P12_PATH" ]]; then
+  die "--signing-p12-password-file requires --signing-p12-path"
+fi
+
+if [[ "$SKIP_SECRET_CHECK" == "1" ]]; then
+  log "Ignoring --skip-secret-check; testing-mode profiles are resolved locally on $RUNNER_LABEL"
+fi
+
+print_dry_run() {
+  local package_run_id="$PACKAGE_RUN_ID"
+
+  cat <<EOF
+# Preflight: require an online macOS self-hosted runner in $REPO with label $RUNNER_LABEL
+gh api --paginate "repos/$REPO/actions/runners" --jq '.runners[]? | [.name, .os, .status, (.labels | map(.name) | join(","))] | @tsv'
+EOF
+
+  if [[ -z "$package_run_id" ]]; then
+    package_run_id="<testing-mode-package-run-id>"
+
+    cat <<EOF
+gh release view "$TAG" --repo "$REPO" --json isDraft,assets --jq '. as \$release | select(\$release.isDraft == false) | .assets[].name' | grep -Fx "tcfs-${TAG#v}-macos-aarch64.tar.gz"
+EOF
+    if [[ -n "$SIGNING_P12_PATH" ]]; then
+      cat <<EOF
+gh workflow run "$PACKAGE_WORKFLOW" --repo "$REPO" --ref "$REF" \\
+  -f tag="$TAG" \\
+  -f runner_label="$RUNNER_LABEL" \\
+  -f signing_p12_path="$SIGNING_P12_PATH"$(if [[ -n "$SIGNING_P12_PASSWORD_FILE" ]]; then printf ' \\\n  -f signing_p12_password_file="%s"' "$SIGNING_P12_PASSWORD_FILE"; fi)$(if [[ -n "$PROFILES_DIR" ]]; then printf ' \\\n  -f profiles_dir="%s"' "$PROFILES_DIR"; fi)
+EOF
+    elif [[ -n "$SIGNING_KEYCHAIN" ]]; then
+      cat <<EOF
+gh workflow run "$PACKAGE_WORKFLOW" --repo "$REPO" --ref "$REF" \\
+  -f tag="$TAG" \\
+  -f runner_label="$RUNNER_LABEL" \\
+  -f signing_keychain="$SIGNING_KEYCHAIN"$(if [[ -n "$PROFILES_DIR" ]]; then printf ' \\\n  -f profiles_dir="%s"' "$PROFILES_DIR"; fi)
+EOF
+    else
+      cat <<EOF
+gh workflow run "$PACKAGE_WORKFLOW" --repo "$REPO" --ref "$REF" \\
+  -f tag="$TAG" \\
+  -f runner_label="$RUNNER_LABEL"$(if [[ -n "$PROFILES_DIR" ]]; then printf ' \\\n  -f profiles_dir="%s"' "$PROFILES_DIR"; fi)
+EOF
+    fi
+
+    if [[ "$WATCH" != "1" ]]; then
+      cat <<EOF
+# Package run dispatched. After it succeeds, rerun with --package-run-id $package_run_id
+EOF
+      return 0
+    fi
+
+    cat <<EOF
+gh run watch "$package_run_id" --repo "$REPO" --exit-status
+EOF
+  fi
+
+  cat <<EOF
+gh api "repos/$REPO/actions/runs/$package_run_id/artifacts" --jq '.artifacts[] | select(.expired == false) | .name' | grep -Fx "$ARTIFACT_NAME"
+gh workflow run "$SMOKE_WORKFLOW" --repo "$REPO" --ref "$REF" \\
+  -f tag="$TAG" \\
+  -f package_artifact_run_id="$package_run_id" \\
+  -f package_artifact_name="$ARTIFACT_NAME" \\
+  -f fileprovider_testing_mode=true \\
+  -f runner_label="$RUNNER_LABEL"$(if [[ "$EXERCISE_CONFLICT_STATUS" == "1" ]]; then printf ' \\\n  -f exercise_conflict_status=true'; fi)$(if [[ "$LAB_GATEKEEPER_OVERRIDE" == "1" ]]; then printf ' \\\n  -f lab_gatekeeper_override=true'; fi)
+EOF
+
+  if [[ "$WATCH" != "1" ]]; then
+    cat <<EOF
+# Post-install smoke dispatched. Watch with: gh run watch "<postinstall-smoke-run-id>" --repo "$REPO" --exit-status
+EOF
+    return 0
+  fi
+
+  cat <<EOF
+gh run watch "<postinstall-smoke-run-id>" --repo "$REPO" --exit-status
+EOF
+}
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  print_dry_run
+  exit 0
+fi
+
+command -v gh >/dev/null 2>&1 || die "gh is required"
+
+gh workflow view "$PACKAGE_WORKFLOW" --repo "$REPO" >/dev/null
+gh workflow view "$SMOKE_WORKFLOW" --repo "$REPO" >/dev/null
+
+verify_release_cli_asset() {
+  local version="${TAG#v}"
+  local asset="tcfs-${version}-macos-aarch64.tar.gz"
+
+  # shellcheck disable=SC2016 # Keep the jq expression literal.
+  if ! gh release view "$TAG" \
+    --repo "$REPO" \
+    --json isDraft,assets \
+    --jq '. as $release | select($release.isDraft == false) | .assets[].name' \
+    | grep -Fxq "$asset"; then
+    die "release $TAG does not expose required asset $asset"
+  fi
+}
+
+label_list_contains() {
+  local labels="$1"
+  local wanted="$2"
+  local label
+  local -a label_array
+
+  IFS=',' read -r -a label_array <<< "$labels"
+  for label in "${label_array[@]}"; do
+    if [[ "$label" == "$wanted" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+verify_lab_runner_available() {
+  if [[ "$SKIP_RUNNER_CHECK" == "1" ]]; then
+    log "Skipping runner visibility check for $RUNNER_LABEL"
+    return 0
+  fi
+
+  local rows
+  if ! rows="$(gh api --paginate "repos/$REPO/actions/runners" \
+    --jq '.runners[]? | [.name, .os, .status, (.labels | map(.name) | join(","))] | @tsv')"; then
+    die "could not list self-hosted runners for $REPO; rerun with --skip-runner-check only if you intentionally want GitHub to queue the job"
+  fi
+
+  local saw_runner=0
+  local saw_label=0
+  local saw_macos=0
+  local runner_name
+  local runner_os
+  local runner_status
+  local runner_labels
+  local candidates=()
+
+  while IFS=$'\t' read -r runner_name runner_os runner_status runner_labels; do
+    if [[ -z "$runner_name" ]]; then
+      continue
+    fi
+
+    saw_runner=1
+
+    if ! label_list_contains "$runner_labels" "$RUNNER_LABEL"; then
+      continue
+    fi
+
+    saw_label=1
+    candidates+=("$runner_name os=$runner_os status=$runner_status labels=$runner_labels")
+
+    case "$runner_os" in
+      macos | macOS) ;;
+      *) continue ;;
+    esac
+
+    saw_macos=1
+
+    if [[ "$runner_status" != "online" ]]; then
+      continue
+    fi
+
+    log "Found online macOS runner $runner_name with label $RUNNER_LABEL"
+    return 0
+  done <<< "$rows"
+
+  if [[ "$saw_runner" == "0" ]]; then
+    die "GitHub sees no self-hosted runners for $REPO. Enroll petting-zoo-mini as a repository runner with label $RUNNER_LABEL before dispatching."
+  fi
+
+  if [[ "$saw_label" == "0" ]]; then
+    die "GitHub sees self-hosted runners for $REPO, but none has label $RUNNER_LABEL"
+  fi
+
+  printf 'Candidates with label %s:\n' "$RUNNER_LABEL" >&2
+  printf '  %s\n' "${candidates[@]}" >&2
+
+  if [[ "$saw_macos" == "0" ]]; then
+    die "runner label $RUNNER_LABEL exists, but not on a macOS runner"
+  fi
+
+  die "runner label $RUNNER_LABEL exists on macOS, but no matching runner is online"
+}
+
+latest_dispatch_run_id() {
+  local workflow="$1"
+  local created_after="$2"
+
+  gh run list \
+    --repo "$REPO" \
+    --workflow "$workflow" \
+    --event workflow_dispatch \
+    --branch "$REF" \
+    --created ">=$created_after" \
+    --limit 1 \
+    --json databaseId \
+    --jq '.[0].databaseId // empty'
+}
+
+pause_between_run_id_polls() {
+  if [[ "$RUN_ID_POLL_SECONDS" == "0" ]]; then
+    return 0
+  fi
+
+  sleep "$RUN_ID_POLL_SECONDS" &
+  wait "$!"
+}
+
+wait_for_dispatch_run_id() {
+  local workflow="$1"
+  local created_after="$2"
+  local attempt
+  local run_id
+
+  for ((attempt = 1; attempt <= RUN_ID_POLL_ATTEMPTS; attempt += 1)); do
+    run_id="$(latest_dispatch_run_id "$workflow" "$created_after")"
+    if [[ -n "$run_id" ]]; then
+      printf '%s\n' "$run_id"
+      return 0
+    fi
+
+    if (( attempt < RUN_ID_POLL_ATTEMPTS )); then
+      log "Waiting for $workflow run to appear ($attempt/$RUN_ID_POLL_ATTEMPTS)"
+      pause_between_run_id_polls
+    fi
+  done
+
+  return 1
+}
+
+verify_package_artifact() {
+  local run_id="$1"
+
+  if ! gh api "repos/$REPO/actions/runs/$run_id/artifacts" \
+    --jq '.artifacts[] | select(.expired == false) | .name' \
+    | grep -Fxq "$ARTIFACT_NAME"; then
+    die "run $run_id does not expose a non-expired $ARTIFACT_NAME artifact"
+  fi
+}
+
+dispatch_and_capture_run_id() {
+  local workflow="$1"
+  shift
+
+  local created_after
+  created_after="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  log "Dispatching $workflow on $REF for $TAG"
+  if ! gh workflow run "$workflow" --repo "$REPO" --ref "$REF" "$@" >&2; then
+    die "failed to dispatch $workflow"
+  fi
+
+  local run_id
+  if ! run_id="$(wait_for_dispatch_run_id "$workflow" "$created_after")"; then
+    die "dispatched $workflow but could not locate its run id after $RUN_ID_POLL_ATTEMPTS attempts; inspect with gh run list --repo $REPO --workflow $workflow --event workflow_dispatch"
+  fi
+
+  printf '%s\n' "$run_id"
+}
+
+verify_lab_runner_available
+
+if [[ -z "$PACKAGE_RUN_ID" ]]; then
+  verify_release_cli_asset
+  package_inputs=(
+    -f tag="$TAG"
+    -f runner_label="$RUNNER_LABEL"
+  )
+  if [[ -n "$SIGNING_KEYCHAIN" ]]; then
+    package_inputs+=(-f signing_keychain="$SIGNING_KEYCHAIN")
+  fi
+  if [[ -n "$SIGNING_P12_PATH" ]]; then
+    package_inputs+=(-f signing_p12_path="$SIGNING_P12_PATH")
+  fi
+  if [[ -n "$SIGNING_P12_PASSWORD_FILE" ]]; then
+    package_inputs+=(-f signing_p12_password_file="$SIGNING_P12_PASSWORD_FILE")
+  fi
+  if [[ -n "$PROFILES_DIR" ]]; then
+    package_inputs+=(-f profiles_dir="$PROFILES_DIR")
+  fi
+  PACKAGE_RUN_ID="$(dispatch_and_capture_run_id \
+    "$PACKAGE_WORKFLOW" \
+    "${package_inputs[@]}")"
+  log "Testing-mode package run: $PACKAGE_RUN_ID"
+
+  if [[ "$WATCH" == "1" ]]; then
+    gh run watch "$PACKAGE_RUN_ID" --repo "$REPO" --exit-status
+  else
+    log "Package run dispatched. After it succeeds, rerun with --package-run-id $PACKAGE_RUN_ID"
+    exit 0
+  fi
+else
+  log "Using existing testing-mode package run: $PACKAGE_RUN_ID"
+fi
+
+verify_package_artifact "$PACKAGE_RUN_ID"
+
+smoke_inputs=(
+  -f tag="$TAG" \
+  -f package_artifact_run_id="$PACKAGE_RUN_ID" \
+  -f package_artifact_name="$ARTIFACT_NAME" \
+  -f fileprovider_testing_mode=true \
+  -f runner_label="$RUNNER_LABEL"
+)
+if [[ "$EXERCISE_CONFLICT_STATUS" == "1" ]]; then
+  smoke_inputs+=(-f exercise_conflict_status=true)
+fi
+if [[ "$LAB_GATEKEEPER_OVERRIDE" == "1" ]]; then
+  smoke_inputs+=(-f lab_gatekeeper_override=true)
+fi
+
+SMOKE_RUN_ID="$(dispatch_and_capture_run_id \
+  "$SMOKE_WORKFLOW" \
+  "${smoke_inputs[@]}")"
+log "Post-install smoke run: $SMOKE_RUN_ID"
+
+if [[ "$WATCH" == "1" ]]; then
+  gh run watch "$SMOKE_RUN_ID" --repo "$REPO" --exit-status
+else
+  log "Post-install smoke dispatched. Watch with: gh run watch $SMOKE_RUN_ID --repo $REPO --exit-status"
+fi

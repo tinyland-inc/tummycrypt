@@ -196,6 +196,14 @@ fn fetch_null_item_id_returns_invalid_arg() {
     }
 }
 
+#[test]
+fn provider_last_error_null_provider_returns_null() {
+    unsafe {
+        let err = tcfs_provider_last_error(ptr::null_mut());
+        assert!(err.is_null());
+    }
+}
+
 // ── tcfs_provider_upload null safety ─────────────────────────────────────
 
 #[test]
@@ -215,6 +223,17 @@ fn delete_null_provider_returns_invalid_arg() {
     let item = CString::new("test").unwrap();
     unsafe {
         let err = tcfs_provider_delete(ptr::null_mut(), item.as_ptr());
+        assert!(matches!(err, TcfsError::TcfsErrorInvalidArg));
+    }
+}
+
+// ── tcfs_provider_unsync null safety ─────────────────────────────────────
+
+#[test]
+fn unsync_null_provider_returns_invalid_arg() {
+    let item = CString::new("test").unwrap();
+    unsafe {
+        let err = tcfs_provider_unsync(ptr::null_mut(), item.as_ptr());
         assert!(matches!(err, TcfsError::TcfsErrorInvalidArg));
     }
 }
@@ -269,6 +288,16 @@ fn enumerate_changes_valid_out_returns_empty() {
             err,
             TcfsError::TcfsErrorNone | TcfsError::TcfsErrorInvalidArg
         ));
+    }
+}
+
+// ── tcfs_provider_start_watch null safety ─────────────────────────────────
+
+#[test]
+fn start_watch_null_provider_returns_invalid_arg() {
+    unsafe {
+        let err = tcfs_provider_start_watch(ptr::null_mut(), None, ptr::null());
+        assert!(matches!(err, TcfsError::TcfsErrorInvalidArg));
     }
 }
 

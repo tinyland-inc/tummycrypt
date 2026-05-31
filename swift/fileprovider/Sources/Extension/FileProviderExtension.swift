@@ -4,12 +4,14 @@ import Security
 import os.log
 
 private let logger = Logger(subsystem: "io.tinyland.tcfs.fileprovider", category: "extension")
+private let sharedConfigService = "io.tinyland.tcfs.config"
+private let sharedConfigAccount = "configJSON"
+private let sharedConfigAccessGroupFallback = "group.io.tinyland.tcfs"
 
 /// TCFS FileProvider extension — bridges to Rust via cbindgen C FFI.
 ///
 /// Implements NSFileProviderReplicatedExtension for on-demand hydration
 /// of files stored in SeaweedFS S3 via the tcfs-file-provider Rust crate.
-@objc(TCFSFileProviderExtension)
 class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
     let domain: NSFileProviderDomain
@@ -173,7 +175,11 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 self.signalEnumeratorUpdate(for: parentId)
                 completionHandler(tempFile, item, nil)
             } else {
-                completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
+                let backendError = Self.providerLastError(prov)
+                logger.error(
+                    "fetchContents failed for \(itemId, privacy: .public): code=\(result.rawValue), backend=\(backendError, privacy: .public)"
+                )
+                completionHandler(nil, nil, Self.mapError(result))
             }
         }
 
@@ -234,6 +240,13 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         return NSFileProviderItemIdentifier(parentPath)
     }
 
+    private static func logicalParentPath(_ identifier: NSFileProviderItemIdentifier) -> String {
+        if identifier == .rootContainer {
+            return ""
+        }
+        return identifier.rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
     // MARK: - Write operations
 
     func createItem(
@@ -252,8 +265,7 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let parentPath = itemTemplate.parentItemIdentifier == .rootContainer
-                ? "" : itemTemplate.parentItemIdentifier.rawValue
+            let parentPath = Self.logicalParentPath(itemTemplate.parentItemIdentifier)
             let filename = itemTemplate.filename
 
             if itemTemplate.contentType == .folder {
@@ -265,7 +277,7 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 }
 
                 if result == TCFS_ERROR_TCFS_ERROR_NONE {
-                    let dirPath = parentPath.isEmpty ? filename : "\(parentPath)/\(filename)"
+                    let dirPath = parentPath.isEmpty ? "\(filename)/" : "\(parentPath)/\(filename)/"
                     let item = TCFSFileProviderItem(
                         identifier: NSFileProviderItemIdentifier(dirPath),
                         parentIdentifier: itemTemplate.parentItemIdentifier,
@@ -335,6 +347,96 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
+            if changedFields.contains(.filename) {
+                let oldPath = item.itemIdentifier.rawValue
+                let parentPath = Self.logicalParentPath(item.parentItemIdentifier)
+                let newRemotePath = parentPath.isEmpty ? item.filename : "\(parentPath)/\(item.filename)"
+
+                if oldPath == newRemotePath {
+                    progress.completedUnitCount = 100
+                    completionHandler(item, [], false, nil)
+                    return
+                }
+
+                if item.contentType == .folder {
+                    logger.error("rename unsupported for directory \(oldPath, privacy: .public)")
+                    progress.completedUnitCount = 100
+                    completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+                    return
+                }
+
+                var sourceURL: URL
+                var tempURL: URL?
+                var accessedSecurityScope = false
+
+                if changedFields.contains(.contents), let contentsURL = newContents {
+                    sourceURL = contentsURL
+                    accessedSecurityScope = contentsURL.startAccessingSecurityScopedResource()
+                } else {
+                    let fetchedURL = FileManager.default.temporaryDirectory
+                        .appendingPathComponent(UUID().uuidString)
+                    let fetchResult = oldPath.withCString { oldPtr in
+                        fetchedURL.path.withCString { destPtr in
+                            tcfs_provider_fetch(prov, oldPtr, destPtr)
+                        }
+                    }
+                    if fetchResult != TCFS_ERROR_TCFS_ERROR_NONE {
+                        progress.completedUnitCount = 100
+                        completionHandler(nil, [], false, Self.mapError(fetchResult))
+                        return
+                    }
+                    sourceURL = fetchedURL
+                    tempURL = fetchedURL
+                }
+
+                defer {
+                    if accessedSecurityScope {
+                        sourceURL.stopAccessingSecurityScopedResource()
+                    }
+                    if let tempURL {
+                        try? FileManager.default.removeItem(at: tempURL)
+                    }
+                }
+
+                let uploadResult = sourceURL.path.withCString { localPtr in
+                    newRemotePath.withCString { remotePtr in
+                        tcfs_provider_upload(prov, localPtr, remotePtr)
+                    }
+                }
+                if uploadResult != TCFS_ERROR_TCFS_ERROR_NONE {
+                    progress.completedUnitCount = 100
+                    completionHandler(nil, [], false, Self.mapError(uploadResult))
+                    return
+                }
+
+                let deleteResult = oldPath.withCString { oldPtr in
+                    tcfs_provider_delete(prov, oldPtr)
+                }
+                if deleteResult != TCFS_ERROR_TCFS_ERROR_NONE {
+                    logger.error(
+                        "rename copied \(oldPath, privacy: .public) to \(newRemotePath, privacy: .public), but old path delete failed: \(deleteResult.rawValue)"
+                    )
+                    progress.completedUnitCount = 100
+                    completionHandler(nil, [], false, Self.mapError(deleteResult))
+                    return
+                }
+
+                let fileSize = (try? FileManager.default.attributesOfItem(atPath: sourceURL.path)[.size] as? UInt64) ?? 0
+                let renamedItem = TCFSFileProviderItem(
+                    identifier: NSFileProviderItemIdentifier(newRemotePath),
+                    parentIdentifier: item.parentItemIdentifier,
+                    filename: item.filename,
+                    isDirectory: false,
+                    fileSize: fileSize,
+                    downloaded: true,
+                    uploaded: true
+                )
+                progress.completedUnitCount = 100
+                self.signalEnumeratorUpdate(for: item.parentItemIdentifier)
+                completionHandler(renamedItem, [], false, nil)
+                return
+            }
+
             // Handle content modification (re-upload)
             if changedFields.contains(.contents), let contentsURL = newContents {
                 let accessed = contentsURL.startAccessingSecurityScopedResource()
@@ -365,33 +467,6 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                     progress.completedUnitCount = 100
                     completionHandler(nil, [], false, Self.mapError(result))
                 }
-            } else if changedFields.contains(.filename) {
-                // Rename: delete old index entry, re-upload to new path
-                let oldPath = item.itemIdentifier.rawValue
-                let parentPath = item.parentItemIdentifier == .rootContainer
-                    ? "" : item.parentItemIdentifier.rawValue
-                let newRemotePath = parentPath.isEmpty ? item.filename : "\(parentPath)/\(item.filename)"
-
-                // Delete old entry
-                let deleteResult = oldPath.withCString { idPtr in
-                    tcfs_provider_delete(prov, idPtr)
-                }
-                if deleteResult != TCFS_ERROR_TCFS_ERROR_NONE {
-                    progress.completedUnitCount = 100
-                    completionHandler(nil, [], false, Self.mapError(deleteResult))
-                    return
-                }
-
-                let renamedItem = TCFSFileProviderItem(
-                    identifier: NSFileProviderItemIdentifier(newRemotePath),
-                    parentIdentifier: item.parentItemIdentifier,
-                    filename: item.filename,
-                    isDirectory: item.contentType == .folder,
-                    fileSize: (item.documentSize as? UInt64) ?? 0
-                )
-                progress.completedUnitCount = 100
-                self.signalEnumeratorUpdate(for: item.parentItemIdentifier)
-                completionHandler(renamedItem, [], false, nil)
             } else {
                 // No content or filename change — return item as-is
                 progress.completedUnitCount = 100
@@ -459,6 +534,14 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         }
     }
 
+    private static func providerLastError(_ prov: OpaquePointer) -> String {
+        guard let errorPtr = tcfs_provider_last_error(prov) else {
+            return "<none>"
+        }
+        defer { tcfs_string_free(errorPtr) }
+        return String(cString: errorPtr)
+    }
+
     // MARK: - Provider setup
 
     private static func createProvider() -> OpaquePointer? {
@@ -483,6 +566,7 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     /// Load TCFS config, trying multiple sources in order of safety.
     ///
     /// Sources (in priority order):
+    /// 0. Diagnostic build-time embedded config, when explicitly enabled
     /// 1. Shared Keychain — provisioned by host app, accessed via securityd XPC
     /// 2. XDG config path — requires sandbox temp-exception entitlement
     /// 3. App Group container file — deadlock-prone, short timeout
@@ -492,8 +576,8 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     /// suite stores data in the Group Container, which is file-coordinated
     /// by fileproviderd — reading it during enumeration deadlocks.
     private static func loadConfig() -> String? {
-        // 0. Build-time embedded config (most reliable — no IPC needed).
-        //    build.sh bakes config.json into the binary as base64.
+        // 0. Diagnostic build-time embedded config. Production signing disables
+        //    this by default so Keychain/App Group provisioning is exercised.
         if let b64 = embeddedConfigBase64,
            let data = Data(base64Encoded: b64),
            let config = String(data: data, encoding: .utf8),
@@ -506,7 +590,7 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         // 1. Shared Keychain — provisioned by the host app.
         //    Uses securityd XPC, no file I/O, no file coordination, no deadlock.
         if let config = readConfigFromKeychain() {
-            logger.info("loadConfig: loaded from shared Keychain")
+            logger.error("loadConfig: loaded from shared Keychain")
             return config
         }
         logger.warning("loadConfig: Keychain empty, trying XDG path")
@@ -528,34 +612,49 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             let configPath = containerURL.appendingPathComponent("config.json")
 
             var result: String?
+            var readError: String?
             let sem = DispatchSemaphore(value: 0)
             DispatchQueue.global(qos: .utility).async {
-                result = try? String(contentsOf: configPath, encoding: .utf8)
+                do {
+                    result = try String(contentsOf: configPath, encoding: .utf8)
+                } catch {
+                    readError = error.localizedDescription
+                }
                 sem.signal()
             }
             if sem.wait(timeout: .now() + 3.0) == .success, let config = result {
                 logger.info("loadConfig: loaded from App Group container file")
                 return config
             }
-            logger.warning("loadConfig: App Group container file read timed out or failed")
+            if let readError = readError {
+                logger.warning(
+                    "loadConfig: App Group container file read failed at \(configPath.path, privacy: .public): \(readError, privacy: .public)"
+                )
+            } else {
+                logger.warning(
+                    "loadConfig: App Group container file read timed out at \(configPath.path, privacy: .public)"
+                )
+            }
         }
 
         logger.error("loadConfig: no config found at any location")
         return nil
     }
 
-    /// Read config JSON from the macOS login keychain.
+    /// Read config JSON from the shared macOS keychain.
     /// Keychain access uses securityd XPC — no filesystem I/O, immune to
     /// fileproviderd's file coordination locks.
     ///
-    /// Uses the legacy macOS keychain (NOT data protection keychain) to avoid
-    /// restricted entitlement requirements. Both host app and extension are
-    /// signed with the same Developer ID, so they share keychain access.
+    /// The host app writes this item with an explicit app-group access group so
+    /// the extension can read it without depending on each target's bundle ID.
     private static func readConfigFromKeychain() -> String? {
+        let accessGroup = resolvedSharedConfigAccessGroup()
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "io.tinyland.tcfs.config",
-            kSecAttrAccount as String: "configJSON",
+            kSecAttrAccessGroup as String: accessGroup,
+            kSecAttrService as String: sharedConfigService,
+            kSecAttrAccount as String: sharedConfigAccount,
+            kSecUseDataProtectionKeychain as String: kCFBooleanTrue as Any,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
@@ -574,6 +673,34 @@ class TCFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             return nil
         }
         return config
+    }
+
+    private static func resolvedSharedConfigAccessGroup() -> String {
+        guard let task = SecTaskCreateFromSelf(nil),
+              let value = SecTaskCopyValueForEntitlement(
+                  task,
+                  "keychain-access-groups" as CFString,
+                  nil
+              )
+        else {
+            return sharedConfigAccessGroupFallback
+        }
+
+        if let groups = value as? [String],
+           let group = groups.first(where: isSharedConfigAccessGroup) {
+            return group
+        }
+
+        if let group = value as? String, isSharedConfigAccessGroup(group) {
+            return group
+        }
+
+        return sharedConfigAccessGroupFallback
+    }
+
+    private static func isSharedConfigAccessGroup(_ group: String) -> Bool {
+        group == sharedConfigAccessGroupFallback ||
+            group.hasSuffix(".\(sharedConfigAccessGroupFallback)")
     }
 }
 
@@ -598,10 +725,10 @@ extension TCFSFileProviderExtension: NSFileProviderCustomAction {
 
                 switch actionIdentifier.rawValue {
                 case "io.tinyland.tcfs.action.unsync":
-                    // Dehydrate: call daemon's Unsync/Delete RPC to free disk space
+                    // Dehydrate without deleting remote storage.
                     logger.info("action.unsync: \(itemPath)")
                     let result = itemPath.withCString { pathPtr in
-                        tcfs_provider_delete(prov, pathPtr)
+                        tcfs_provider_unsync(prov, pathPtr)
                     }
                     if result != TCFS_ERROR_TCFS_ERROR_NONE {
                         logger.error("action.unsync failed for \(itemPath): \(result.rawValue)")
@@ -618,7 +745,10 @@ extension TCFSFileProviderExtension: NSFileProviderCustomAction {
                         }
                     }
                     if result != TCFS_ERROR_TCFS_ERROR_NONE {
-                        logger.error("action.pin failed for \(itemPath): \(result.rawValue)")
+                        let backendError = Self.providerLastError(prov)
+                        logger.error(
+                            "action.pin failed for \(itemPath, privacy: .public): code=\(result.rawValue), backend=\(backendError, privacy: .public)"
+                        )
                     }
                     // Clean up temp file — the system manages the real materialized copy
                     try? FileManager.default.removeItem(at: dest)

@@ -1,6 +1,9 @@
 //! Concrete `VirtualFilesystem` implementation for tcfs.
 //!
-//! Maps a SeaweedFS prefix to a virtual directory tree with `.tc` stub files.
+//! Maps a SeaweedFS prefix to a virtual directory tree with user-facing names.
+//! Physical `.tc`/`.tcf` stub paths are still supported as a legacy lookup
+//! fallback for offline/dehydrated sync-root paths, but exact remote filenames
+//! always win so a real project file ending in `.tc` stays addressable as such.
 //! This is the core filesystem logic, decoupled from any specific mount
 //! protocol (FUSE, NFS, FileProvider).
 //!
@@ -13,15 +16,15 @@
 //!
 //! Virtual tree:
 //!   /src/
-//!     main.rs.tc   (0-byte stub shown as real size from index)
-//!   /README.md.tc
+//!     main.rs      (remote-backed, hydrated on open)
+//!   /README.md     (remote-backed, hydrated on open)
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -30,6 +33,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
 use tcfs_sync::conflict::VectorClock;
+use tcfs_sync::index_entry::{write_committed_index_entry, RemoteEntryKind, RemoteIndexEntry};
 use tcfs_sync::manifest::SyncManifest;
 
 use crate::cache::DiskCache;
@@ -50,9 +54,16 @@ const DIR_MARKER: &str = ".tcfs_dir";
 /// Content stored in directory marker index entries.
 const DIR_MARKER_CONTENT: &[u8] = b"type=directory\n";
 
+/// Positive directory hints learned from `readdir`.
+///
+/// S3-compatible backends often return prefix entries that are directories, not
+/// readable index objects. A short hint lets the following FUSE `lookup`/`stat`
+/// answer as a directory without first attempting a noisy missing object read.
+const DIR_HINT_TTL: Duration = Duration::from_secs(2);
+
 /// An open file handle — holds content in memory, tracks write state.
 struct FileHandle {
-    /// Virtual path (e.g., "/src/main.rs.tc")
+    /// Virtual path (e.g., "/src/main.rs")
     path: String,
     /// File content in memory (hydrated on open, modified on write)
     data: Vec<u8>,
@@ -72,7 +83,7 @@ pub struct UnsyncResult {
     pub path: String,
     /// Bytes freed from disk cache.
     pub bytes_freed: u64,
-    /// Whether the file was actually cached (false = already a stub).
+    /// Whether the file was actually cached (false = already dehydrated).
     pub was_cached: bool,
 }
 
@@ -105,6 +116,8 @@ pub struct TcfsVfs {
     master_key: Arc<tokio::sync::Mutex<Option<tcfs_crypto::MasterKey>>>,
     /// If true, unlink moves index entries to .tcfs-trash/ instead of deleting.
     trash_enabled: bool,
+    /// Recently observed remote directories from list results.
+    known_dirs: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl TcfsVfs {
@@ -142,6 +155,7 @@ impl TcfsVfs {
             vclocks: Arc::new(Mutex::new(HashMap::new())),
             master_key: Arc::new(tokio::sync::Mutex::new(None)),
             trash_enabled: false,
+            known_dirs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -194,8 +208,8 @@ impl TcfsVfs {
 
     /// Unsync (dehydrate) a file: evict it from the disk cache.
     ///
-    /// After this the file appears as a stub in the VFS and will be
-    /// re-hydrated on-demand when next accessed.
+    /// After this the VFS keeps listing the clean path, but its cached content
+    /// is gone and will be re-hydrated on demand when next accessed.
     pub async fn unsync_path(&self, vpath: &str) -> Result<UnsyncResult> {
         let clean = vpath.trim_start_matches('/');
         let index_key = if self.prefix.is_empty() {
@@ -211,15 +225,10 @@ impl TcfsVfs {
             .await
             .with_context(|| format!("unsync: reading index for {vpath}"))?;
         let idx_raw = idx_bytes.to_bytes();
-        let idx_str = String::from_utf8_lossy(&idx_raw);
-
-        // Parse manifest_hash from index entry
-        // Format: "manifest_hash=HASH\nsize=...\nchunks=..."
-        let manifest_hash = idx_str
-            .lines()
-            .find_map(|line| line.strip_prefix("manifest_hash="))
-            .context("unsync: no manifest_hash in index entry")?
-            .to_string();
+        let idx_str = std::str::from_utf8(&idx_raw).context("unsync: index entry is not UTF-8")?;
+        let manifest_hash = IndexEntry::parse(idx_str)
+            .context("unsync: parsing index entry")?
+            .manifest_hash;
 
         // Evict from disk cache
         let bytes_freed = self.disk_cache.evict(&manifest_hash).await?;
@@ -339,6 +348,7 @@ impl TcfsVfs {
             rel_path: Some(vpath.to_string()),
             mode: None,
             encrypted_file_key,
+            wrapped_file_keys: Vec::new(),
         };
         let manifest_key = format!("{}/manifests/{}", prefix, file_hash);
         self.op
@@ -358,14 +368,9 @@ impl TcfsVfs {
         let index_key = self
             .index_key_for(vpath)
             .context("cannot compute index key")?;
-        let index_content = format!(
-            "manifest_hash={}\nsize={}\nchunks={}\n",
-            file_hash,
-            data.len(),
-            chunk_hashes.len()
-        );
-        self.op
-            .write(&index_key, index_content.into_bytes())
+        let index_entry =
+            RemoteIndexEntry::new(file_hash.clone(), data.len() as u64, chunk_hashes.len());
+        write_committed_index_entry(&self.op, &index_key, &index_entry)
             .await
             .context("writing index entry")?;
 
@@ -394,24 +399,37 @@ impl TcfsVfs {
         Ok(())
     }
 
-    /// Build the index path for a virtual FS path.
-    ///
-    /// `/src/main.rs.tc` -> `{prefix}/index/src/main.rs`
-    fn index_key_for(&self, vpath: &str) -> Option<String> {
-        let rel = vpath.trim_start_matches('/');
+    fn index_key_for_rel(&self, rel: &str) -> Option<String> {
         if rel.is_empty() {
             return None;
         }
-        let real = rel
-            .strip_suffix(".tc")
-            .or_else(|| rel.strip_suffix(".tcf"))
-            .unwrap_or(rel);
         let prefix = self.prefix.trim_end_matches('/');
         if prefix.is_empty() {
-            Some(format!("index/{}", real))
+            Some(format!("index/{}", rel))
         } else {
-            Some(format!("{}/index/{}", prefix, real))
+            Some(format!("{}/index/{}", prefix, rel))
         }
+    }
+
+    /// Build the exact index path for a virtual FS path.
+    ///
+    /// `/src/main.rs` -> `{prefix}/index/src/main.rs`
+    /// `/tests/fail.tc` -> `{prefix}/index/tests/fail.tc`
+    fn index_key_for(&self, vpath: &str) -> Option<String> {
+        self.index_key_for_rel(vpath.trim_start_matches('/'))
+    }
+
+    /// Build the clean-path compatibility key for a physical stub path.
+    ///
+    /// `/src/main.rs.tc` -> `{prefix}/index/src/main.rs`.
+    /// This is only a fallback after the exact `.tc` key was absent, because
+    /// real source trees can legitimately contain files ending in `.tc`.
+    fn legacy_stub_index_key_for(&self, vpath: &str) -> Option<String> {
+        let rel = vpath.trim_start_matches('/');
+        let real = rel
+            .strip_suffix(".tc")
+            .or_else(|| rel.strip_suffix(".tcf"))?;
+        self.index_key_for_rel(real)
     }
 
     /// The index prefix for directory listing: `{prefix}/index/{rel_dir}/`
@@ -461,14 +479,12 @@ impl TcfsVfs {
             .collect()
     }
 
-    /// Fetch and parse an IndexEntry for a virtual path.
-    async fn get_index_entry(&self, vpath: &str) -> Option<IndexEntry> {
-        let key = self.index_key_for(vpath)?;
+    async fn get_index_entry_at_key(&self, vpath: &str, key: String) -> Option<IndexEntry> {
         debug!(vpath = %vpath, key = %key, "get_index_entry: reading S3 key");
         let data = match self.op.read(&key).await {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(vpath = %vpath, key = %key, error = %e, "get_index_entry: S3 read failed");
+                debug!(vpath = %vpath, key = %key, error = %e, "get_index_entry: index key not present");
                 return None;
             }
         };
@@ -483,20 +499,42 @@ impl TcfsVfs {
         match IndexEntry::parse(&text) {
             Ok(entry) => Some(entry),
             Err(e) => {
-                tracing::warn!(vpath = %vpath, key = %key, error = %e, text = %text, "get_index_entry: parse failed");
+                if text.trim().is_empty() {
+                    debug!(vpath = %vpath, key = %key, "get_index_entry: empty index object treated as non-file entry");
+                } else {
+                    tracing::warn!(vpath = %vpath, key = %key, error = %e, text_len = text.len(), "get_index_entry: parse failed");
+                }
                 None
             }
         }
     }
 
-    /// Fetch the real file size from an index entry by its S3 key.
-    async fn read_index_entry_size(&self, index_key: &str) -> u64 {
+    /// Fetch and parse an IndexEntry for a virtual path using its exact key.
+    async fn get_index_entry(&self, vpath: &str) -> Option<IndexEntry> {
+        let key = self.index_key_for(vpath)?;
+        self.get_index_entry_at_key(vpath, key).await
+    }
+
+    /// Fetch an IndexEntry using exact lookup first, then legacy stub fallback.
+    async fn get_index_entry_with_legacy_stub_fallback(&self, vpath: &str) -> Option<IndexEntry> {
+        if let Some(entry) = self.get_index_entry(vpath).await {
+            return Some(entry);
+        }
+
+        let key = self.legacy_stub_index_key_for(vpath)?;
+        self.get_index_entry_at_key(vpath, key).await
+    }
+
+    /// Fetch attributes from an index entry by its S3 key.
+    async fn read_index_entry_attr(&self, index_key: &str) -> Option<VfsAttr> {
         match self.op.read(index_key).await {
             Ok(data) => {
                 let text = String::from_utf8(data.to_bytes().to_vec()).unwrap_or_default();
-                IndexEntry::parse(&text).map(|e| e.size).unwrap_or(0)
+                IndexEntry::parse(&text)
+                    .ok()
+                    .map(|entry| self.attr_for_index_entry(&entry))
             }
-            Err(_) => 0,
+            Err(_) => None,
         }
     }
 
@@ -505,9 +543,55 @@ impl TcfsVfs {
         VfsAttr::file(size, self.uid, self.gid, self.mount_time)
     }
 
+    /// Synthesize symlink attributes.
+    fn symlink_attr(&self, size: u64) -> VfsAttr {
+        VfsAttr::symlink(size, self.uid, self.gid, self.mount_time)
+    }
+
     /// Synthesize directory attributes.
     fn dir_attr(&self) -> VfsAttr {
         VfsAttr::dir(self.uid, self.gid, self.mount_time)
+    }
+
+    fn child_virtual_path(parent: &str, child: &str) -> String {
+        if parent == "/" {
+            format!("/{child}")
+        } else {
+            format!("{}/{}", parent.trim_end_matches('/'), child)
+        }
+    }
+
+    async fn remember_dir_hints<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let now = Instant::now();
+        let mut known_dirs = self.known_dirs.write().await;
+        known_dirs.retain(|_, seen_at| now.duration_since(*seen_at) <= DIR_HINT_TTL);
+        for path in paths {
+            self.negative_cache.remove(&path);
+            known_dirs.insert(path, now);
+        }
+    }
+
+    async fn has_recent_dir_hint(&self, path: &str) -> bool {
+        let now = Instant::now();
+        let mut known_dirs = self.known_dirs.write().await;
+        match known_dirs.get(path).copied() {
+            Some(seen_at) if now.duration_since(seen_at) <= DIR_HINT_TTL => true,
+            Some(_) => {
+                known_dirs.remove(path);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn attr_for_index_entry(&self, entry: &IndexEntry) -> VfsAttr {
+        match entry.kind {
+            RemoteEntryKind::RegularFile => self.file_attr(entry.size),
+            RemoteEntryKind::Symlink => self.symlink_attr(entry.size),
+        }
     }
 
     /// Core readdir logic returning `VfsDirEntry` with optional attrs.
@@ -521,7 +605,9 @@ impl TcfsVfs {
             .context("listing index entries")?;
 
         let mut seen_dirs: HashSet<String> = HashSet::new();
+        let mut pending_files: Vec<(String, String)> = Vec::new();
         let mut entries: Vec<VfsDirEntry> = Vec::new();
+        let mut discovered_dir_paths: Vec<String> = Vec::new();
 
         for entry in raw_entries {
             let full_path = entry.path().to_string();
@@ -539,7 +625,7 @@ impl TcfsVfs {
                 continue;
             }
 
-            let is_dir = rel.contains('/') || rel.ends_with('/');
+            let is_dir = entry.metadata().is_dir() || rel.contains('/') || rel.ends_with('/');
 
             if is_dir {
                 let dir_name = first_component.trim_end_matches('/').to_string();
@@ -547,6 +633,7 @@ impl TcfsVfs {
                     continue;
                 }
                 seen_dirs.insert(dir_name.clone());
+                discovered_dir_paths.push(Self::child_virtual_path(path, &dir_name));
                 entries.push(VfsDirEntry {
                     name: dir_name,
                     kind: VfsFileType::Directory,
@@ -557,19 +644,41 @@ impl TcfsVfs {
                     },
                 });
             } else {
-                let stub_name = first_component.to_string();
-                let attr = if with_attrs {
-                    let size = self.read_index_entry_size(&full_path).await;
-                    Some(self.file_attr(size))
-                } else {
-                    None
-                };
-                entries.push(VfsDirEntry {
-                    name: stub_name,
-                    kind: VfsFileType::RegularFile,
-                    attr,
-                });
+                pending_files.push((first_component.to_string(), full_path));
             }
+        }
+
+        for (clean_name, full_path) in pending_files {
+            if seen_dirs.contains(&clean_name) {
+                debug!(
+                    path = %path,
+                    name = %clean_name,
+                    key = %full_path,
+                    "readdir: skipping leaf object shadowed by a directory prefix"
+                );
+                continue;
+            }
+
+            let Some(parsed_attr) = self.read_index_entry_attr(&full_path).await else {
+                debug!(
+                    path = %path,
+                    name = %clean_name,
+                    key = %full_path,
+                    "readdir: skipping unreadable or non-index leaf object"
+                );
+                continue;
+            };
+            let kind = parsed_attr.kind;
+            let attr = if with_attrs { Some(parsed_attr) } else { None };
+            entries.push(VfsDirEntry {
+                name: clean_name,
+                kind,
+                attr,
+            });
+        }
+
+        if !discovered_dir_paths.is_empty() {
+            self.remember_dir_hints(discovered_dir_paths).await;
         }
 
         // Fallback: if root dir is empty and prefix is empty, discover prefixes
@@ -580,6 +689,8 @@ impl TcfsVfs {
                 if let Ok(idx_entries) = self.op.list(&probe).await {
                     if !idx_entries.is_empty() && !seen_dirs.contains(&pfx) {
                         seen_dirs.insert(pfx.clone());
+                        self.remember_dir_hints([Self::child_virtual_path(path, &pfx)])
+                            .await;
                         entries.push(VfsDirEntry {
                             name: pfx,
                             kind: VfsFileType::Directory,
@@ -611,14 +722,14 @@ impl VirtualFilesystem for TcfsVfs {
             anyhow::bail!("ENOENT (negative cache): {}", path);
         }
 
-        // File: try index lookup (with and without .tc for backward compat)
-        if let Some(entry) = self.get_index_entry(path).await {
-            return Ok(self.file_attr(entry.size));
+        if self.has_recent_dir_hint(path).await {
+            return Ok(self.dir_attr());
         }
-        // Try with .tc suffix (old index entries)
-        let with_tc = format!("{}.tc", path.trim_end_matches('/'));
-        if let Some(entry) = self.get_index_entry(&with_tc).await {
-            return Ok(self.file_attr(entry.size));
+
+        // File: exact index lookup first; legacy physical-stub fallback only
+        // when the exact `.tc`/`.tcf` filename is absent.
+        if let Some(entry) = self.get_index_entry_with_legacy_stub_fallback(path).await {
+            return Ok(self.attr_for_index_entry(&entry));
         }
 
         // Directory: check if any index entries exist under it
@@ -652,17 +763,28 @@ impl VirtualFilesystem for TcfsVfs {
         self.readdir_impl(path, true).await
     }
 
+    async fn readlink(&self, path: &str) -> Result<String> {
+        let entry = self
+            .get_index_entry_with_legacy_stub_fallback(path)
+            .await
+            .context(format!("index entry not found: {}", path))?;
+        if entry.kind != RemoteEntryKind::Symlink {
+            anyhow::bail!("EINVAL: not a symlink: {}", path);
+        }
+        entry
+            .symlink_target
+            .context(format!("symlink index entry missing target: {}", path))
+    }
+
     async fn open(&self, path: &str) -> Result<(u64, Vec<u8>)> {
-        // Try index lookup as-is, then with .tc suffix for backward compat
-        let entry = match self.get_index_entry(path).await {
-            Some(e) => e,
-            None => {
-                let with_tc = format!("{}.tc", path.trim_end_matches('/'));
-                self.get_index_entry(&with_tc)
-                    .await
-                    .context(format!("index entry not found: {}", path))?
-            }
-        };
+        let entry = self
+            .get_index_entry_with_legacy_stub_fallback(path)
+            .await
+            .context(format!("index entry not found: {}", path))?;
+
+        if entry.kind == RemoteEntryKind::Symlink {
+            anyhow::bail!("ELOOP: open called on symlink: {}", path);
+        }
 
         let manifest_path = entry.manifest_path(&self.prefix);
         let prefix = self.prefix.trim_end_matches('/');
@@ -751,6 +873,47 @@ impl VirtualFilesystem for TcfsVfs {
         handle.modified = true;
 
         Ok(data.len() as u32)
+    }
+
+    async fn truncate(&self, path: Option<&str>, fh: Option<u64>, size: u64) -> Result<VfsAttr> {
+        if size as usize > MAX_WRITE_SIZE {
+            anyhow::bail!(
+                "EFBIG: truncate would exceed maximum file size ({} bytes, limit {} bytes)",
+                size,
+                MAX_WRITE_SIZE
+            );
+        }
+
+        if let Some(fh) = fh {
+            let mut handles = self.handles.write().await;
+            let handle = handles
+                .get_mut(&fh)
+                .context(format!("truncate: bad file handle: {}", fh))?;
+            handle.data.resize(size as usize, 0);
+            handle.modified = true;
+            return Ok(self.file_attr(size));
+        }
+
+        let path = path.context("truncate requires path or file handle")?;
+
+        {
+            let mut handles = self.handles.write().await;
+            let mut matched = false;
+            for handle in handles.values_mut().filter(|handle| handle.path == path) {
+                handle.data.resize(size as usize, 0);
+                handle.modified = true;
+                matched = true;
+            }
+            if matched {
+                return Ok(self.file_attr(size));
+            }
+        }
+
+        let (fh, _) = self.open(path).await?;
+        self.truncate(None, Some(fh), size).await?;
+        self.release(fh).await?;
+
+        Ok(self.file_attr(size))
     }
 
     async fn create(&self, parent: &str, name: &OsStr, _mode: u32) -> Result<(u64, VfsAttr)> {
@@ -1004,7 +1167,7 @@ mod tests {
     fn test_index_key_empty_prefix() {
         let vfs = make_vfs("");
         assert_eq!(
-            vfs.index_key_for("/file.txt.tc"),
+            vfs.index_key_for("/file.txt"),
             Some("index/file.txt".to_string())
         );
     }
@@ -1013,25 +1176,33 @@ mod tests {
     fn test_index_key_with_prefix() {
         let vfs = make_vfs("data");
         assert_eq!(
-            vfs.index_key_for("/file.txt.tc"),
+            vfs.index_key_for("/file.txt"),
             Some("data/index/file.txt".to_string())
         );
     }
 
     #[test]
-    fn test_index_key_strips_tc_suffix() {
+    fn test_index_key_preserves_tc_suffix_for_exact_lookup() {
         let vfs = make_vfs("data");
         assert_eq!(
             vfs.index_key_for("/src/main.rs.tc"),
+            Some("data/index/src/main.rs.tc".to_string())
+        );
+        assert_eq!(
+            vfs.legacy_stub_index_key_for("/src/main.rs.tc"),
             Some("data/index/src/main.rs".to_string())
         );
     }
 
     #[test]
-    fn test_index_key_strips_tcf_suffix() {
+    fn test_index_key_preserves_tcf_suffix_for_exact_lookup() {
         let vfs = make_vfs("data");
         assert_eq!(
             vfs.index_key_for("/doc.pdf.tcf"),
+            Some("data/index/doc.pdf.tcf".to_string())
+        );
+        assert_eq!(
+            vfs.legacy_stub_index_key_for("/doc.pdf.tcf"),
             Some("data/index/doc.pdf".to_string())
         );
     }

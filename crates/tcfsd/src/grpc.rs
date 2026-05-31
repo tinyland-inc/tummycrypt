@@ -1,22 +1,82 @@
-//! tonic gRPC server over Unix domain socket
+//! tonic gRPC server over Unix domain socket and optional TCP
 
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex as TokioMutex;
-use tokio_stream::wrappers::UnixListenerStream;
+use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
 use tonic::transport::Server;
 use tracing::{info, warn};
 
 use crate::cred_store::SharedCredStore;
 
+use base64::Engine;
+use secrecy::ExposeSecret;
 use tcfs_core::config::TcfsConfig;
 use tcfs_core::proto::{
     tcfs_daemon_server::{TcfsDaemon, TcfsDaemonServer},
     *,
 };
 use tcfs_sync::state::StateCacheBackend;
+
+/// Build an `EncryptionContext`, attaching per-device wrapping (TIN-1417) when
+/// `crypto.per_device_wrapping` is enabled and the device registry has real age
+/// recipients. Falls back to legacy shared-master wrapping (and logs why) if the
+/// registry can't be loaded, has no real recipients, or this device's age secret
+/// is missing — never producing content this device cannot read back.
+pub(crate) fn build_encryption_context(
+    config: &TcfsConfig,
+    device_id: &str,
+    master_key: &tcfs_crypto::MasterKey,
+) -> tcfs_sync::engine::EncryptionContext {
+    use tcfs_sync::engine::{DeviceUnwrapIdentity, EncryptionContext};
+
+    let base = EncryptionContext::new(master_key.clone());
+    if !config.crypto.per_device_wrapping {
+        return base;
+    }
+    let registry_path = config
+        .sync
+        .device_identity
+        .clone()
+        .unwrap_or_else(tcfs_secrets::device::default_registry_path);
+    let registry = match tcfs_secrets::device::DeviceRegistry::load(&registry_path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("per-device wrapping: registry load failed ({e}); using master wrap");
+            return base;
+        }
+    };
+    let recipients: Vec<tcfs_crypto::AgeFileKeyRecipient> = registry
+        .active_devices()
+        .filter(|d| tcfs_secrets::device::is_real_age_public_key(&d.public_key))
+        .map(|d| tcfs_crypto::AgeFileKeyRecipient {
+            device_id: d.device_id.clone(),
+            recipient: d.public_key.clone(),
+        })
+        .collect();
+    if recipients.is_empty() {
+        tracing::warn!(
+            "per-device wrapping enabled but no active age recipients; using master wrap"
+        );
+        return base;
+    }
+    let secret_path = tcfs_secrets::device::device_secret_key_path(&registry_path, device_id);
+    let identity = match std::fs::read_to_string(&secret_path) {
+        Ok(s) => DeviceUnwrapIdentity {
+            device_id: device_id.to_string(),
+            secret: s.trim().to_string(),
+        },
+        Err(e) => {
+            tracing::warn!(
+                "per-device wrapping: local device secret unreadable ({e}); using master wrap"
+            );
+            return base;
+        }
+    };
+    base.with_device_wrapping(recipients, Some(identity))
+}
 
 /// Implementation of the TcfsDaemon gRPC service
 pub struct TcfsDaemonImpl {
@@ -34,12 +94,14 @@ pub struct TcfsDaemonImpl {
     nats: Arc<TokioMutex<Option<tcfs_sync::NatsClient>>>,
     active_mounts: Arc<TokioMutex<std::collections::HashMap<String, tokio::process::Child>>>,
     path_locks: tcfs_sync::state::PathLocks,
+    data_dir: std::path::PathBuf,
     /// VFS handle from active FUSE mount — used to invalidate negative cache
     /// on NATS events so remote files appear in readdir immediately.
     pub vfs_handle: tokio::sync::watch::Receiver<Option<std::sync::Arc<tcfs_vfs::TcfsVfs>>>,
     vfs_tx: tokio::sync::watch::Sender<Option<std::sync::Arc<tcfs_vfs::TcfsVfs>>>,
     // Auth infrastructure
     session_store: tcfs_auth::SessionStore,
+    invite_redemptions: tcfs_auth::InviteRedemptionStore,
     totp_provider: Arc<tcfs_auth::totp::TotpProvider>,
     webauthn_provider: Arc<tcfs_auth::webauthn::WebAuthnProvider>,
     rate_limiter: tcfs_auth::RateLimiter,
@@ -68,6 +130,64 @@ fn sanitize_rel_path(path: &str) -> std::result::Result<String, String> {
     }
 
     Ok(path.to_string())
+}
+
+fn logical_rel_path_from_state_key(
+    key: &str,
+    state: &tcfs_sync::state::SyncState,
+    sync_root: Option<&Path>,
+    storage_prefix: &str,
+) -> Option<String> {
+    if let Some(root) = sync_root {
+        let root = root.to_string_lossy();
+        let root = root.trim_end_matches('/');
+        if !root.is_empty() {
+            let root_prefix = format!("{root}/");
+            if let Some(rel) = key.strip_prefix(&root_prefix) {
+                let rel = rel.trim_start_matches('/');
+                if !rel.is_empty() {
+                    return Some(rel.to_string());
+                }
+            }
+        }
+    }
+
+    let index_prefix = format!("{}/index/", storage_prefix.trim_end_matches('/'));
+    state
+        .remote_path
+        .strip_prefix(&index_prefix)
+        .map(|rel| rel.trim_start_matches('/'))
+        .filter(|rel| !rel.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn logical_rel_path_from_fs_path(path: &Path, sync_root: Option<&Path>) -> String {
+    if let Some(root) = sync_root {
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel = rel.to_string_lossy();
+            let rel = rel.trim_start_matches('/');
+            return rel.to_string();
+        }
+    }
+
+    path.to_string_lossy().to_string()
+}
+
+fn normalize_watch_root(path: &str) -> String {
+    path.trim_matches('/').to_string()
+}
+
+fn rel_path_matches_watch_roots(rel_path: &str, roots: &[String]) -> bool {
+    roots.iter().any(|root| {
+        if root.is_empty() {
+            true
+        } else {
+            rel_path == root
+                || rel_path
+                    .strip_prefix(root)
+                    .is_some_and(|r| r.starts_with('/'))
+        }
+    })
 }
 
 impl TcfsDaemonImpl {
@@ -114,6 +234,8 @@ impl TcfsDaemonImpl {
             backoff_multiplier: config.auth.rate_limit.backoff_multiplier,
         });
 
+        let data_dir = dirs::data_dir().unwrap_or_default().join("tcfsd");
+
         Self {
             cred_store,
             config,
@@ -124,6 +246,7 @@ impl TcfsDaemonImpl {
             operator,
             device_id,
             device_name,
+            data_dir,
             master_key: Arc::new(TokioMutex::new(master_key)),
             nats_ok: std::sync::atomic::AtomicBool::new(false),
             nats: Arc::new(TokioMutex::new(None)),
@@ -132,15 +255,94 @@ impl TcfsDaemonImpl {
             vfs_handle: vfs_rx,
             vfs_tx,
             session_store: tcfs_auth::SessionStore::new(),
+            invite_redemptions: tcfs_auth::InviteRedemptionStore::new(),
             totp_provider,
             webauthn_provider,
             rate_limiter,
         }
     }
 
+    async fn enrollment_bootstrap_for_invite(
+        &self,
+        invite: &tcfs_auth::EnrollmentInvite,
+    ) -> Result<tcfs_auth::EnrollmentBootstrap, tonic::Status> {
+        let (storage_access_key, storage_secret_key) =
+            self.enrollment_storage_credentials(invite).await;
+        if storage_access_key.is_none() || storage_secret_key.is_none() {
+            return Err(tonic::Status::failed_precondition(
+                "storage credentials unavailable for enrollment bootstrap",
+            ));
+        }
+
+        let master_key_base64 = {
+            let master = self.master_key.lock().await;
+            let master = master.as_ref().ok_or_else(|| {
+                tonic::Status::failed_precondition(
+                    "daemon master key not loaded — cannot wrap enrollment bootstrap",
+                )
+            })?;
+            base64::engine::general_purpose::STANDARD.encode(master.as_bytes())
+        };
+
+        Ok(tcfs_auth::EnrollmentBootstrap {
+            nats_url: invite
+                .nats_url
+                .clone()
+                .or_else(|| Some(self.config.sync.nats_url.clone()).filter(|url| !url.is_empty())),
+            storage_endpoint: invite.storage_endpoint.clone().or_else(|| {
+                Some(self.config.storage.endpoint.clone()).filter(|url| !url.is_empty())
+            }),
+            storage_bucket: invite.storage_bucket.clone().or_else(|| {
+                Some(self.config.storage.bucket.clone()).filter(|bucket| !bucket.is_empty())
+            }),
+            storage_access_key,
+            storage_secret_key,
+            remote_prefix: invite
+                .remote_prefix
+                .clone()
+                .or_else(|| Some(self.config.storage.resolved_prefix().to_string())),
+            master_key_base64: Some(master_key_base64),
+            encryption_salt: invite
+                .encryption_salt
+                .clone()
+                .or_else(|| self.config.crypto.kdf_salt.clone()),
+        })
+    }
+
+    async fn enrollment_storage_credentials(
+        &self,
+        invite: &tcfs_auth::EnrollmentInvite,
+    ) -> (Option<String>, Option<String>) {
+        if invite.storage_access_key.is_some() && invite.storage_secret_key.is_some() {
+            return (
+                invite.storage_access_key.clone(),
+                invite.storage_secret_key.clone(),
+            );
+        }
+
+        let store = self.cred_store.read().await;
+        if let Some(s3) = store.as_ref().and_then(|store| store.s3.as_ref()) {
+            return (
+                Some(s3.access_key_id.clone()),
+                Some(s3.secret_access_key.expose_secret().to_string()),
+            );
+        }
+
+        (
+            invite.storage_access_key.clone(),
+            invite.storage_secret_key.clone(),
+        )
+    }
+
     /// Get a clone of the session store (for background tasks).
     pub fn session_store(&self) -> tcfs_auth::SessionStore {
         self.session_store.clone()
+    }
+
+    #[cfg(test)]
+    fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = data_dir;
+        self
     }
 
     /// Load persisted TOTP credentials from disk.
@@ -153,14 +355,23 @@ impl TcfsDaemonImpl {
         self.session_store.load_from_file(path).await
     }
 
+    /// Load persisted invite redemptions from disk.
+    pub async fn load_invite_redemptions(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.invite_redemptions.load_from_file(path).await
+    }
+
     /// Save sessions to disk (called after session changes).
     async fn persist_sessions(&self) {
-        let path = dirs::data_dir()
-            .unwrap_or_default()
-            .join("tcfsd/sessions.json");
+        let path = self.data_dir.join("sessions.json");
         if let Err(e) = self.session_store.save_to_file(&path).await {
             tracing::warn!("failed to persist sessions: {e}");
         }
+    }
+
+    /// Save invite redemptions to disk (called after successful invite use).
+    async fn persist_invite_redemptions(&self) -> anyhow::Result<()> {
+        let path = self.data_dir.join("invite-redemptions.json");
+        self.invite_redemptions.save_to_file(&path).await
     }
 
     /// Validate a session token from gRPC request metadata.
@@ -180,7 +391,8 @@ impl TcfsDaemonImpl {
                 "AUTH BYPASS: request granted full permissions — \
                  set auth.require_session=true for production"
             );
-            return Ok(tcfs_auth::Session::new(&self.device_id, "local", "bypass"));
+            return Ok(tcfs_auth::Session::new(&self.device_id, "local", "bypass")
+                .with_permissions(tcfs_auth::DevicePermissions::admin()));
         }
 
         // Extract token from "authorization" metadata
@@ -301,10 +513,39 @@ impl TcfsDaemon for TcfsDaemonImpl {
     ) -> Result<tonic::Response<StatusResponse>, tonic::Status> {
         let uptime = self.start_time.elapsed().as_secs() as i64;
         let mount_count = self.active_mounts.lock().await.len() as i32;
+        let storage_prefix = self.config.storage.resolved_prefix().to_string();
+        let operator = self.operator.lock().await.as_ref().cloned();
+        let storage_ok = match operator {
+            Some(op) => {
+                match tcfs_storage::check_health_for_prefix_detailed(&op, &storage_prefix).await {
+                    Ok(report) => {
+                        tracing::debug!(
+                            health_path = %report.path,
+                            elapsed_ms = report.elapsed_ms,
+                            entry_count = report.entry_count,
+                            "status storage health probe passed"
+                        );
+                        true
+                    }
+                    Err(err) => {
+                        warn!(
+                            health_kind = %err.kind(),
+                            health_path = %err.path(),
+                            elapsed_ms = err.elapsed_ms(),
+                            backend_kind = err.backend_kind().unwrap_or("none"),
+                            "status storage health probe failed: {err}"
+                        );
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
+
         Ok(tonic::Response::new(StatusResponse {
             version: env!("CARGO_PKG_VERSION").into(),
             storage_endpoint: self.storage_endpoint.clone(),
-            storage_ok: self.storage_ok,
+            storage_ok,
             nats_ok: self.nats_ok.load(std::sync::atomic::Ordering::Relaxed),
             active_mounts: mount_count,
             uptime_secs: uptime,
@@ -668,9 +909,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
             let mk_guard = self.master_key.lock().await;
             let enc_ctx = mk_guard
                 .as_ref()
-                .map(|mk| tcfs_sync::engine::EncryptionContext {
-                    master_key: mk.clone(),
-                });
+                .map(|mk| build_encryption_context(&self.config, &self.device_id, mk));
             tcfs_sync::engine::upload_file_with_device(
                 &op,
                 &local_path,
@@ -808,9 +1047,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
             let mk_guard = self.master_key.lock().await;
             let enc_ctx = mk_guard
                 .as_ref()
-                .map(|mk| tcfs_sync::engine::EncryptionContext {
-                    master_key: mk.clone(),
-                });
+                .map(|mk| build_encryption_context(&self.config, &self.device_id, mk));
             tcfs_sync::engine::download_file_with_device(
                 &op,
                 &resolved_manifest,
@@ -904,9 +1141,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
             let mk_guard = self.master_key.lock().await;
             let enc_ctx = mk_guard
                 .as_ref()
-                .map(|mk| tcfs_sync::engine::EncryptionContext {
-                    master_key: mk.clone(),
-                });
+                .map(|mk| build_encryption_context(&self.config, &self.device_id, mk));
             tcfs_sync::engine::download_file_with_device(
                 &op,
                 &manifest_path,
@@ -1125,47 +1360,19 @@ impl TcfsDaemon for TcfsDaemonImpl {
         let cache = self.state_cache.lock().await;
         let all = cache.all_entries();
 
-        let sync_root_str = self
-            .config
-            .sync
-            .sync_root
-            .as_deref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/".to_string());
-        // Ensure sync_root ends with '/' for reliable stripping
-        let sync_root_prefix = if sync_root_str.ends_with('/') {
-            sync_root_str.clone()
-        } else {
-            format!("{}/", sync_root_str)
-        };
-
         let mut dirs_seen = std::collections::HashSet::new();
         let mut files: Vec<FileEntry> = Vec::new();
 
         let storage_prefix = self.config.storage.resolved_prefix();
 
         for (key, state) in &all {
-            // Compute logical relative path from cache key (local abs path).
-            // Primary: strip sync_root from local path.
-            // Fallback: extract rel_path from remote_path (e.g., "data/manifests/hash"
-            //   → look up original rel_path from the index key pattern).
-            // Skip entries that can't be mapped (e.g., /private/tmp/ test artifacts
-            //   with no usable remote_path).
-            let rel_path = match key
-                .strip_prefix(&sync_root_prefix)
-                .or_else(|| key.strip_prefix(&sync_root_str))
-            {
-                Some(r) => r.trim_start_matches('/'),
-                None => {
-                    // Fallback: derive rel_path from remote_path for entries not
-                    // keyed under sync_root (e.g., FileProvider container temps).
-                    let index_prefix = format!("{}/index/", storage_prefix);
-                    if let Some(rel) = state.remote_path.strip_prefix(&index_prefix) {
-                        rel.trim_start_matches('/')
-                    } else {
-                        continue;
-                    }
-                }
+            let Some(rel_path) = logical_rel_path_from_state_key(
+                key,
+                state,
+                self.config.sync.sync_root.as_deref(),
+                &storage_prefix,
+            ) else {
+                continue;
             };
 
             if rel_path.is_empty() {
@@ -1183,7 +1390,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
             };
 
             let remainder = if normalized_prefix.is_empty() {
-                rel_path.to_string()
+                rel_path.clone()
             } else {
                 // Must start with prefix (exact prefix match, not substring)
                 let pfx = if normalized_prefix.ends_with('/') {
@@ -1231,7 +1438,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
                     tcfs_sync::state::FileSyncStatus::Conflict => "conflict",
                 };
                 files.push(FileEntry {
-                    path: rel_path.to_string(),
+                    path: rel_path,
                     filename: remainder.clone(),
                     size: state.size,
                     last_synced: state.last_synced as i64,
@@ -1328,6 +1535,7 @@ impl TcfsDaemon for TcfsDaemonImpl {
                     rel_path: Some(req.path.clone()),
                     mode: None,
                     encrypted_file_key: None,
+                    wrapped_file_keys: Vec::new(),
                 };
 
                 // Upload updated manifest
@@ -1577,28 +1785,47 @@ impl TcfsDaemon for TcfsDaemonImpl {
 
         let since = req.since_timestamp;
         info!(paths = ?req.paths, since, "watch requested");
+        let watch_roots: Vec<String> = req
+            .paths
+            .iter()
+            .map(|path| normalize_watch_root(path))
+            .collect();
 
         let (async_tx, async_rx) = tokio::sync::mpsc::channel(256);
 
         // ── Emit initial deltas from state cache (catch-up since anchor) ────
-        if since > 0 {
+        if since >= 0 {
             let cache = self.state_cache.lock().await;
             let all = cache.all_entries();
-            for (path, state) in &all {
+            let storage_prefix = self.config.storage.resolved_prefix();
+            let sync_root = self.config.sync.sync_root.as_deref();
+            for (key, state) in &all {
                 let last = state.last_synced as i64;
-                if last > since {
-                    let filename = std::path::Path::new(path.as_str())
+                if since == 0 || last > since {
+                    let Some(rel_path) =
+                        logical_rel_path_from_state_key(key, state, sync_root, &storage_prefix)
+                    else {
+                        continue;
+                    };
+                    if rel_path.is_empty() || !rel_path_matches_watch_roots(&rel_path, &watch_roots)
+                    {
+                        continue;
+                    }
+                    let filename = std::path::Path::new(rel_path.as_str())
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
+                    let is_directory = sync_root
+                        .map(|root| root.join(&rel_path).is_dir())
+                        .unwrap_or_else(|| std::path::Path::new(key.as_str()).is_dir());
                     let event = WatchEvent {
-                        path: path.clone(),
+                        path: rel_path,
                         event_type: "modified".into(),
                         timestamp: last,
                         filename,
                         size: state.size,
                         blake3: state.blake3.clone(),
-                        is_directory: std::path::Path::new(path.as_str()).is_dir(),
+                        is_directory,
                         device_id: state.device_id.clone(),
                     };
                     if async_tx.send(Ok(event)).await.is_err() {
@@ -1613,89 +1840,126 @@ impl TcfsDaemon for TcfsDaemonImpl {
         // ── Live local filesystem events via notify ─────────────────────────
         let (sync_tx, sync_rx) = std::sync::mpsc::channel();
         let state_cache_for_notify = self.state_cache.clone();
+        let sync_root = self.config.sync.sync_root.clone();
+        let mut watch_targets = Vec::new();
 
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let _ = sync_tx.send(res);
-        })
-        .map_err(|e| tonic::Status::internal(format!("create watcher: {e}")))?;
+        for root in &watch_roots {
+            let Some(path) = sync_root
+                .as_deref()
+                .map(|sync_root| {
+                    if root.is_empty() {
+                        sync_root.to_path_buf()
+                    } else {
+                        sync_root.join(root)
+                    }
+                })
+                .or_else(|| {
+                    if root.is_empty() {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(root))
+                    }
+                })
+            else {
+                debug!("watch: local notify disabled for empty path without sync_root");
+                continue;
+            };
 
-        for path_str in &req.paths {
-            let path = std::path::Path::new(path_str);
-            if !path.exists() {
-                return Err(tonic::Status::not_found(format!(
-                    "watch path does not exist: {path_str}"
-                )));
+            if path.exists() {
+                watch_targets.push((root.clone(), path));
+            } else {
+                debug!(
+                    root,
+                    path = %path.display(),
+                    "watch: local notify target missing; using cache/NATS only"
+                );
             }
-            watcher
-                .watch(path, RecursiveMode::Recursive)
-                .map_err(|e| tonic::Status::internal(format!("watch {path_str}: {e}")))?;
         }
 
-        let notify_tx = async_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let _watcher = watcher;
-            while let Ok(result) = sync_rx.recv() {
-                let event = match result {
-                    Ok(event) => {
-                        let event_type = match event.kind {
-                            notify::EventKind::Create(_) => "created",
-                            notify::EventKind::Modify(_) => "modified",
-                            notify::EventKind::Remove(_) => "deleted",
-                            notify::EventKind::Access(_) => continue,
-                            notify::EventKind::Other => continue,
-                            notify::EventKind::Any => continue,
-                        };
-                        let path = event
-                            .paths
-                            .first()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let filename = event
-                            .paths
-                            .first()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
+        if !watch_targets.is_empty() {
+            let mut watcher =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    let _ = sync_tx.send(res);
+                })
+                .map_err(|e| tonic::Status::internal(format!("create watcher: {e}")))?;
 
-                        // Enrich with state cache metadata (best-effort)
-                        let (size, blake3) = {
-                            let path_buf = std::path::PathBuf::from(&path);
-                            let cache = state_cache_for_notify.blocking_lock();
-                            cache
-                                .get(&path_buf)
-                                .map(|s| (s.size, s.blake3.clone()))
-                                .unwrap_or((0, String::new()))
-                        };
-
-                        let is_dir = event.paths.first().map(|p| p.is_dir()).unwrap_or(false);
-
-                        WatchEvent {
-                            path,
-                            event_type: event_type.to_string(),
-                            timestamp,
-                            filename,
-                            size,
-                            blake3,
-                            is_directory: is_dir,
-                            device_id: String::new(), // local event
-                        }
-                    }
-                    Err(e) => WatchEvent {
-                        path: String::new(),
-                        event_type: format!("error: {e}"),
-                        timestamp: 0,
-                        ..Default::default()
-                    },
-                };
-                if notify_tx.blocking_send(Ok(event)).is_err() {
-                    break; // Client disconnected
-                }
+            for (root, path) in &watch_targets {
+                watcher
+                    .watch(path, RecursiveMode::Recursive)
+                    .map_err(|e| tonic::Status::internal(format!("watch {root}: {e}")))?;
             }
-        });
+
+            let notify_tx = async_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _watcher = watcher;
+                loop {
+                    if notify_tx.is_closed() {
+                        break;
+                    }
+                    let result = match sync_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                        Ok(result) => result,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    let event = match result {
+                        Ok(event) => {
+                            let event_type = match event.kind {
+                                notify::EventKind::Create(_) => "created",
+                                notify::EventKind::Modify(_) => "modified",
+                                notify::EventKind::Remove(_) => "deleted",
+                                notify::EventKind::Access(_) => continue,
+                                notify::EventKind::Other => continue,
+                                notify::EventKind::Any => continue,
+                            };
+                            let path = event.paths.first().cloned().unwrap_or_default();
+                            let logical_path =
+                                logical_rel_path_from_fs_path(&path, sync_root.as_deref());
+                            let filename = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+
+                            // Enrich with state cache metadata (best-effort)
+                            let (size, blake3) = {
+                                let cache = state_cache_for_notify.blocking_lock();
+                                cache
+                                    .get(&path)
+                                    .map(|s| (s.size, s.blake3.clone()))
+                                    .unwrap_or((0, String::new()))
+                            };
+
+                            let is_dir = path.is_dir();
+
+                            WatchEvent {
+                                path: logical_path,
+                                event_type: event_type.to_string(),
+                                timestamp,
+                                filename,
+                                size,
+                                blake3,
+                                is_directory: is_dir,
+                                device_id: String::new(), // local event
+                            }
+                        }
+                        Err(e) => WatchEvent {
+                            path: String::new(),
+                            event_type: format!("error: {e}"),
+                            timestamp: 0,
+                            ..Default::default()
+                        },
+                    };
+                    if notify_tx.blocking_send(Ok(event)).is_err() {
+                        break; // Client disconnected
+                    }
+                }
+            });
+        } else {
+            debug!("watch: no local notify targets; using cache/NATS only");
+        }
 
         // ── Live remote events via NATS STATE_UPDATES ───────────────────────
         // Use an ephemeral consumer so Watch callers don't compete with
@@ -1897,6 +2161,8 @@ impl TcfsDaemon for TcfsDaemonImpl {
     ) -> Result<tonic::Response<AuthEnrollResponse>, tonic::Status> {
         use tcfs_auth::AuthProvider;
 
+        let session = self.require_session(&request).await?;
+        Self::check_permission(&session, "admin")?;
         let req = request.into_inner();
         info!(device_id = %req.device_id, method = %req.method, "auth enroll requested");
 
@@ -1962,6 +2228,8 @@ impl TcfsDaemon for TcfsDaemonImpl {
         &self,
         request: tonic::Request<AuthCompleteEnrollRequest>,
     ) -> Result<tonic::Response<AuthCompleteEnrollResponse>, tonic::Status> {
+        let session = self.require_session(&request).await?;
+        Self::check_permission(&session, "admin")?;
         let req = request.into_inner();
         info!(device_id = %req.device_id, method = %req.method, "auth complete enroll requested");
 
@@ -2135,6 +2403,8 @@ impl TcfsDaemon for TcfsDaemonImpl {
         &self,
         request: tonic::Request<AuthRevokeRequest>,
     ) -> Result<tonic::Response<AuthRevokeResponse>, tonic::Status> {
+        let session = self.require_session(&request).await?;
+        Self::check_permission(&session, "admin")?;
         let req = request.into_inner();
 
         if !req.session_token.is_empty() {
@@ -2172,13 +2442,21 @@ impl TcfsDaemon for TcfsDaemonImpl {
         info!(device_name = %req.device_name, platform = %req.platform, "device enroll requested");
 
         // Decode and validate the enrollment invite
-        let invite = tcfs_auth::EnrollmentInvite::decode(&req.invite_data)
+        let invite = tcfs_auth::EnrollmentInvite::decode_any(&req.invite_data)
             .map_err(|e| tonic::Status::invalid_argument(format!("invalid invite: {e}")))?;
 
         if invite.is_expired() {
             return Ok(tonic::Response::new(DeviceEnrollResponse {
                 success: false,
                 error: "invite has expired".into(),
+                ..Default::default()
+            }));
+        }
+
+        if !tcfs_secrets::device::is_real_age_public_key(&req.public_key) {
+            return Ok(tonic::Response::new(DeviceEnrollResponse {
+                success: false,
+                error: "invalid device public key; expected age X25519 recipient".into(),
                 ..Default::default()
             }));
         }
@@ -2200,6 +2478,43 @@ impl TcfsDaemon for TcfsDaemonImpl {
             ));
         }
 
+        let bootstrap = self.enrollment_bootstrap_for_invite(&invite).await?;
+        let bootstrap_json = serde_json::to_vec(&bootstrap).map_err(|e| {
+            tonic::Status::internal(format!("serializing enrollment bootstrap: {e}"))
+        })?;
+        let wrapped_bootstrap_age =
+            tcfs_secrets::age::encrypt_for_recipient(&req.public_key, &bootstrap_json).map_err(
+                |e| tonic::Status::invalid_argument(format!("wrapping enrollment bootstrap: {e}")),
+            )?;
+
+        match self
+            .invite_redemptions
+            .claim(
+                &invite.invite_id,
+                &invite.nonce,
+                &req.device_name,
+                &req.public_key,
+                &req.platform,
+            )
+            .await
+        {
+            Ok(_) => {
+                if let Err(e) = self.persist_invite_redemptions().await {
+                    tracing::warn!(error = %e, invite_id = %invite.invite_id, "failed to persist invite redemption");
+                    return Err(tonic::Status::internal(
+                        "failed to persist invite redemption state",
+                    ));
+                }
+            }
+            Err(tcfs_auth::InviteRedemptionError::AlreadyRedeemed { .. }) => {
+                return Ok(tonic::Response::new(DeviceEnrollResponse {
+                    success: false,
+                    error: "invite has already been redeemed".into(),
+                    ..Default::default()
+                }));
+            }
+        }
+
         // Enroll device in the local registry
         let device_id = uuid::Uuid::new_v4().to_string();
         info!(
@@ -2213,16 +2528,17 @@ impl TcfsDaemon for TcfsDaemonImpl {
         Ok(tonic::Response::new(DeviceEnrollResponse {
             success: true,
             device_id,
-            nats_url: invite.nats_url.unwrap_or_default(),
-            storage_endpoint: invite.storage_endpoint.unwrap_or_default(),
+            nats_url: bootstrap.nats_url.unwrap_or_default(),
+            storage_endpoint: bootstrap.storage_endpoint.unwrap_or_default(),
             available_auth_methods: vec!["totp".into()],
             error: String::new(),
-            storage_bucket: invite.storage_bucket.unwrap_or_default(),
-            storage_access_key: invite.storage_access_key.unwrap_or_default(),
-            storage_secret: invite.storage_secret_key.unwrap_or_default(),
-            remote_prefix: invite.remote_prefix.unwrap_or_default(),
-            encryption_passphrase: invite.encryption_passphrase.unwrap_or_default(),
-            encryption_salt: invite.encryption_salt.unwrap_or_default(),
+            storage_bucket: bootstrap.storage_bucket.unwrap_or_default(),
+            storage_access_key: String::new(),
+            storage_secret: String::new(),
+            remote_prefix: bootstrap.remote_prefix.unwrap_or_default(),
+            encryption_passphrase: String::new(),
+            encryption_salt: bootstrap.encryption_salt.unwrap_or_default(),
+            wrapped_bootstrap_age,
         }))
     }
 
@@ -2299,6 +2615,7 @@ async fn bind_uds(socket_path: &Path) -> Result<UnixListenerStream> {
 pub async fn serve(
     socket_path: &Path,
     fileprovider_socket: Option<&Path>,
+    listen: Option<&str>,
     impl_: TcfsDaemonImpl,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
@@ -2306,6 +2623,33 @@ pub async fn serve(
     info!(socket = %socket_path.display(), "gRPC server ready");
 
     let service = TcfsDaemonServer::new(impl_);
+
+    let tcp_handle = if let Some(addr) = listen {
+        let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+        info!(addr = %local_addr, "gRPC TCP listener ready");
+
+        let tcp_service = service.clone();
+        let tcp_shutdown = Arc::new(tokio::sync::Notify::new());
+        let tcp_shutdown_clone = tcp_shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = Server::builder()
+                .add_service(tcp_service)
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    tcp_shutdown_clone.notified(),
+                )
+                .await
+            {
+                tracing::warn!("TCP gRPC server error: {e}");
+            }
+        });
+
+        Some((handle, tcp_shutdown))
+    } else {
+        None
+    };
 
     // Spawn a second gRPC server on the FileProvider socket if configured.
     // Uses a separate tokio task with a shared shutdown notify.
@@ -2343,6 +2687,10 @@ pub async fn serve(
         notify.notify_one();
         let _ = handle.await;
     }
+    if let Some((handle, notify)) = tcp_handle {
+        notify.notify_one();
+        let _ = handle.await;
+    }
 
     result
 }
@@ -2352,16 +2700,22 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use opendal::services::Memory;
     use opendal::Operator;
+    use secrecy::{ExposeSecret, SecretString};
     use tcfs_core::proto::tcfs_daemon_client::TcfsDaemonClient;
     use tonic::transport::{Channel, Endpoint, Uri};
     use tower::service_fn;
 
     /// Build a TcfsDaemonImpl with in-memory components for testing.
-    fn test_daemon_with_operator(operator_value: Option<Operator>) -> TcfsDaemonImpl {
+    fn test_daemon_with_operator_master_and_session_requirement(
+        operator_value: Option<Operator>,
+        master_key: Option<tcfs_crypto::MasterKey>,
+        require_session: bool,
+    ) -> TcfsDaemonImpl {
         let mut config = TcfsConfig::default();
-        config.auth.require_session = false;
+        config.auth.require_session = require_session;
         config.storage.bucket = "data".into();
         config.storage.remote_prefix = Some("data".into());
         let config = Arc::new(config);
@@ -2383,8 +2737,23 @@ mod tests {
             tcfs_sync::state::PathLocks::new(),
             "test-device-id".into(),
             "test-device".into(),
-            None,
+            master_key,
         )
+    }
+
+    fn test_daemon_with_operator_and_master(
+        operator_value: Option<Operator>,
+        master_key: Option<tcfs_crypto::MasterKey>,
+    ) -> TcfsDaemonImpl {
+        test_daemon_with_operator_master_and_session_requirement(operator_value, master_key, false)
+    }
+
+    fn test_daemon_with_required_sessions() -> TcfsDaemonImpl {
+        test_daemon_with_operator_master_and_session_requirement(None, None, true)
+    }
+
+    fn test_daemon_with_operator(operator_value: Option<Operator>) -> TcfsDaemonImpl {
+        test_daemon_with_operator_and_master(operator_value, None)
     }
 
     fn test_daemon() -> TcfsDaemonImpl {
@@ -2393,6 +2762,65 @@ mod tests {
 
     fn memory_operator() -> Operator {
         Operator::new(Memory::default()).unwrap().finish()
+    }
+
+    fn test_device_keypair() -> tcfs_secrets::device::LocalDeviceKey {
+        tcfs_secrets::device::generate_local_device_key()
+    }
+
+    async fn insert_test_s3_credentials(
+        daemon: &TcfsDaemonImpl,
+        access_key: &str,
+        secret_key: &str,
+    ) {
+        daemon
+            .cred_store
+            .write()
+            .await
+            .replace(tcfs_secrets::CredStore {
+                s3: Some(tcfs_secrets::S3Credentials {
+                    access_key_id: access_key.into(),
+                    secret_access_key: SecretString::from(secret_key.to_string()),
+                    endpoint: daemon.config.storage.endpoint.clone(),
+                    region: daemon.config.storage.region.clone(),
+                }),
+                source: "test".into(),
+            });
+    }
+
+    fn request_with_bearer<T>(message: T, token: &str) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+    }
+
+    async fn insert_test_session(
+        daemon: &TcfsDaemonImpl,
+        device_id: &str,
+        permissions: tcfs_auth::DevicePermissions,
+    ) -> String {
+        let session =
+            tcfs_auth::Session::new(device_id, device_id, "test").with_permissions(permissions);
+        let token = session.token.clone();
+        daemon.session_store.insert(session).await;
+        token
+    }
+
+    fn test_sync_state(remote_path: &str, last_synced: u64) -> tcfs_sync::state::SyncState {
+        tcfs_sync::state::SyncState {
+            blake3: "test-blake3".into(),
+            size: 123,
+            mtime: 0,
+            chunk_count: 1,
+            remote_path: remote_path.into(),
+            last_synced,
+            vclock: tcfs_sync::conflict::VectorClock::default(),
+            device_id: "remote-device".into(),
+            conflict: None,
+            status: tcfs_sync::state::FileSyncStatus::NotSynced,
+        }
     }
 
     async fn connect_test_client(socket_path: &Path) -> TcfsDaemonClient<Channel> {
@@ -2441,7 +2869,14 @@ mod tests {
         let shutdown_for_server = shutdown.clone();
 
         let handle = tokio::spawn(async move {
-            serve(&socket_path, None, daemon, shutdown_for_server.notified()).await
+            serve(
+                &socket_path,
+                None,
+                None,
+                daemon,
+                shutdown_for_server.notified(),
+            )
+            .await
         });
 
         (dir, handle, shutdown)
@@ -2463,6 +2898,18 @@ mod tests {
         assert!(!resp.nats_ok);
         assert_eq!(resp.active_mounts, 0);
         assert!(resp.uptime_secs >= 0);
+    }
+
+    #[tokio::test]
+    async fn status_rechecks_live_storage_health() {
+        let daemon = test_daemon_with_operator(Some(memory_operator()));
+        let resp = daemon
+            .status(tonic::Request::new(StatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.storage_ok);
     }
 
     #[tokio::test]
@@ -2546,6 +2993,315 @@ mod tests {
 
         assert!(!resp.success);
         assert!(resp.error.contains("must be"));
+    }
+
+    #[tokio::test]
+    async fn auth_enroll_requires_admin_session() {
+        let daemon = test_daemon_with_required_sessions();
+        let request = AuthEnrollRequest {
+            device_id: "new-device".into(),
+            method: "totp".into(),
+        };
+
+        let missing = daemon
+            .auth_enroll(tonic::Request::new(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+
+        let user_token = insert_test_session(
+            &daemon,
+            "regular-device",
+            tcfs_auth::DevicePermissions::default(),
+        )
+        .await;
+        let non_admin = daemon
+            .auth_enroll(request_with_bearer(request.clone(), &user_token))
+            .await
+            .unwrap_err();
+        assert_eq!(non_admin.code(), tonic::Code::PermissionDenied);
+
+        let admin_token = insert_test_session(
+            &daemon,
+            "admin-device",
+            tcfs_auth::DevicePermissions::admin(),
+        )
+        .await;
+        let mut unsupported = request;
+        unsupported.method = "unsupported".into();
+        let allowed = daemon
+            .auth_enroll(request_with_bearer(unsupported, &admin_token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!allowed.success);
+        assert!(allowed.error.contains("unsupported auth method"));
+    }
+
+    #[tokio::test]
+    async fn auth_complete_enroll_requires_admin_session() {
+        let daemon = test_daemon_with_required_sessions();
+        let request = AuthCompleteEnrollRequest {
+            device_id: "new-device".into(),
+            method: "totp".into(),
+            attestation_data: Vec::new(),
+        };
+
+        let missing = daemon
+            .auth_complete_enroll(tonic::Request::new(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+
+        let user_token = insert_test_session(
+            &daemon,
+            "regular-device",
+            tcfs_auth::DevicePermissions::default(),
+        )
+        .await;
+        let non_admin = daemon
+            .auth_complete_enroll(request_with_bearer(request.clone(), &user_token))
+            .await
+            .unwrap_err();
+        assert_eq!(non_admin.code(), tonic::Code::PermissionDenied);
+
+        let admin_token = insert_test_session(
+            &daemon,
+            "admin-device",
+            tcfs_auth::DevicePermissions::admin(),
+        )
+        .await;
+        let allowed = daemon
+            .auth_complete_enroll(request_with_bearer(request, &admin_token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(allowed.success, "admin request failed: {}", allowed.error);
+    }
+
+    #[tokio::test]
+    async fn auth_revoke_requires_admin_session() {
+        let daemon = test_daemon_with_required_sessions();
+        let target_token = insert_test_session(
+            &daemon,
+            "target-device",
+            tcfs_auth::DevicePermissions::default(),
+        )
+        .await;
+        let request = AuthRevokeRequest {
+            session_token: target_token.clone(),
+            device_id: String::new(),
+        };
+
+        let missing = daemon
+            .auth_revoke(tonic::Request::new(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+
+        let user_token = insert_test_session(
+            &daemon,
+            "regular-device",
+            tcfs_auth::DevicePermissions::default(),
+        )
+        .await;
+        let non_admin = daemon
+            .auth_revoke(request_with_bearer(request.clone(), &user_token))
+            .await
+            .unwrap_err();
+        assert_eq!(non_admin.code(), tonic::Code::PermissionDenied);
+        assert!(daemon.session_store.validate(&target_token).await.is_some());
+
+        let admin_token = insert_test_session(
+            &daemon,
+            "admin-device",
+            tcfs_auth::DevicePermissions::admin(),
+        )
+        .await;
+        let allowed = daemon
+            .auth_revoke(request_with_bearer(request, &admin_token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(allowed.success, "admin revoke failed: {}", allowed.error);
+        assert!(daemon.session_store.validate(&target_token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn device_enroll_rejects_reused_invite() {
+        let key_bytes = [0xA5; tcfs_crypto::KEY_SIZE];
+        let signing_key: [u8; 32] = *blake3::hash(&key_bytes).as_bytes();
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = test_daemon_with_operator_and_master(
+            None,
+            Some(tcfs_crypto::MasterKey::from_bytes(key_bytes)),
+        )
+        .with_data_dir(temp.path().join("tcfsd"));
+
+        let mut invite = tcfs_auth::EnrollmentInvite::new(
+            "admin-device",
+            &signing_key,
+            24,
+            tcfs_auth::DevicePermissions::default(),
+        );
+        invite.storage_endpoint = Some("https://s3.example.invalid".into());
+        invite.storage_bucket = Some("tcfs".into());
+        invite.storage_access_key = Some("test-access".into());
+        invite.storage_secret_key = Some("test-secret".into());
+        invite.refresh_signature(&signing_key);
+        let invite_data = invite.encode_compact().unwrap();
+        let keypair = test_device_keypair();
+
+        let req = DeviceEnrollRequest {
+            invite_data: invite_data.clone(),
+            device_name: "new-laptop".into(),
+            public_key: keypair.public_key.clone(),
+            platform: "linux-x86_64".into(),
+        };
+
+        let first = daemon
+            .device_enroll(tonic::Request::new(req.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.success, "first enrollment failed: {}", first.error);
+        assert!(temp.path().join("tcfsd/invite-redemptions.json").exists());
+
+        let second = daemon
+            .device_enroll(tonic::Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!second.success);
+        assert!(second.error.contains("already been redeemed"));
+    }
+
+    #[tokio::test]
+    async fn device_enroll_rejects_invalid_public_key_before_claiming_invite() {
+        let key_bytes = [0xC7; tcfs_crypto::KEY_SIZE];
+        let signing_key: [u8; 32] = *blake3::hash(&key_bytes).as_bytes();
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = test_daemon_with_operator_and_master(
+            None,
+            Some(tcfs_crypto::MasterKey::from_bytes(key_bytes)),
+        )
+        .with_data_dir(temp.path().join("tcfsd"));
+
+        let mut invite = tcfs_auth::EnrollmentInvite::new(
+            "admin-device",
+            &signing_key,
+            24,
+            tcfs_auth::DevicePermissions::default(),
+        );
+        invite.storage_endpoint = Some("https://s3.example.invalid".into());
+        invite.storage_bucket = Some("tcfs".into());
+        invite.storage_access_key = Some("test-access".into());
+        invite.storage_secret_key = Some("test-secret".into());
+        invite.refresh_signature(&signing_key);
+        let invite_data = invite.encode_compact().unwrap();
+
+        let rejected = daemon
+            .device_enroll(tonic::Request::new(DeviceEnrollRequest {
+                invite_data: invite_data.clone(),
+                device_name: "new-laptop".into(),
+                public_key: "not-an-age-recipient".into(),
+                platform: "linux-x86_64".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!rejected.success);
+        assert!(rejected.error.contains("invalid device public key"));
+        assert!(!temp.path().join("tcfsd/invite-redemptions.json").exists());
+
+        let keypair = test_device_keypair();
+        let accepted = daemon
+            .device_enroll(tonic::Request::new(DeviceEnrollRequest {
+                invite_data,
+                device_name: "new-laptop".into(),
+                public_key: keypair.public_key.clone(),
+                platform: "linux-x86_64".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(accepted.success, "retry failed: {}", accepted.error);
+    }
+
+    #[tokio::test]
+    async fn device_enroll_wraps_bootstrap_to_joining_device_key() {
+        let key_bytes = [0xB6; tcfs_crypto::KEY_SIZE];
+        let signing_key: [u8; 32] = *blake3::hash(&key_bytes).as_bytes();
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = test_daemon_with_operator_and_master(
+            None,
+            Some(tcfs_crypto::MasterKey::from_bytes(key_bytes)),
+        )
+        .with_data_dir(temp.path().join("tcfsd"));
+        insert_test_s3_credentials(&daemon, "daemon-access", "daemon-secret").await;
+
+        let mut invite = tcfs_auth::EnrollmentInvite::new(
+            "admin-device",
+            &signing_key,
+            24,
+            tcfs_auth::DevicePermissions::default(),
+        );
+        invite.storage_endpoint = Some("https://s3.example.invalid".into());
+        invite.storage_bucket = Some("tcfs".into());
+        invite.remote_prefix = Some("tenant/a".into());
+        invite.refresh_signature(&signing_key);
+        let invite_data = invite.encode_compact().unwrap();
+        let keypair = test_device_keypair();
+
+        let resp = daemon
+            .device_enroll(tonic::Request::new(DeviceEnrollRequest {
+                invite_data,
+                device_name: "new-laptop".into(),
+                public_key: keypair.public_key.clone(),
+                platform: "linux-x86_64".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.success, "enrollment failed: {}", resp.error);
+        assert!(resp.storage_access_key.is_empty());
+        assert!(resp.storage_secret.is_empty());
+        assert!(resp.encryption_passphrase.is_empty());
+        assert!(resp
+            .wrapped_bootstrap_age
+            .contains("BEGIN AGE ENCRYPTED FILE"));
+
+        let identity = tcfs_secrets::IdentityProvider {
+            key_data: keypair.secret_key.expose_secret().to_string(),
+            source: "test".into(),
+        };
+        let plaintext = tcfs_secrets::age::decrypt_with_identity(
+            &identity,
+            resp.wrapped_bootstrap_age.as_bytes(),
+        )
+        .unwrap();
+        let bootstrap: tcfs_auth::EnrollmentBootstrap = serde_json::from_slice(&plaintext).unwrap();
+
+        assert_eq!(
+            bootstrap.storage_endpoint.as_deref(),
+            Some("https://s3.example.invalid")
+        );
+        assert_eq!(bootstrap.storage_bucket.as_deref(), Some("tcfs"));
+        assert_eq!(
+            bootstrap.storage_access_key.as_deref(),
+            Some("daemon-access")
+        );
+        assert_eq!(
+            bootstrap.storage_secret_key.as_deref(),
+            Some("daemon-secret")
+        );
+        assert_eq!(bootstrap.remote_prefix.as_deref(), Some("tenant/a"));
+        let expected_master_key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+        assert_eq!(
+            bootstrap.master_key_base64.as_deref(),
+            Some(expected_master_key.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2688,6 +3444,71 @@ mod tests {
             "needs_sync Err was silently collapsed into \"synced\""
         );
         assert_eq!(resp.state, "unknown");
+    }
+
+    #[test]
+    fn logical_rel_path_prefers_sync_root_key_for_manifest_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("ci-smoke/0.12.9/hello.txt");
+        let state = test_sync_state("data/manifests/abc123", 1_700_000_000);
+
+        let rel = logical_rel_path_from_state_key(
+            &key.to_string_lossy(),
+            &state,
+            Some(root.path()),
+            "data",
+        )
+        .unwrap();
+
+        assert_eq!(rel, "ci-smoke/0.12.9/hello.txt");
+    }
+
+    #[test]
+    fn logical_rel_path_falls_back_to_remote_index_key() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "/tmp/outside-tcfs-state-cache-key";
+        let state = test_sync_state("data/index/remote/only.txt", 1_700_000_000);
+
+        let rel = logical_rel_path_from_state_key(key, &state, Some(root.path()), "data").unwrap();
+
+        assert_eq!(rel, "remote/only.txt");
+    }
+
+    #[tokio::test]
+    async fn watch_empty_root_returns_logical_catch_up_events() {
+        use futures::StreamExt;
+
+        let daemon = test_daemon();
+        let tracked = std::path::PathBuf::from("/tmp/tcfs-state-key/ci-smoke/0.12.9/hello.txt");
+
+        {
+            let mut cache = daemon.state_cache.lock().await;
+            cache.set(
+                &tracked,
+                test_sync_state("data/index/ci-smoke/0.12.9/hello.txt", 1_700_000_000),
+            );
+            cache.flush().unwrap();
+        }
+
+        let mut stream = daemon
+            .watch(tonic::Request::new(WatchRequest {
+                paths: vec![String::new()],
+                since_timestamp: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("watch should emit catch-up event")
+            .expect("watch stream should stay open")
+            .expect("catch-up event should not be an error");
+
+        assert_eq!(event.path, "ci-smoke/0.12.9/hello.txt");
+        assert_eq!(event.filename, "hello.txt");
+        assert_eq!(event.event_type, "modified");
+        assert_eq!(event.size, 123);
     }
 
     #[tokio::test]

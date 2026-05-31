@@ -1,0 +1,1149 @@
+name: macOS Post-Install Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to validate (for example v0.12.12)"
+        required: true
+        type: string
+      require_current_postinstall:
+        description: "Require the package postinstall script to match current main"
+        required: false
+        default: false
+        type: boolean
+      elect_plugin_use:
+        description: "Set PlugInKit user election to use for the FileProvider before the harness"
+        required: false
+        default: true
+        type: boolean
+      rebuild_domain:
+        description: "Remove and re-add the FileProvider domain before the smoke harness; useful for stale-domain/FPFS diagnostics"
+        required: false
+        default: false
+        type: boolean
+      fileprovider_testing_mode:
+        description: "Request FileProvider testing-mode alwaysEnabled; package must carry Apple's testing entitlement"
+        required: false
+        default: false
+        type: boolean
+      exercise_conflict_status:
+        description: "In testing mode, seed and verify a deterministic FileProvider conflict/status fixture"
+        required: false
+        default: false
+        type: boolean
+      require_conflict_enumerator_status:
+        description: "Fail conflict/status smoke unless the FileProvider enumerator logs hydration_state=conflict"
+        required: false
+        default: false
+        type: boolean
+      exercise_dev_id_layered_proof:
+        description: "Production Dev ID lane: layer --exercise-evict-rehydrate + --exercise-mutation on top of base hydration proof (mirrors testing-mode coverage without requiring the testing-mode entitlement)"
+        required: false
+        default: false
+        type: boolean
+      soak_cycles:
+        description: "Number of FileProvider evict/rehydrate cycles for layered proof or testing-mode soak"
+        required: false
+        default: "1"
+        type: string
+      exercise_rename_safety:
+        description: "Post-M10 hardening lane: rename a FileProvider file and prove the new remote path is readable while the old path is no longer visible"
+        required: false
+        default: false
+        type: boolean
+      host_root_probe:
+        description: "Require the signed HostApp root/user-visible URL probe even when raw CloudStorage enumeration succeeds"
+        required: false
+        default: false
+        type: boolean
+      require_cli_fileprovider_config:
+        description: "Fail unless the installed tcfs CLI renders the FileProvider JSON via `tcfs config fileprovider`"
+        required: false
+        default: false
+        type: boolean
+      lab_gatekeeper_override:
+        description: "PZM-only non-production lab: require a SystemPolicyRule profile for the installed testing-mode app"
+        required: false
+        default: false
+        type: boolean
+      package_url:
+        description: "Optional direct .pkg URL to install instead of the release asset for tag"
+        required: false
+        default: ""
+        type: string
+      package_artifact_run_id:
+        description: "Optional Actions run ID containing a .pkg artifact to install instead of the release asset"
+        required: false
+        default: ""
+        type: string
+      package_artifact_name:
+        description: "Artifact name to download when package_artifact_run_id is set"
+        required: false
+        default: "dist-testing-mode-pkg"
+        type: string
+      runner_label:
+        description: "Runner label. Use petting-zoo-mini for FileProvider testing-mode."
+        required: false
+        default: "macos-15"
+        type: string
+      smoke_environment:
+        description: "GitHub environment containing TCFS_SMOKE_* secrets"
+        required: false
+        default: "tcfs-macos-smoke"
+        type: string
+      remote_prefix:
+        description: "Optional storage prefix override; use an allowed production prefix such as gha/storage-posture/macos-postinstall/<tag>/<run>"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  pkg-postinstall:
+    name: macOS .pkg post-install smoke
+    if: github.repository == 'Jesssullivan/tummycrypt'
+    runs-on: ${{ github.event.inputs.runner_label }}
+    timeout-minutes: 40
+    environment: ${{ github.event.inputs.smoke_environment }}
+    env:
+      TCFS_SMOKE_S3_ENDPOINT: ${{ secrets.TCFS_SMOKE_S3_ENDPOINT }}
+      TCFS_SMOKE_S3_BUCKET: ${{ secrets.TCFS_SMOKE_S3_BUCKET }}
+      TCFS_SMOKE_S3_ACCESS_KEY_ID: ${{ secrets.TCFS_SMOKE_S3_ACCESS_KEY_ID }}
+      TCFS_SMOKE_S3_SECRET_ACCESS_KEY: ${{ secrets.TCFS_SMOKE_S3_SECRET_ACCESS_KEY }}
+      TCFS_SMOKE_MASTER_KEY_B64: ${{ secrets.TCFS_SMOKE_MASTER_KEY_B64 }}
+      TCFS_S3_ACCESS: ${{ secrets.TCFS_SMOKE_S3_ACCESS_KEY_ID }}
+      TCFS_S3_SECRET: ${{ secrets.TCFS_SMOKE_S3_SECRET_ACCESS_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.TCFS_SMOKE_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TCFS_SMOKE_S3_SECRET_ACCESS_KEY }}
+      TCFS_RUNNER_SUDO_PASSWORD: ${{ secrets.TCFS_RUNNER_SUDO_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Initialize log directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_DIR="$RUNNER_TEMP/tcfs-macos-postinstall"
+          mkdir -p "$LOG_DIR"
+          echo "LOG_DIR=$LOG_DIR" >> "$GITHUB_ENV"
+
+      - name: Validate release inputs and storage secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          PACKAGE_URL="${{ github.event.inputs.package_url }}"
+          PACKAGE_ARTIFACT_RUN_ID="${{ github.event.inputs.package_artifact_run_id }}"
+          FILEPROVIDER_TESTING_MODE="${{ github.event.inputs.fileprovider_testing_mode }}"
+          EXERCISE_CONFLICT_STATUS="${{ github.event.inputs.exercise_conflict_status }}"
+          REQUIRE_CONFLICT_ENUMERATOR_STATUS="${{ github.event.inputs.require_conflict_enumerator_status }}"
+          EXERCISE_DEV_ID_LAYERED_PROOF="${{ github.event.inputs.exercise_dev_id_layered_proof }}"
+          SOAK_CYCLES="${{ github.event.inputs.soak_cycles }}"
+          EXERCISE_RENAME_SAFETY="${{ github.event.inputs.exercise_rename_safety }}"
+          LAB_GATEKEEPER_OVERRIDE="${{ github.event.inputs.lab_gatekeeper_override }}"
+          RUNNER_LABEL="${{ github.event.inputs.runner_label }}"
+          [[ "$TAG" == v* ]] || {
+            echo "::error::tag must start with 'v' (got '$TAG')"
+            exit 1
+          }
+
+          if [[ -n "$PACKAGE_URL" && -n "$PACKAGE_ARTIFACT_RUN_ID" ]]; then
+            echo "::error::set only one of package_url or package_artifact_run_id"
+            exit 1
+          fi
+
+          if [[ "$FILEPROVIDER_TESTING_MODE" == "true" && -z "$PACKAGE_URL" && -z "$PACKAGE_ARTIFACT_RUN_ID" ]]; then
+            echo "::error::fileprovider_testing_mode=true requires package_artifact_run_id or package_url for a testing-mode package"
+            exit 1
+          fi
+
+          if [[ "$FILEPROVIDER_TESTING_MODE" == "true" && "$RUNNER_LABEL" == macos-* ]]; then
+            echo "::error::fileprovider_testing_mode=true requires a registered self-hosted Mac runner label, not $RUNNER_LABEL"
+            exit 1
+          fi
+
+          if [[ "$EXERCISE_CONFLICT_STATUS" == "true" \
+                && "$FILEPROVIDER_TESTING_MODE" != "true" \
+                && "$EXERCISE_DEV_ID_LAYERED_PROOF" != "true" ]]; then
+            echo "::error::exercise_conflict_status=true requires fileprovider_testing_mode=true or exercise_dev_id_layered_proof=true"
+            exit 1
+          fi
+
+          if [[ "$REQUIRE_CONFLICT_ENUMERATOR_STATUS" == "true" && "$EXERCISE_CONFLICT_STATUS" != "true" ]]; then
+            echo "::error::require_conflict_enumerator_status=true requires exercise_conflict_status=true"
+            exit 1
+          fi
+
+          if [[ "$EXERCISE_RENAME_SAFETY" == "true" \
+                && "$FILEPROVIDER_TESTING_MODE" != "true" \
+                && "$EXERCISE_DEV_ID_LAYERED_PROOF" != "true" ]]; then
+            echo "::error::exercise_rename_safety=true requires fileprovider_testing_mode=true or exercise_dev_id_layered_proof=true"
+            exit 1
+          fi
+
+          case "$SOAK_CYCLES" in
+            ''|*[!0-9]*)
+              echo "::error::soak_cycles must be a positive integer"
+              exit 1
+              ;;
+          esac
+          if [[ "$SOAK_CYCLES" == "0" ]]; then
+            echo "::error::soak_cycles must be a positive integer"
+            exit 1
+          fi
+          if [[ "$SOAK_CYCLES" != "1" \
+                && "$FILEPROVIDER_TESTING_MODE" != "true" \
+                && "$EXERCISE_DEV_ID_LAYERED_PROOF" != "true" ]]; then
+            echo "::error::soak_cycles greater than 1 requires fileprovider_testing_mode=true or exercise_dev_id_layered_proof=true"
+            exit 1
+          fi
+
+          if [[ "$LAB_GATEKEEPER_OVERRIDE" == "true" && "$FILEPROVIDER_TESTING_MODE" != "true" ]]; then
+            echo "::error::lab_gatekeeper_override=true requires fileprovider_testing_mode=true"
+            exit 1
+          fi
+
+          if [[ "$LAB_GATEKEEPER_OVERRIDE" == "true" ]]; then
+            case "$RUNNER_LABEL" in
+              petting-zoo-mini | petting-zoo-mini-tcfs) ;;
+              *)
+                echo "::error::lab_gatekeeper_override=true is restricted to the petting-zoo-mini lab runner, not $RUNNER_LABEL"
+                exit 1
+                ;;
+            esac
+          fi
+
+          missing=()
+          for name in \
+            TCFS_SMOKE_S3_ENDPOINT \
+            TCFS_SMOKE_S3_BUCKET \
+            TCFS_SMOKE_S3_ACCESS_KEY_ID \
+            TCFS_SMOKE_S3_SECRET_ACCESS_KEY \
+            TCFS_SMOKE_MASTER_KEY_B64
+          do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required tcfs-macos-smoke environment secrets: ${missing[*]}"
+            echo "Set the storage and E2EE smoke secrets before using this workflow."
+            exit 1
+          fi
+
+          if [[ "$RUNNER_LABEL" != macos-* ]]; then
+            echo "Self-hosted runner label $RUNNER_LABEL: allowing private storage endpoint classes."
+            exit 0
+          fi
+
+          python3 - "$TCFS_SMOKE_S3_ENDPOINT" <<'PY'
+          import ipaddress
+          import socket
+          import sys
+          from urllib.parse import urlparse
+
+          endpoint = sys.argv[1].strip()
+          parsed = urlparse(endpoint)
+          if parsed.scheme != "https" or not parsed.hostname:
+              print(
+                  f"::error::TCFS_SMOKE_S3_ENDPOINT must be an https URL with a hostname (got {endpoint!r})"
+              )
+              raise SystemExit(1)
+
+          host = parsed.hostname.rstrip(".").lower()
+          blocked_suffixes = (".ts.net", ".local", ".internal", ".home.arpa")
+          if host in {"localhost", "localhost.localdomain"}:
+              print(
+                  f"::error::TCFS_SMOKE_S3_ENDPOINT host {host!r} is local-only and cannot be reached from GitHub-hosted macOS runners."
+              )
+              raise SystemExit(1)
+          if host.endswith(blocked_suffixes):
+              print(
+                  f"::error::TCFS_SMOKE_S3_ENDPOINT host {host!r} looks private to a tailnet or local DNS domain."
+              )
+              raise SystemExit(1)
+          try:
+              ip = ipaddress.ip_address(host)
+          except ValueError:
+              ip = None
+
+          if ip is None:
+              if "." not in host:
+                  print(
+                      f"::error::TCFS_SMOKE_S3_ENDPOINT host {host!r} is a bare hostname; GitHub-hosted runners need a publicly routable DNS name."
+                  )
+                  raise SystemExit(1)
+              raise SystemExit(0)
+
+          blocked = []
+          if ip in ipaddress.ip_network("100.64.0.0/10"):
+              blocked.append("carrier-grade NAT / tailnet")
+          elif not ip.is_global:
+              blocked.append("non-global")
+
+          if blocked:
+              print(
+                  f"::error::TCFS_SMOKE_S3_ENDPOINT host {host!r} is {' and '.join(blocked)}; GitHub-hosted macOS runners need a publicly reachable storage endpoint."
+              )
+              raise SystemExit(1)
+
+          port = parsed.port or 443
+          try:
+              socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+          except OSError as exc:
+              print(
+                  "::error::TCFS_SMOKE_S3_ENDPOINT hostname does not resolve from this GitHub-hosted macOS runner; refresh the public smoke endpoint or use a private runner."
+              )
+              print(f"DNS error: {exc}")
+              raise SystemExit(1)
+
+          try:
+              with socket.create_connection((host, port), timeout=5):
+                  pass
+          except OSError as exc:
+              print(
+                  "::error::TCFS_SMOKE_S3_ENDPOINT did not accept a TCP connection from this GitHub-hosted macOS runner; refresh the public smoke endpoint or use a private runner."
+              )
+              print(f"connection error: {exc}")
+              raise SystemExit(1)
+          PY
+
+      - name: Derive run paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+          # Release-candidate asset names keep the prerelease suffix
+          # (`0.12.13-rc1`), but the Rust binaries report the Cargo package
+          # version (`0.12.13`).
+          BINARY_EXPECTED_VERSION="${VERSION%%-*}"
+          LOG_DIR="${LOG_DIR:-$RUNNER_TEMP/tcfs-macos-postinstall}"
+          SYNC_ROOT="$RUNNER_TEMP/tcfs-sync-root"
+          CONFIG_DIR="$RUNNER_TEMP/tcfs-config"
+          CONFIG_PATH="$CONFIG_DIR/config.toml"
+          NO_CRYPTO_CONFIG_PATH="$RUNNER_TEMP/tcfs-no-crypto.toml"
+          MASTER_KEY_PATH="$RUNNER_TEMP/tcfs-master.key"
+          STATE_PATH="$RUNNER_TEMP/tcfs-state.json"
+          EXPECTED_CONTENT_FILE="$RUNNER_TEMP/expected-fixture-content"
+          MUTATION_CONTENT_FILE="$RUNNER_TEMP/mutation-fixture-content"
+          CONFLICT_CONTENT_FILE="$RUNNER_TEMP/conflict-fixture-content"
+          APP_GROUP_DIR="$HOME/Library/Group Containers/group.io.tinyland.tcfs"
+          FILEPROVIDER_LISTEN_ADDR="127.0.0.1:19101"
+          FILEPROVIDER_ENDPOINT="http://${FILEPROVIDER_LISTEN_ADDR}"
+          REMOTE_PREFIX="${{ github.event.inputs.remote_prefix }}"
+          if [[ -z "$REMOTE_PREFIX" ]]; then
+            REMOTE_PREFIX="gha/macos-postinstall/${TAG}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          REMOTE_PREFIX="${REMOTE_PREFIX#/}"
+          REMOTE_PREFIX="${REMOTE_PREFIX%/}"
+          if [[ -z "$REMOTE_PREFIX" ]]; then
+            echo "::error::remote_prefix resolved to an empty prefix"
+            exit 1
+          fi
+          FIXTURE_REL="ci-smoke/${VERSION}/postinstall-${GITHUB_RUN_ATTEMPT}.txt"
+          MUTATION_REL="ci-smoke/${VERSION}/mutation-${GITHUB_RUN_ATTEMPT}.txt"
+          CONFLICT_REL="ci-smoke/${VERSION}/conflict-status-${GITHUB_RUN_ATTEMPT}.txt"
+
+          mkdir -p "$LOG_DIR" "$SYNC_ROOT" "$CONFIG_DIR"
+
+          {
+            echo "TAG=$TAG"
+            echo "VERSION=$VERSION"
+            echo "BINARY_EXPECTED_VERSION=$BINARY_EXPECTED_VERSION"
+            echo "LOG_DIR=$LOG_DIR"
+            echo "SYNC_ROOT=$SYNC_ROOT"
+            echo "CONFIG_DIR=$CONFIG_DIR"
+            echo "CONFIG_PATH=$CONFIG_PATH"
+            echo "NO_CRYPTO_CONFIG_PATH=$NO_CRYPTO_CONFIG_PATH"
+            echo "MASTER_KEY_PATH=$MASTER_KEY_PATH"
+            echo "STATE_PATH=$STATE_PATH"
+            echo "EXPECTED_CONTENT_FILE=$EXPECTED_CONTENT_FILE"
+            echo "MUTATION_CONTENT_FILE=$MUTATION_CONTENT_FILE"
+            echo "CONFLICT_CONTENT_FILE=$CONFLICT_CONTENT_FILE"
+            echo "APP_GROUP_DIR=$APP_GROUP_DIR"
+            echo "FILEPROVIDER_LISTEN_ADDR=$FILEPROVIDER_LISTEN_ADDR"
+            echo "FILEPROVIDER_ENDPOINT=$FILEPROVIDER_ENDPOINT"
+            echo "REMOTE_PREFIX=$REMOTE_PREFIX"
+            echo "FIXTURE_REL=$FIXTURE_REL"
+            echo "MUTATION_REL=$MUTATION_REL"
+            echo "CONFLICT_REL=$CONFLICT_REL"
+          } >> "$GITHUB_ENV"
+
+      - name: Install E2EE master key
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$MASTER_KEY_PATH" <<'PY'
+          import base64
+          import binascii
+          import os
+          import sys
+
+          target = sys.argv[1]
+          encoded = os.environ.get("TCFS_SMOKE_MASTER_KEY_B64", "").strip()
+          try:
+              key = base64.b64decode(encoded, validate=True)
+          except binascii.Error as exc:
+              print(f"::error::TCFS_SMOKE_MASTER_KEY_B64 is not valid base64: {exc}")
+              raise SystemExit(1)
+
+          if len(key) != 32:
+              print(
+                  f"::error::TCFS_SMOKE_MASTER_KEY_B64 decoded to {len(key)} bytes; expected 32"
+              )
+              raise SystemExit(1)
+
+          with open(target, "wb") as fh:
+              fh.write(key)
+          PY
+          chmod 600 "$MASTER_KEY_PATH"
+
+      - name: Download package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PACKAGE_PATH="$RUNNER_TEMP/tcfs-${VERSION}-macos-aarch64.pkg"
+          PACKAGE_URL="${{ github.event.inputs.package_url }}"
+          PACKAGE_ARTIFACT_RUN_ID="${{ github.event.inputs.package_artifact_run_id }}"
+          PACKAGE_ARTIFACT_NAME="${{ github.event.inputs.package_artifact_name }}"
+
+          if [[ -n "$PACKAGE_ARTIFACT_RUN_ID" ]]; then
+            artifact_dir="$RUNNER_TEMP/package-artifact"
+            artifact_json="$RUNNER_TEMP/package-artifacts.json"
+            artifact_zip="$RUNNER_TEMP/package-artifact.zip"
+            mkdir -p "$artifact_dir"
+            curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/${PACKAGE_ARTIFACT_RUN_ID}/artifacts?per_page=100" \
+              -o "$artifact_json"
+            artifact_url="$(
+          python3 - "$artifact_json" "$PACKAGE_ARTIFACT_NAME" <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          wanted = sys.argv[2]
+          for artifact in payload.get("artifacts", []):
+              if artifact.get("name") == wanted and not artifact.get("expired", False):
+                  print(artifact["archive_download_url"])
+                  raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+            )" || {
+              echo "::error::non-expired artifact $PACKAGE_ARTIFACT_NAME not found on run $PACKAGE_ARTIFACT_RUN_ID"
+              cat "$artifact_json"
+              exit 1
+            }
+            curl -fL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -o "$artifact_zip" \
+              "$artifact_url"
+            python3 -m zipfile -e "$artifact_zip" "$artifact_dir"
+            artifact_pkg="$(find "$artifact_dir" -type f -name '*.pkg' -print -quit)"
+            if [[ -z "$artifact_pkg" ]]; then
+              echo "::error::artifact $PACKAGE_ARTIFACT_NAME from run $PACKAGE_ARTIFACT_RUN_ID did not contain a .pkg"
+              find "$artifact_dir" -type f -print
+              exit 1
+            fi
+            cp "$artifact_pkg" "$PACKAGE_PATH"
+          elif [[ -n "$PACKAGE_URL" ]]; then
+            curl -fL -o "$PACKAGE_PATH" "$PACKAGE_URL"
+          else
+            curl -fL \
+              -o "$PACKAGE_PATH" \
+              "https://github.com/${{ github.repository }}/releases/download/${TAG}/tcfs-${VERSION}-macos-aarch64.pkg"
+          fi
+
+          echo "PACKAGE_PATH=$PACKAGE_PATH" >> "$GITHUB_ENV"
+
+      - name: Verify package structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --pkg "$PACKAGE_PATH"
+          )
+
+          if [[ "${{ github.event.inputs.fileprovider_testing_mode }}" != "true" ]]; then
+            args+=(--require-signature)
+          fi
+
+          if [[ "${{ github.event.inputs.require_current_postinstall }}" == "true" ]]; then
+            args+=(--expected-postinstall scripts/macos-pkg-postinstall.sh)
+          else
+            args+=(--allow-postinstall-mismatch)
+          fi
+
+          bash scripts/macos-pkg-structure-smoke.sh "${args[@]}"
+
+      - name: Install package
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUDO_PASSWORD_FILE="${TCFS_RUNNER_SUDO_PASSWORD_FILE:-$HOME/.config/sops-nix/secrets/become/password}"
+          INSTALLER_BIN="${TCFS_INSTALLER:-}"
+
+          if [[ -z "$INSTALLER_BIN" ]]; then
+            if command -v installer >/dev/null 2>&1; then
+              INSTALLER_BIN="$(command -v installer)"
+            elif [[ -x /usr/sbin/installer ]]; then
+              INSTALLER_BIN="/usr/sbin/installer"
+            else
+              echo "::error::installer command not found"
+              exit 1
+            fi
+          fi
+
+          if sudo -n true 2>/dev/null; then
+            sudo "$INSTALLER_BIN" -pkg "$PACKAGE_PATH" -target /
+          elif [[ -n "${TCFS_RUNNER_SUDO_PASSWORD:-}" ]]; then
+            printf '%s\n' "$TCFS_RUNNER_SUDO_PASSWORD" \
+              | sudo -S -p '' "$INSTALLER_BIN" -pkg "$PACKAGE_PATH" -target /
+          elif [[ -r "$SUDO_PASSWORD_FILE" ]]; then
+            sudo -S -p '' "$INSTALLER_BIN" -pkg "$PACKAGE_PATH" -target / < "$SUDO_PASSWORD_FILE"
+          else
+            echo "::error::sudo requires a password; set TCFS_RUNNER_SUDO_PASSWORD secret or provide $SUDO_PASSWORD_FILE on the runner"
+            exit 1
+          fi
+
+      - name: Verify installed FileProvider signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/macos-fileprovider-preflight.sh \
+            --signing-only \
+            --require-production-signing \
+            --app-path /Applications/TCFSProvider.app
+
+      - name: Prove installed-binary smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          env \
+            -u TCFS_S3_ACCESS \
+            -u TCFS_S3_SECRET \
+            -u AWS_ACCESS_KEY_ID \
+            -u AWS_SECRET_ACCESS_KEY \
+            bash scripts/install-smoke.sh --expected-version "${BINARY_EXPECTED_VERSION}"
+
+      - name: Verify PZM lab Gatekeeper profile
+        if: ${{ github.event.inputs.lab_gatekeeper_override == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/macos-fileprovider-lab-gatekeeper-override.sh apply \
+            --log-dir "$LOG_DIR/lab-gatekeeper-override"
+
+      - name: Probe installed FileProvider app launch policy
+        if: ${{ github.event.inputs.fileprovider_testing_mode == 'true' }}
+        shell: bash
+        run: |
+          set +e
+          HOST_BIN="/Applications/TCFSProvider.app/Contents/MacOS/TCFSProvider"
+          LOG_PATH="$LOG_DIR/installed-host-policy-probe.log"
+          EXIT_PATH="$LOG_DIR/installed-host-policy-probe.exit"
+
+          run_bounded() {
+            local timeout_secs="$1"
+            shift
+
+            local pid
+            local waited=0
+            local status=0
+
+            "$@" > "$LOG_PATH" 2>&1 &
+            pid="$!"
+
+            while kill -0 "$pid" 2>/dev/null; do
+              if (( waited >= timeout_secs )); then
+                {
+                  echo "pid=$pid"
+                  ps -p "$pid" -o pid,ppid,stat,etime,command || true
+                } > "$LOG_DIR/installed-host-policy-probe.ps" 2>&1 || true
+                if command -v sample >/dev/null 2>&1; then
+                  sample "$pid" 3 -file "$LOG_DIR/installed-host-policy-probe.sample.txt" \
+                    >/dev/null 2>&1 || true
+                fi
+                kill "$pid" 2>/dev/null || true
+                perl -e 'select undef, undef, undef, 1.0'
+                kill -KILL "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                echo "timed out after ${timeout_secs}s" >> "$LOG_PATH"
+                return 124
+              fi
+              perl -e 'select undef, undef, undef, 1.0'
+              waited=$((waited + 1))
+            done
+
+            wait "$pid" || status=$?
+            return "$status"
+          }
+
+          if [[ ! -x "$HOST_BIN" ]]; then
+            echo "missing executable host binary: $HOST_BIN" > "$LOG_PATH"
+            echo "exit=127" > "$EXIT_PATH"
+            exit 0
+          fi
+
+          if ! strings "$HOST_BIN" | grep -Fq "TCFS_FILEPROVIDER_HOST_POLICY_PROBE_ONLY"; then
+            echo "installed host does not contain policy-probe support; skipping" > "$LOG_PATH"
+            echo "exit=skipped" > "$EXIT_PATH"
+            exit 0
+          fi
+
+          run_bounded 15 env \
+            TCFS_FILEPROVIDER_HOST_STDERR_LOG=1 \
+            TCFS_FILEPROVIDER_HOST_POLICY_PROBE_ONLY=1 \
+            TCFS_FILEPROVIDER_TESTING_MODE_ALWAYS_ENABLED=1 \
+            "$HOST_BIN"
+          status=$?
+          echo "exit=$status" > "$EXIT_PATH"
+          cat "$LOG_PATH" || true
+          exit 0
+
+      - name: Write live config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${TCFS_SMOKE_S3_ENDPOINT}" == https://* ]]; then
+            STORAGE_ENFORCE_TLS=true
+          else
+            STORAGE_ENFORCE_TLS=false
+          fi
+          cat > "$CONFIG_PATH" <<EOF
+          [daemon]
+          socket = "/tmp/tcfsd-gha.sock"
+          listen = "${FILEPROVIDER_LISTEN_ADDR}"
+          fileprovider_endpoint = "${FILEPROVIDER_ENDPOINT}"
+          metrics_addr = "127.0.0.1:19100"
+          log_format = "text"
+
+          [storage]
+          endpoint = "${TCFS_SMOKE_S3_ENDPOINT}"
+          region = "us-east-1"
+          bucket = "${TCFS_SMOKE_S3_BUCKET}"
+          remote_prefix = "${REMOTE_PREFIX}"
+          enforce_tls = ${STORAGE_ENFORCE_TLS}
+
+          [crypto]
+          enabled = true
+          master_key_file = "${MASTER_KEY_PATH}"
+
+          # This smoke proves Finder/FileProvider enumeration and hydration.
+          # CLI fixture checks above already prove live storage + E2EE. Keep the
+          # daemon auth boundary explicit here until FileProvider carries a
+          # session token.
+          [auth]
+          require_session = false
+
+          [sync]
+          state_db = "${RUNNER_TEMP}/tcfs-state.db"
+          sync_root = "${SYNC_ROOT}"
+          device_name = "gha-macos-postinstall"
+
+          device_id = "gha-macos-postinstall"
+          EOF
+          chmod 600 "$CONFIG_PATH"
+
+      - name: Provision FileProvider config
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILEPROVIDER_CONFIG_PATH="$HOME/.config/tcfs/fileprovider/config.json"
+          REQUIRE_CLI_FILEPROVIDER_CONFIG="${{ github.event.inputs.require_cli_fileprovider_config }}"
+
+          if tcfs --config "$CONFIG_PATH" config fileprovider --help >/dev/null 2>&1; then
+            tcfs --config "$CONFIG_PATH" config fileprovider \
+              --out "$FILEPROVIDER_CONFIG_PATH" \
+              --device-id "gha-macos-postinstall" \
+              --master-key-file "$MASTER_KEY_PATH" \
+              --force
+
+            if [[ "${{ github.event.inputs.fileprovider_testing_mode }}" != "true" && -d "$APP_GROUP_DIR" ]]; then
+              install -m 600 "$FILEPROVIDER_CONFIG_PATH" "$APP_GROUP_DIR/config.json"
+              echo "==> Also written to $APP_GROUP_DIR/config.json"
+            fi
+          elif [[ "$REQUIRE_CLI_FILEPROVIDER_CONFIG" == "true" ]]; then
+            echo "::error::Installed tcfs does not support 'config fileprovider'; cannot prove Rust-owned FileProvider JSON path."
+            exit 1
+          else
+            echo "::warning::Installed tcfs lacks 'config fileprovider'; falling back to legacy provision-config.sh"
+            if [[ "${{ github.event.inputs.fileprovider_testing_mode }}" == "true" ]]; then
+              TCFS_FILEPROVIDER_SKIP_APP_GROUP_COPY=1 \
+                bash swift/fileprovider/provision-config.sh "$CONFIG_PATH"
+            else
+              bash swift/fileprovider/provision-config.sh "$CONFIG_PATH"
+            fi
+          fi
+
+      - name: Seed remote fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_bounded() {
+            local label="$1"
+            local timeout_secs="$2"
+            shift 2
+
+            local out="$LOG_DIR/$label"
+            local pid
+            local waited=0
+            local status=0
+
+            "$@" > "$out" 2>&1 &
+            pid="$!"
+
+            while kill -0 "$pid" 2>/dev/null; do
+              if (( waited >= timeout_secs )); then
+                kill "$pid" 2>/dev/null || true
+                perl -e 'select undef, undef, undef, 1.0'
+                kill -KILL "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                echo "timed out after ${timeout_secs}s" >> "$out"
+                return 124
+              fi
+              perl -e 'select undef, undef, undef, 1.0'
+              waited=$((waited + 1))
+            done
+
+            wait "$pid" || status=$?
+            return "$status"
+          }
+
+          FIXTURE_PATH="${SYNC_ROOT}/${FIXTURE_REL}"
+          mkdir -p "$(dirname "$FIXTURE_PATH")"
+          printf 'tcfs macOS post-install smoke %s run %s\n' "$TAG" "$GITHUB_RUN_ID" > "$EXPECTED_CONTENT_FILE"
+          cp "$EXPECTED_CONTENT_FILE" "$FIXTURE_PATH"
+          if ! run_bounded tcfs-push.log 120 tcfs --config "$CONFIG_PATH" push "$FIXTURE_PATH"; then
+            echo "::error::tcfs push failed or timed out"
+            cat "$LOG_DIR/tcfs-push.log" || true
+            exit 1
+          fi
+
+          if [[ "${{ github.event.inputs.exercise_conflict_status }}" == "true" ]]; then
+            CONFLICT_PATH="${SYNC_ROOT}/${CONFLICT_REL}"
+            mkdir -p "$(dirname "$CONFLICT_PATH")"
+            printf 'tcfs macOS FileProvider conflict fixture %s run %s attempt %s\n' \
+              "$TAG" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$CONFLICT_CONTENT_FILE"
+            cp "$CONFLICT_CONTENT_FILE" "$CONFLICT_PATH"
+            if ! run_bounded tcfs-conflict-push.log 120 tcfs --config "$CONFIG_PATH" push "$CONFLICT_PATH"; then
+              echo "::error::tcfs conflict fixture push failed or timed out"
+              cat "$LOG_DIR/tcfs-conflict-push.log" || true
+              exit 1
+            fi
+            python3 - "$STATE_PATH" "$CONFLICT_PATH" "$CONFLICT_REL" <<'PY'
+          import json
+          import os
+          import sys
+          import time
+
+          state_path, conflict_path, rel_path = sys.argv[1:4]
+          key = os.path.realpath(conflict_path)
+          with open(state_path, encoding="utf-8") as fh:
+              state = json.load(fh)
+          entries = state.get("entries", state)
+          entry = entries.get(key)
+          if entry is None:
+              raise SystemExit(f"state entry not found for {key}")
+          entry["status"] = "conflict"
+          entry["conflict"] = {
+              "rel_path": rel_path,
+              "local_vclock": {"clocks": {"gha-macos-postinstall": 1}},
+              "remote_vclock": {"clocks": {"fixture-remote": 1}},
+              "local_blake3": entry.get("blake3", ""),
+              "remote_blake3": entry.get("blake3", ""),
+              "local_device": "gha-macos-postinstall",
+              "remote_device": "fixture-remote",
+              "detected_at": int(time.time()),
+          }
+          with open(state_path, "w", encoding="utf-8") as fh:
+              json.dump(state, fh, indent=2, sort_keys=True)
+              fh.write("\n")
+          PY
+          fi
+
+      - name: Verify remote fixture requires E2EE key
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_bounded() {
+            local label="$1"
+            local timeout_secs="$2"
+            shift 2
+
+            local out="$LOG_DIR/$label"
+            local pid
+            local waited=0
+            local status=0
+
+            "$@" > "$out" 2>&1 &
+            pid="$!"
+
+            while kill -0 "$pid" 2>/dev/null; do
+              if (( waited >= timeout_secs )); then
+                kill "$pid" 2>/dev/null || true
+                perl -e 'select undef, undef, undef, 1.0'
+                kill -KILL "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                echo "timed out after ${timeout_secs}s" >> "$out"
+                return 124
+              fi
+              perl -e 'select undef, undef, undef, 1.0'
+              waited=$((waited + 1))
+            done
+
+            wait "$pid" || status=$?
+            return "$status"
+          }
+
+          FIXTURE_PATH="${SYNC_ROOT}/${FIXTURE_REL}"
+          if [[ "${TCFS_SMOKE_S3_ENDPOINT}" == https://* ]]; then
+            STORAGE_ENFORCE_TLS=true
+          else
+            STORAGE_ENFORCE_TLS=false
+          fi
+          cat > "$NO_CRYPTO_CONFIG_PATH" <<EOF
+          [daemon]
+          socket = "/tmp/tcfsd-gha-no-crypto.sock"
+          metrics_addr = "127.0.0.1:19101"
+          log_format = "text"
+
+          [storage]
+          endpoint = "${TCFS_SMOKE_S3_ENDPOINT}"
+          region = "us-east-1"
+          bucket = "${TCFS_SMOKE_S3_BUCKET}"
+          remote_prefix = "${REMOTE_PREFIX}"
+          enforce_tls = ${STORAGE_ENFORCE_TLS}
+
+          [sync]
+          state_db = "${RUNNER_TEMP}/tcfs-no-crypto-state.db"
+          sync_root = "${SYNC_ROOT}"
+          device_name = "gha-macos-postinstall-no-crypto"
+          EOF
+          chmod 600 "$NO_CRYPTO_CONFIG_PATH"
+
+          no_crypto_status=0
+          run_bounded no-crypto-pull.log 60 \
+            tcfs --config "$NO_CRYPTO_CONFIG_PATH" pull "$FIXTURE_PATH" "$RUNNER_TEMP/no-crypto-pull-check" \
+            || no_crypto_status=$?
+          if [[ "$no_crypto_status" -eq 0 ]]; then
+            echo "::error::Encrypted smoke fixture was readable without the E2EE master key"
+            cat "$LOG_DIR/no-crypto-pull.log"
+            exit 1
+          fi
+          if [[ "$no_crypto_status" -eq 124 ]]; then
+            echo "::error::No-crypto pull timed out; this does not prove E2EE rejection"
+            cat "$LOG_DIR/no-crypto-pull.log" || true
+            exit 1
+          fi
+
+          if ! run_bounded e2ee-pull.log 120 \
+            tcfs --config "$CONFIG_PATH" pull "$FIXTURE_PATH" "$RUNNER_TEMP/e2ee-pull-check"; then
+            echo "::error::E2EE pull failed or timed out"
+            cat "$LOG_DIR/e2ee-pull.log" || true
+            exit 1
+          fi
+          cmp -s "$EXPECTED_CONTENT_FILE" "$RUNNER_TEMP/e2ee-pull-check"
+
+      - name: Start tcfsd with live config
+        shell: bash
+        run: |
+          set -euo pipefail
+          nohup tcfsd --config "$CONFIG_PATH" --mode daemon --log-format text \
+            > "$LOG_DIR/tcfsd.log" 2>&1 &
+          echo "$!" > "$LOG_DIR/tcfsd.pid"
+
+          for socket in /tmp/tcfsd-gha.sock; do
+            ready=0
+            for _ in $(seq 1 60); do
+              if [[ -S "$socket" ]]; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [[ "$ready" -ne 1 ]]; then
+              echo "::error::Timed out waiting for socket $socket"
+              cat "$LOG_DIR/tcfsd.log" || true
+              exit 1
+            fi
+          done
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if python3 - "$FILEPROVIDER_LISTEN_ADDR" <<'PY'
+          import socket
+          import sys
+
+          host, port = sys.argv[1].rsplit(":", 1)
+          with socket.create_connection((host, int(port)), timeout=1):
+              pass
+          PY
+            then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" -ne 1 ]]; then
+            echo "::error::Timed out waiting for TCP listener $FILEPROVIDER_LISTEN_ADDR"
+            cat "$LOG_DIR/tcfsd.log" || true
+            exit 1
+          fi
+
+      - name: Run macOS post-install harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --expected-version "${BINARY_EXPECTED_VERSION}" \
+            --config "$CONFIG_PATH" \
+            --expected-file "${FIXTURE_REL}" \
+            --expected-content-file "$EXPECTED_CONTENT_FILE" \
+            --require-keychain-config \
+            --soak-cycles "${{ github.event.inputs.soak_cycles }}" \
+            --log-dir "$LOG_DIR/harness"
+          )
+
+          if [[ "${{ github.event.inputs.elect_plugin_use }}" == "true" ]]; then
+            args+=(--elect-plugin-use)
+          fi
+
+          if [[ "${{ github.event.inputs.rebuild_domain }}" == "true" ]]; then
+            args+=(--rebuild-domain)
+          fi
+
+          if [[ "${{ github.event.inputs.host_root_probe }}" == "true" ]]; then
+            args+=(--host-root-probe)
+          fi
+
+          if [[ "${{ github.event.inputs.fileprovider_testing_mode }}" == "true" ]]; then
+            printf 'tcfs macOS FileProvider mutation %s run %s attempt %s\n' \
+              "$TAG" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$MUTATION_CONTENT_FILE"
+            args+=(--fileprovider-testing-mode)
+            args+=(--exercise-evict-rehydrate)
+            args+=(
+              --exercise-mutation \
+              --mutation-file "$MUTATION_REL" \
+              --mutation-content-file "$MUTATION_CONTENT_FILE" \
+              --remote-prefix "$REMOTE_PREFIX"
+            )
+            if [[ "${{ github.event.inputs.exercise_rename_safety }}" == "true" ]]; then
+              RENAME_REL="ci-smoke/${VERSION}/rename-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
+              RENAME_DEST_REL="ci-smoke/${VERSION}/rename-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-renamed.txt"
+              RENAME_CONTENT_FILE="$RUNNER_TEMP/fileprovider-rename-content.txt"
+              printf 'tcfs macOS FileProvider rename %s run %s attempt %s\n' \
+                "$TAG" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$RENAME_CONTENT_FILE"
+              args+=(
+                --exercise-rename-safety \
+                --rename-source-file "$RENAME_REL" \
+                --rename-dest-file "$RENAME_DEST_REL" \
+                --rename-content-file "$RENAME_CONTENT_FILE"
+              )
+            fi
+            if [[ "${{ github.event.inputs.exercise_conflict_status }}" == "true" ]]; then
+              args+=(
+                --exercise-conflict-status \
+                --conflict-file "$CONFLICT_REL" \
+                --conflict-content-file "$CONFLICT_CONTENT_FILE" \
+                --state "$STATE_PATH" \
+                --sync-root "$SYNC_ROOT"
+              )
+              if [[ "${{ github.event.inputs.require_conflict_enumerator_status }}" == "true" ]]; then
+                args+=(--require-conflict-enumerator-status)
+              fi
+            fi
+          elif [[ "${{ github.event.inputs.exercise_dev_id_layered_proof }}" == "true" ]]; then
+            printf 'tcfs macOS FileProvider mutation %s run %s attempt %s\n' \
+              "$TAG" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$MUTATION_CONTENT_FILE"
+            args+=(--exercise-evict-rehydrate)
+            args+=(
+              --exercise-mutation \
+              --mutation-file "$MUTATION_REL" \
+              --mutation-content-file "$MUTATION_CONTENT_FILE" \
+              --remote-prefix "$REMOTE_PREFIX"
+            )
+            if [[ "${{ github.event.inputs.exercise_rename_safety }}" == "true" ]]; then
+              RENAME_REL="ci-smoke/${VERSION}/rename-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
+              RENAME_DEST_REL="ci-smoke/${VERSION}/rename-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-renamed.txt"
+              RENAME_CONTENT_FILE="$RUNNER_TEMP/fileprovider-rename-content.txt"
+              printf 'tcfs macOS FileProvider rename %s run %s attempt %s\n' \
+                "$TAG" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$RENAME_CONTENT_FILE"
+              args+=(
+                --exercise-rename-safety \
+                --rename-source-file "$RENAME_REL" \
+                --rename-dest-file "$RENAME_DEST_REL" \
+                --rename-content-file "$RENAME_CONTENT_FILE"
+              )
+            fi
+            if [[ "${{ github.event.inputs.exercise_conflict_status }}" == "true" ]]; then
+              args+=(
+                --exercise-conflict-status \
+                --conflict-file "$CONFLICT_REL" \
+                --conflict-content-file "$CONFLICT_CONTENT_FILE" \
+                --state "$STATE_PATH" \
+                --sync-root "$SYNC_ROOT"
+              )
+              if [[ "${{ github.event.inputs.require_conflict_enumerator_status }}" == "true" ]]; then
+                args+=(--require-conflict-enumerator-status)
+              fi
+            fi
+          fi
+
+          bash scripts/macos-postinstall-smoke.sh "${args[@]}"
+
+      - name: Capture diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          run_bounded() {
+            local label="$1"
+            local timeout_secs="$2"
+            shift 2
+
+            local out="$LOG_DIR/$label"
+            local pid
+            local waited=0
+
+            "$@" > "$out" 2>&1 &
+            pid="$!"
+
+            while kill -0 "$pid" 2>/dev/null; do
+              if (( waited >= timeout_secs )); then
+                kill "$pid" 2>/dev/null || true
+                perl -e 'select undef, undef, undef, 1.0'
+                kill -KILL "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                echo "timed out after ${timeout_secs}s" >> "$out"
+                return 124
+              fi
+              perl -e 'select undef, undef, undef, 1.0'
+              waited=$((waited + 1))
+            done
+
+            wait "$pid"
+          }
+
+          pluginkit -m -A -D -i io.tinyland.tcfs.fileprovider > "$LOG_DIR/pluginkit.txt" 2>&1
+          capture_bundle_signing() {
+            local label="$1"
+            local bundle="$2"
+            local profile="$bundle/Contents/embedded.provisionprofile"
+
+            if [[ ! -e "$bundle" ]]; then
+              echo "$bundle not found" > "$LOG_DIR/${label}-missing.txt"
+              return
+            fi
+
+            codesign --verify --deep --strict --verbose=4 "$bundle" \
+              > "$LOG_DIR/${label}-codesign-verify.txt" 2>&1 || true
+            codesign -dvvv --entitlements :- "$bundle" \
+              > "$LOG_DIR/${label}-codesign-detail.txt" 2>&1 || true
+            {
+              ls -ldeO@ "$bundle" || true
+              find "$bundle" -maxdepth 3 \( -type d -o -type f \) -print 2>/dev/null \
+                | while IFS= read -r path; do
+                    ls -ldeO@ "$path" || true
+                  done
+            } > "$LOG_DIR/${label}-ls-flags.txt" 2>&1 || true
+            if command -v xattr >/dev/null 2>&1; then
+              xattr -lr "$bundle" > "$LOG_DIR/${label}-xattrs.txt" 2>&1 || true
+            else
+              echo "xattr not found" > "$LOG_DIR/${label}-xattrs.txt"
+            fi
+
+            local spctl_bin
+            spctl_bin="$(command -v spctl || true)"
+            if [[ -z "$spctl_bin" && -x /usr/sbin/spctl ]]; then
+              spctl_bin=/usr/sbin/spctl
+            fi
+            if [[ -n "$spctl_bin" ]]; then
+              "$spctl_bin" --assess --type execute --verbose=4 "$bundle" \
+                > "$LOG_DIR/${label}-spctl-execute.txt" 2>&1 || true
+            else
+              echo "spctl not found" > "$LOG_DIR/${label}-spctl-execute.txt"
+            fi
+            if command -v syspolicy_check >/dev/null 2>&1; then
+              syspolicy_check distribution "$bundle" \
+                > "$LOG_DIR/${label}-syspolicy-distribution.txt" 2>&1 || true
+              syspolicy_check notary-submission "$bundle" \
+                > "$LOG_DIR/${label}-syspolicy-notary-submission.txt" 2>&1 || true
+            else
+              echo "syspolicy_check not found" \
+                > "$LOG_DIR/${label}-syspolicy-distribution.txt"
+              echo "syspolicy_check not found" \
+                > "$LOG_DIR/${label}-syspolicy-notary-submission.txt"
+            fi
+
+            if [[ -f "$profile" ]]; then
+              security cms -D -i "$profile" \
+                > "$LOG_DIR/${label}-embedded-profile.plist" 2>&1 || true
+              if [[ -s "$LOG_DIR/${label}-embedded-profile.plist" ]]; then
+                plutil -extract Entitlements xml1 -o "$LOG_DIR/${label}-profile-entitlements.plist" \
+                  "$LOG_DIR/${label}-embedded-profile.plist" 2>/dev/null || true
+                plutil -extract DeveloperCertificates.0 raw -o "$LOG_DIR/${label}-profile-cert-0.b64" \
+                  "$LOG_DIR/${label}-embedded-profile.plist" 2>/dev/null || true
+              fi
+            fi
+          }
+          capture_bundle_signing host-app /Applications/TCFSProvider.app
+          capture_bundle_signing fileprovider-extension /Applications/TCFSProvider.app/Contents/Extensions/TCFSFileProvider.appex
+          if command -v fileproviderctl >/dev/null 2>&1; then
+            fileproviderctl domain list > "$LOG_DIR/fileproviderctl-domains.txt" 2>&1
+            run_bounded fileproviderctl-dump.txt 10 fileproviderctl dump || true
+            mkdir -p "$LOG_DIR/fileproviderctl-diagnose"
+            run_bounded fileproviderctl-diagnose.log 20 \
+              fileproviderctl diagnose -o "$LOG_DIR/fileproviderctl-diagnose" || true
+          fi
+          run_bounded oslog.txt 10 \
+            log show --style compact --last 5m \
+            --predicate 'subsystem BEGINSWITH "io.tinyland.tcfs"' \
+            || true
+          run_bounded apple-fileprovider-oslog.txt 15 \
+            log show --style compact --last 5m \
+            --predicate 'process == "fileproviderd" OR process == "pkd" OR process == "amfid" OR subsystem BEGINSWITH "com.apple.FileProvider" OR eventMessage CONTAINS[c] "TCFS" OR eventMessage CONTAINS "io.tinyland.tcfs"' \
+            || true
+          run_bounded apple-security-policy-oslog.txt 15 \
+            log show --style compact --last 5m \
+            --predicate 'process == "amfid" OR process == "taskgated-helper" OR process == "syspolicyd" OR process == "sandboxd" OR process == "tccd" OR eventMessage CONTAINS[c] "Security policy would not allow" OR eventMessage CONTAINS[c] "restricted entitlements" OR eventMessage CONTAINS[c] "io.tinyland.tcfs" OR eventMessage CONTAINS[c] "TCFSProvider"' \
+            || true
+
+      - name: Stop tcfsd
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [[ -f "$LOG_DIR/tcfsd.pid" ]]; then
+            kill "$(cat "$LOG_DIR/tcfsd.pid")" 2>/dev/null || true
+            wait "$(cat "$LOG_DIR/tcfsd.pid")" 2>/dev/null || true
+          fi
+
+      - name: Record PZM lab Gatekeeper profile cleanup
+        if: always() && github.event.inputs.lab_gatekeeper_override == 'true'
+        shell: bash
+        run: |
+          set +e
+          bash scripts/macos-fileprovider-lab-gatekeeper-override.sh cleanup \
+            --log-dir "$LOG_DIR/lab-gatekeeper-override-cleanup" || true
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-postinstall-smoke-${{ github.event.inputs.tag }}
+          path: ${{ env.LOG_DIR }}
+          if-no-files-found: ignore
+          retention-days: 7

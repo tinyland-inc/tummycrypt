@@ -67,9 +67,9 @@ class TCFSFileProviderItem: NSObject, NSFileProviderItem {
 
     var capabilities: NSFileProviderItemCapabilities {
         if contentType == .folder {
-            return [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems, .allowsDeleting, .allowsRenaming]
+            return [.allowsReading, .allowsContentEnumerating]
         }
-        return [.allowsReading, .allowsWriting, .allowsDeleting, .allowsRenaming, .allowsReparenting]
+        return [.allowsReading]
     }
 
     var contentPolicy: NSFileProviderContentPolicy {

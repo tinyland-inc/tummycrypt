@@ -4,7 +4,25 @@
 //! transparently migrated on read via `from_bytes()`.
 
 use crate::conflict::VectorClock;
+use crate::index_entry::RemoteEntryKind;
 use serde::{Deserialize, Serialize};
+
+/// One per-device FileKey wrap carried by a regular-file manifest.
+///
+/// This is additive for TIN-1417 Phase 1. Existing manifests continue to use
+/// `encrypted_file_key`; upgraded writers can dual-write this field before the
+/// fleet cuts over to per-device unwrap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrappedFileKey {
+    /// Stable TCFS device identifier this wrap is intended for.
+    pub recipient_device_id: String,
+    /// Public age recipient used when producing this wrap.
+    pub recipient: String,
+    /// Cryptographic wrap algorithm, for example `age-x25519-v1`.
+    pub algorithm: String,
+    /// Wrapped FileKey payload.
+    pub wrapped_key: String,
+}
 
 /// A manifest describing a synced file's chunks and metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +50,69 @@ pub struct SyncManifest {
     /// Base64-encoded wrapped file key (present only when E2E encryption is enabled)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_file_key: Option<String>,
+    /// Per-device wrapped FileKeys for manifest schema v3 migration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wrapped_file_keys: Vec<WrappedFileKey>,
+}
+
+/// A manifest for a POSIX symbolic link.
+///
+/// Symlinks intentionally use a separate v3 shape rather than pretending to be
+/// zero-byte regular files. Older clients that do not understand this shape
+/// fail to hydrate it instead of silently materializing the wrong file type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymlinkManifest {
+    /// Manifest format version (3 for symlink manifests)
+    pub version: u32,
+    /// Object kind discriminator.
+    pub kind: RemoteEntryKind,
+    /// Link target text exactly as returned by `readlink` for supported paths.
+    pub symlink_target: String,
+    /// Vector clock at the time of writing
+    pub vclock: VectorClock,
+    /// Device ID that wrote this manifest
+    pub written_by: String,
+    /// Unix timestamp when this manifest was written
+    pub written_at: u64,
+    /// Relative path of the symlink.
+    pub rel_path: Option<String>,
+}
+
+impl SymlinkManifest {
+    pub fn new(
+        symlink_target: impl Into<String>,
+        vclock: VectorClock,
+        written_by: String,
+        written_at: u64,
+        rel_path: Option<String>,
+    ) -> Self {
+        Self {
+            version: 3,
+            kind: RemoteEntryKind::Symlink,
+            symlink_target: symlink_target.into(),
+            vclock,
+            written_by,
+            written_at,
+            rel_path,
+        }
+    }
+
+    pub fn from_bytes(data: &[u8]) -> anyhow::Result<Self> {
+        let manifest: SymlinkManifest = serde_json::from_slice(data)
+            .map_err(|e| anyhow::anyhow!("parsing symlink manifest: {e}"))?;
+        if manifest.version != 3 {
+            anyhow::bail!("unsupported symlink manifest version: {}", manifest.version);
+        }
+        if manifest.kind != RemoteEntryKind::Symlink {
+            anyhow::bail!("manifest is not a symlink");
+        }
+        Ok(manifest)
+    }
+
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec_pretty(self)
+            .map_err(|e| anyhow::anyhow!("serializing symlink manifest: {e}"))
+    }
 }
 
 impl SyncManifest {
@@ -43,9 +124,12 @@ impl SyncManifest {
         let text = String::from_utf8(data.to_vec())
             .map_err(|e| anyhow::anyhow!("manifest is not UTF-8: {e}"))?;
 
-        // Try JSON (v2) first
-        if let Ok(manifest) = serde_json::from_str::<SyncManifest>(&text) {
-            return Ok(manifest);
+        // Try JSON (v2) first. JSON-shaped manifests that do not match the
+        // regular-file schema must fail closed instead of being treated as v1
+        // newline manifests.
+        if text.trim_start().starts_with('{') {
+            return serde_json::from_str::<SyncManifest>(&text)
+                .map_err(|e| anyhow::anyhow!("parsing regular-file manifest JSON: {e}"));
         }
 
         // Fall back to v1 text format: newline-separated chunk hashes
@@ -70,6 +154,7 @@ impl SyncManifest {
             rel_path: None,
             mode: None,
             encrypted_file_key: None,
+            wrapped_file_keys: Vec::new(),
         })
     }
 
@@ -109,6 +194,12 @@ mod tests {
             rel_path: Some("docs/readme.md".into()),
             mode: Some(0o644),
             encrypted_file_key: None,
+            wrapped_file_keys: vec![WrappedFileKey {
+                recipient_device_id: "device-a".into(),
+                recipient: "age1recipient".into(),
+                algorithm: "age-x25519-v1".into(),
+                wrapped_key: "AGE-ENCRYPTED-PAYLOAD".into(),
+            }],
         };
 
         let bytes = manifest.to_bytes().unwrap();
@@ -119,6 +210,8 @@ mod tests {
         assert_eq!(parsed.chunks.len(), 2);
         assert_eq!(parsed.vclock.get("yoga"), 1);
         assert_eq!(parsed.written_by, "yoga");
+        assert_eq!(parsed.wrapped_file_keys.len(), 1);
+        assert_eq!(parsed.wrapped_file_keys[0].recipient_device_id, "device-a");
     }
 
     #[test]
@@ -136,6 +229,25 @@ mod tests {
     fn test_empty_manifest_fails() {
         let result = SyncManifest::from_bytes(b"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_symlink_manifest_roundtrip() {
+        let manifest = SymlinkManifest::new(
+            "../target.txt",
+            VectorClock::new(),
+            "neo".to_string(),
+            1000,
+            Some("link.txt".to_string()),
+        );
+
+        let bytes = manifest.to_bytes().unwrap();
+        let parsed = SymlinkManifest::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.version, 3);
+        assert_eq!(parsed.kind, crate::index_entry::RemoteEntryKind::Symlink);
+        assert_eq!(parsed.symlink_target, "../target.txt");
+        assert!(SyncManifest::from_bytes(&bytes).is_err());
     }
 
     #[test]
@@ -185,6 +297,7 @@ mod proptest_suite {
                 rel_path: None,
                 mode: None,
                 encrypted_file_key: None,
+                wrapped_file_keys: Vec::new(),
             };
 
             let bytes = manifest.to_bytes().unwrap();

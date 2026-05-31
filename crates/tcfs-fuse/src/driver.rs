@@ -33,6 +33,17 @@ const DIR_TTL: Duration = Duration::from_secs(1);
 /// S3 backend is slow or unreachable.
 const VFS_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn parse_bool_flag(value: Option<&str>) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase) {
+        Some(value) => matches!(value.as_str(), "1" | "true" | "yes" | "on"),
+        None => false,
+    }
+}
+
+fn force_readdir_plus_enabled_from_env() -> bool {
+    parse_bool_flag(std::env::var("TCFS_FUSE_FORCE_READDIRPLUS").ok().as_deref())
+}
+
 /// Map VFS/anyhow errors to appropriate POSIX errno values.
 fn vfs_error_to_errno(err: &anyhow::Error) -> Errno {
     let msg = format!("{err:#}").to_lowercase();
@@ -79,6 +90,7 @@ fn to_fuse_attr(attr: &VfsAttr) -> FileAttr {
         kind: match attr.kind {
             VfsFileType::RegularFile => FileType::RegularFile,
             VfsFileType::Directory => FileType::Directory,
+            VfsFileType::Symlink => FileType::Symlink,
         },
         perm: attr.perm,
         nlink: attr.nlink,
@@ -97,6 +109,7 @@ fn to_fuse_file_type(kind: VfsFileType) -> FileType {
     match kind {
         VfsFileType::RegularFile => FileType::RegularFile,
         VfsFileType::Directory => FileType::Directory,
+        VfsFileType::Symlink => FileType::Symlink,
     }
 }
 
@@ -303,7 +316,7 @@ impl PathFilesystem for TcfsFs {
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
-    async fn open(&self, _req: Request, path: &OsStr, _flags: u32) -> fuse3::Result<ReplyOpen> {
+    async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> fuse3::Result<ReplyOpen> {
         let path_str = path.to_str().ok_or(Errno::from(libc::ENOENT))?;
 
         let (fh, _data) = tokio::time::timeout(VFS_TIMEOUT, self.vfs.open(path_str))
@@ -317,7 +330,79 @@ impl PathFilesystem for TcfsFs {
                 vfs_error_to_errno(&e)
             })?;
 
+        if flags & libc::O_TRUNC as u32 != 0 {
+            tokio::time::timeout(VFS_TIMEOUT, self.vfs.truncate(Some(path_str), Some(fh), 0))
+                .await
+                .map_err(|_| {
+                    warn!(path = %path_str, "FUSE OPEN truncate timed out");
+                    Errno::from(libc::EIO)
+                })?
+                .map_err(|e| {
+                    warn!(path = %path_str, error = %e, "FUSE OPEN truncate failed");
+                    vfs_error_to_errno(&e)
+                })?;
+        }
+
         Ok(ReplyOpen { fh, flags: 0 })
+    }
+
+    async fn readlink(&self, _req: Request, path: &OsStr) -> fuse3::Result<ReplyData> {
+        let path_str = path.to_str().ok_or(Errno::from(libc::ENOENT))?;
+
+        let target = tokio::time::timeout(VFS_TIMEOUT, self.vfs.readlink(path_str))
+            .await
+            .map_err(|_| {
+                warn!(path = %path_str, "FUSE READLINK timed out");
+                Errno::from(libc::EIO)
+            })?
+            .map_err(|e| {
+                warn!(path = %path_str, error = %e, "FUSE READLINK failed");
+                vfs_error_to_errno(&e)
+            })?;
+
+        Ok(ReplyData {
+            data: Bytes::from(target.into_bytes()),
+        })
+    }
+
+    async fn setattr(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        fh: Option<u64>,
+        set_attr: SetAttr,
+    ) -> fuse3::Result<ReplyAttr> {
+        let path_str = path.and_then(OsStr::to_str);
+
+        let attr = if let Some(size) = set_attr.size {
+            tokio::time::timeout(VFS_TIMEOUT, self.vfs.truncate(path_str, fh, size))
+                .await
+                .map_err(|_| {
+                    warn!(path = ?path_str, fh, size, "FUSE SETATTR truncate timed out");
+                    Errno::from(libc::EIO)
+                })?
+                .map_err(|e| {
+                    warn!(path = ?path_str, fh, size, error = %e, "FUSE SETATTR truncate failed");
+                    vfs_error_to_errno(&e)
+                })?
+        } else {
+            let path_str = path_str.ok_or_else(|| Errno::from(libc::ENOENT))?;
+            tokio::time::timeout(VFS_TIMEOUT, self.vfs.getattr(path_str))
+                .await
+                .map_err(|_| {
+                    warn!(path = %path_str, "FUSE SETATTR getattr timed out");
+                    Errno::from(libc::EIO)
+                })?
+                .map_err(|e| {
+                    warn!(path = %path_str, error = %e, "FUSE SETATTR getattr failed");
+                    vfs_error_to_errno(&e)
+                })?
+        };
+
+        Ok(ReplyAttr {
+            ttl: ATTR_TTL,
+            attr: to_fuse_attr(&attr),
+        })
     }
 
     async fn read(
@@ -583,12 +668,19 @@ pub async fn mount(
     let mut opts = MountOptions::default();
     opts.fs_name("tcfs");
     opts.read_only(cfg.read_only);
-    opts.force_readdir_plus(true);
+    let force_readdir_plus = force_readdir_plus_enabled_from_env();
+    if force_readdir_plus {
+        opts.force_readdir_plus(true);
+    }
     if cfg.allow_other {
         opts.allow_other(true);
     }
 
-    info!(mountpoint = %cfg.mountpoint.display(), "mounting tcfs via FUSE3 (unprivileged)");
+    info!(
+        mountpoint = %cfg.mountpoint.display(),
+        force_readdir_plus,
+        "mounting tcfs via FUSE3 (unprivileged)"
+    );
 
     let handle = Session::new(opts)
         .mount_with_unprivileged(fs, &cfg.mountpoint)
@@ -643,5 +735,17 @@ mod tests {
     fn errno_mapping_default_eio() {
         let err = anyhow::anyhow!("some unknown storage error");
         assert_eq!(vfs_error_to_errno(&err), Errno::from(libc::EIO));
+    }
+
+    #[test]
+    fn force_readdir_plus_flag_is_opt_in() {
+        assert!(!parse_bool_flag(None));
+        assert!(!parse_bool_flag(Some("")));
+        assert!(!parse_bool_flag(Some("0")));
+        assert!(!parse_bool_flag(Some("false")));
+        assert!(parse_bool_flag(Some("1")));
+        assert!(parse_bool_flag(Some("true")));
+        assert!(parse_bool_flag(Some("YES")));
+        assert!(parse_bool_flag(Some(" on ")));
     }
 }

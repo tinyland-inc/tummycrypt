@@ -56,7 +56,7 @@ As of April 15, 2026:
 │  │  - FileProviderExtension.swift             │  │
 │  │  - FileProviderItem.swift                  │  │
 │  │  - FileProviderEnumerator.swift            │  │
-│  │  - ContentKeychain.swift (~2000 LOC)       │  │
+│  │  - Keychain helpers in host/extension code │  │
 │  └────────────────┬───────────────────────────┘  │
 │                   │ UniFFI (C ABI)               │
 │  ┌────────────────┴───────────────────────────┐  │
@@ -233,7 +233,7 @@ enum ProviderError {
 - Background refresh via `NSFileProviderManager.signalEnumerator`
 - Push notifications for real-time updates (APNs or polling)
 
-### Phase 7e: UI + Polish (PR #65, IN PROGRESS)
+### Phase 7e: UI + Polish (PR #65 merged; broader iOS proof remains incomplete)
 
 - [x] Progress reporting during hydration (UniFFI callback interface → NSProgress)
 - [x] Conflict detection via vclock divergence (`check_conflict_async`)
@@ -272,8 +272,9 @@ Credentials must be stored in the iOS Keychain and accessed via
 ```swift
 let query: [String: Any] = [
     kSecClass: kSecClassGenericPassword,
-    kSecAttrService: "com.tummycrypt.tcfsd",
-    kSecAttrAccount: "s3_access_key",
+    kSecAttrService: "io.tinyland.tcfs.config",
+    kSecAttrAccount: "configJSON",
+    kSecAttrAccessGroup: "group.io.tinyland.tcfs",
     kSecReturnData: true,
 ]
 ```
@@ -307,7 +308,7 @@ tcfs-core (proto types, config)
             │
             └── tcfs-file-provider (UniFFI bridge) ← NEW
                     │
-                    └── Swift FileProviderExtension (Xcode project) ← FUTURE
+                    └── Swift FileProviderExtension (Xcode project) ← scaffold exists; acceptance pending
 ```
 
 ## References

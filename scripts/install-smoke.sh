@@ -5,8 +5,10 @@ usage() {
   cat <<'EOF'
 Usage: scripts/install-smoke.sh [options]
 
-Starts an installed tcfsd in an isolated temp environment, waits for its socket,
-and runs `tcfs status` when the CLI is available.
+Initializes an installed tcfs CLI surface in an isolated temp environment,
+starts tcfsd against that generated config, waits for its socket, and runs
+`tcfs status` when the CLI is available. Daemon-only surfaces get a minimal
+intentional config instead of relying on tcfsd defaults.
 
 Options:
   --expected-version <version>  Require tcfs/tcfsd --version output to include this string
@@ -90,8 +92,182 @@ assert_version() {
   fi
 }
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tcfs-install-smoke.XXXXXX")"
-CONFIG_PATH="$TMP_DIR/missing-config.toml"
+write_daemon_only_config() {
+  if [[ "$REQUIRE_STORAGE_OK" -eq 1 ]]; then
+    write_storage_backed_config "$CONFIG_PATH" false
+    return
+  fi
+
+  cat >"$CONFIG_PATH" <<EOF
+[daemon]
+socket = "$SOCKET_PATH"
+
+[storage]
+endpoint = "http://localhost:8333"
+bucket = "tcfs"
+enforce_tls = false
+
+[sync]
+state_db = "$STATE_DIR/tcfsd/state.db"
+
+[crypto]
+enabled = false
+EOF
+  chmod 600 "$CONFIG_PATH" 2>/dev/null || true
+}
+
+storage_env() {
+  local install_var="TCFS_INSTALL_SMOKE_$1"
+  local smoke_var="TCFS_SMOKE_$1"
+  local tcfs_var="TCFS_$1"
+  local default="${2:-}"
+
+  if [[ -n "${!install_var:-}" ]]; then
+    printf '%s\n' "${!install_var}"
+  elif [[ -n "${!smoke_var:-}" ]]; then
+    printf '%s\n' "${!smoke_var}"
+  elif [[ -n "${!tcfs_var:-}" ]]; then
+    printf '%s\n' "${!tcfs_var}"
+  else
+    printf '%s\n' "$default"
+  fi
+}
+
+toml_string() {
+  python3 - "$1" <<'PY'
+import sys
+print('"' + sys.argv[1].replace('\\', '\\\\').replace('"', '\\"') + '"')
+PY
+}
+
+write_storage_backed_config() {
+  local output_path="$1"
+  local crypto_enabled="$2"
+  local endpoint bucket region remote_prefix enforce_tls ca_cert_path ca_cert_pem
+
+  endpoint="$(storage_env S3_ENDPOINT "http://localhost:8333")"
+  bucket="$(storage_env S3_BUCKET "tcfs")"
+  region="$(storage_env S3_REGION "us-east-1")"
+  remote_prefix="$(storage_env REMOTE_PREFIX "")"
+  if [[ -z "$remote_prefix" ]]; then
+    remote_prefix="$(storage_env S3_REMOTE_PREFIX "")"
+  fi
+  ca_cert_path="$(storage_env S3_CA_CERT_PATH "")"
+  ca_cert_pem="$(storage_env S3_CA_CERT_PEM "")"
+  enforce_tls="$(storage_env S3_ENFORCE_TLS "")"
+
+  if [[ -z "$ca_cert_path" && -n "$ca_cert_pem" ]]; then
+    ca_cert_path="$TMP_DIR/storage-ca.pem"
+    printf '%s\n' "$ca_cert_pem" >"$ca_cert_path"
+    chmod 600 "$ca_cert_path" 2>/dev/null || true
+  fi
+
+  if [[ -z "$enforce_tls" ]]; then
+    case "$endpoint" in
+      https://*) enforce_tls="true" ;;
+      *) enforce_tls="false" ;;
+    esac
+  else
+    enforce_tls="$(printf '%s\n' "$enforce_tls" | tr '[:upper:]' '[:lower:]')"
+    case "$enforce_tls" in
+      true|1|yes) enforce_tls="true" ;;
+      false|0|no) enforce_tls="false" ;;
+      *)
+        echo "invalid storage TLS flag for install smoke: $enforce_tls" >&2
+        exit 2
+        ;;
+    esac
+  fi
+
+  {
+    printf '[daemon]\n'
+    printf 'socket = %s\n\n' "$(toml_string "$SOCKET_PATH")"
+    printf '[storage]\n'
+    printf 'endpoint = %s\n' "$(toml_string "$endpoint")"
+    printf 'region = %s\n' "$(toml_string "$region")"
+    printf 'bucket = %s\n' "$(toml_string "$bucket")"
+    printf 'enforce_tls = %s\n' "$enforce_tls"
+    if [[ -n "$remote_prefix" ]]; then
+      printf 'remote_prefix = %s\n' "$(toml_string "$remote_prefix")"
+    fi
+    if [[ -n "$ca_cert_path" ]]; then
+      printf 'ca_cert_path = %s\n' "$(toml_string "$ca_cert_path")"
+    fi
+    printf '\n[sync]\n'
+    printf 'state_db = %s\n\n' "$(toml_string "$STATE_DIR/tcfsd/state.db")"
+    printf '[crypto]\n'
+    printf 'enabled = %s\n' "$crypto_enabled"
+  } >"$output_path"
+
+  chmod 600 "$output_path" 2>/dev/null || true
+}
+
+tcfs_supports_init_config_out() {
+  "$TCFS_PATH" init --help 2>&1 | grep -Fq -- "--config-out"
+}
+
+start_daemon() {
+  if [[ "$REQUIRE_STORAGE_OK" -eq 1 ]]; then
+    "$TCFSD_PATH" --config "$CONFIG_PATH" --log-format text
+    return
+  fi
+
+  env \
+    -u TCFS_S3_ACCESS \
+    -u TCFS_S3_SECRET \
+    -u TCFS_S3_ACCESS_FILE \
+    -u TCFS_S3_SECRET_FILE \
+    -u TCFS_S3_ACCESS_KEY_FILE \
+    -u TCFS_S3_SECRET_KEY_FILE \
+    -u AWS_ACCESS_KEY_ID \
+    -u AWS_SECRET_ACCESS_KEY \
+    -u AWS_SESSION_TOKEN \
+    -u AWS_ACCESS_KEY_ID_FILE \
+    -u AWS_SECRET_ACCESS_KEY_FILE \
+    -u SEAWEED_ACCESS_KEY \
+    -u SEAWEED_SECRET_KEY \
+    -u REMOTE_JUGGLER_IDENTITY \
+    -u TCFS_KDBX_PATH \
+    -u AWS_PROFILE \
+    -u AWS_SHARED_CREDENTIALS_FILE \
+    -u AWS_CONFIG_FILE \
+    "$TCFSD_PATH" --config "$CONFIG_PATH" --log-format text
+}
+
+run_tcfs_status() {
+  if [[ "$REQUIRE_STORAGE_OK" -eq 1 ]]; then
+    "$TCFS_PATH" --config "$CONFIG_PATH" status
+    return
+  fi
+
+  env \
+    -u TCFS_S3_ACCESS \
+    -u TCFS_S3_SECRET \
+    -u TCFS_S3_ACCESS_FILE \
+    -u TCFS_S3_SECRET_FILE \
+    -u TCFS_S3_ACCESS_KEY_FILE \
+    -u TCFS_S3_SECRET_KEY_FILE \
+    -u AWS_ACCESS_KEY_ID \
+    -u AWS_SECRET_ACCESS_KEY \
+    -u AWS_SESSION_TOKEN \
+    -u AWS_ACCESS_KEY_ID_FILE \
+    -u AWS_SECRET_ACCESS_KEY_FILE \
+    -u SEAWEED_ACCESS_KEY \
+    -u SEAWEED_SECRET_KEY \
+    -u REMOTE_JUGGLER_IDENTITY \
+    -u TCFS_KDBX_PATH \
+    -u AWS_PROFILE \
+    -u AWS_SHARED_CREDENTIALS_FILE \
+    -u AWS_CONFIG_FILE \
+    "$TCFS_PATH" --config "$CONFIG_PATH" status
+}
+
+# Keep the default short on macOS. GitHub-hosted macOS exposes a long
+# /var/folders/... TMPDIR, and daemon Unix sockets can exceed SUN_LEN there.
+TMP_BASE="${TCFS_INSTALL_SMOKE_TMPDIR:-/tmp}"
+TMP_DIR="$(mktemp -d "${TMP_BASE%/}/tcfs-install-smoke.XXXXXX")"
+CONFIG_PATH="$TMP_DIR/config.toml"
+INIT_BASE_CONFIG="$TMP_DIR/init-base-missing.toml"
 HOME_DIR="$TMP_DIR/home"
 STATE_DIR="$HOME_DIR/.local/state"
 CONFIG_DIR="$HOME_DIR/.config"
@@ -121,12 +297,41 @@ assert_version "tcfsd" "$TCFSD_PATH"
 if [[ "$SKIP_CLI" -eq 0 ]]; then
   TCFS_PATH="$(resolve_bin "$TCFS_BIN")"
   assert_version "tcfs" "$TCFS_PATH"
+  if tcfs_supports_init_config_out; then
+    if [[ "$REQUIRE_STORAGE_OK" -eq 1 ]]; then
+      echo "writing storage-backed init base config: $INIT_BASE_CONFIG"
+      write_storage_backed_config "$INIT_BASE_CONFIG" true
+    fi
+    echo "initializing first-run config: $CONFIG_PATH"
+    TCFS_MASTER_PASSWORD="tcfs-install-smoke-passphrase" \
+      "$TCFS_PATH" --config "$INIT_BASE_CONFIG" init \
+        --config-out "$CONFIG_PATH" \
+        --device-name "install-smoke" \
+        --non-interactive \
+        >"$TMP_DIR/tcfs-init.log" 2>&1 || {
+          echo "tcfs init failed" >&2
+          cat "$TMP_DIR/tcfs-init.log" >&2 || true
+          exit 1
+        }
+    "$TCFS_PATH" --config "$CONFIG_PATH" init --check --config-out "$CONFIG_PATH" \
+      >"$TMP_DIR/tcfs-init-check.log" 2>&1 || {
+        echo "tcfs init --check failed" >&2
+        cat "$TMP_DIR/tcfs-init-check.log" >&2 || true
+        exit 1
+      }
+    cat "$TMP_DIR/tcfs-init-check.log"
+  else
+    echo "installed tcfs init does not support --config-out; writing explicit smoke config: $CONFIG_PATH"
+    write_daemon_only_config
+  fi
 else
   TCFS_PATH=""
+  echo "writing daemon-only first-run config: $CONFIG_PATH"
+  write_daemon_only_config
 fi
 
 echo "starting daemon smoke with temp home: $HOME_DIR"
-"$TCFSD_PATH" --config "$CONFIG_PATH" --log-format text >"$DAEMON_LOG" 2>&1 &
+start_daemon >"$DAEMON_LOG" 2>&1 &
 daemon_pid="$!"
 
 for _ in $(seq 1 30); do
@@ -154,7 +359,7 @@ if [[ "$SKIP_CLI" -eq 1 ]]; then
   exit 0
 fi
 
-"$TCFS_PATH" --config "$CONFIG_PATH" status >"$STATUS_LOG" 2>&1 || {
+run_tcfs_status >"$STATUS_LOG" 2>&1 || {
   echo "tcfs status failed" >&2
   cat "$STATUS_LOG" >&2 || true
   echo "--- daemon log ---" >&2

@@ -1,8 +1,8 @@
 # Platform Support
 
 tcfs targets Linux, macOS, Windows, and iOS with varying feature completeness.
-The repo is under active development, so "supported" here means "currently
-shipped and evidenced," not "long-term stable."
+This page records platform maturity; only surfaces explicitly marked proven or
+available with evidence should be treated as shipped/supportable.
 
 ## Linux (Primary)
 
@@ -10,13 +10,25 @@ Best-supported runtime. This is the platform with the strongest continuous CI
 coverage and the clearest end-to-end validation story.
 
 - **CLI**: All commands (push, pull, reconcile, policy, resolve, mount, unsync)
-- **Daemon**: systemd user service with auto-restart, metrics (Prometheus), health checks
-- **Filesystem**: FUSE3 mount with on-demand hydration, `.tc` stub files
-- **NFS loopback**: Alternative to FUSE (no kernel modules required)
+- **Daemon**: package artifacts install daemon binaries and service files; isolated daemon smoke is proven, while systemd-managed service behavior is a separate release gate
+- **Filesystem**: FUSE3 mount with clean-name on-demand hydration is host-proven on Linux x86_64 from repo-pinned tooling; packaged install-to-mount proof is still separate
+- **Project-tree canary**: `task lazy:home-canary-linux-xr-shadow` can stage a
+  real repo shadow for cross-host proof. POSIX symlink preservation is available
+  through `sync_symlinks = true`, and the current scoped packet proved mounted
+  honey traversal/hydration, all 85 mounted symlink targets, and the Linux
+  lifecycle companion. The release-binary storage-posture prefix now has the
+  same scoped lifecycle companion as well. This is isolated project-tree parity,
+  not broad home-directory takeover, production Finder, or production S3 posture
+- **NFS loopback**: Alternative to FUSE (no kernel modules required), with current release evidence pending
 - **Fleet sync**: NATS JetStream with vector clock conflict detection
-- **D-Bus**: Status change signals for desktop integration
+- **D-Bus**: Interface crate exists, but the default backend is a stub and release UX/status integration is not yet proven
 - **Encryption**: XChaCha20-Poly1305 per-chunk, Argon2id KDF
-- **Build targets**: x86_64 (.tar.gz, .deb, .rpm), aarch64 (.tar.gz, .deb)
+- **Build targets**: x86_64 (.tar.gz, .deb, .rpm) with the primary FUSE lane;
+  aarch64 (.tar.gz, .deb) is install-smoke proven but cross-compiled without
+  FUSE in the current release matrix. `.deb` install support is claimed for
+  Ubuntu 24.04+ and Debian 13 `trixie`+. Debian 12 `bookworm` is not a truthful
+  target for the current shipped `.deb` assets because the packages require
+  newer glibc/OpenSSL ABI floors than bookworm provides.
 
 ## macOS (Experimental Desktop Surface)
 
@@ -26,21 +38,40 @@ as a production-proven platform.
 
 - **CLI**: Builds and ships for Apple Silicon and Intel
 - **Daemon**: Launchd-oriented runtime exists, but user-facing acceptance coverage is still limited
-- **FileProvider**: Packaged macOS FileProvider app exists in releases, but Finder-level claims should be treated as experimental until stronger acceptance coverage exists
-- **Finder badges / progress**: Implemented in code, not yet continuously proven by system-level tests
+- **FileProvider**: Packaged macOS FileProvider app exists in releases; the PZM testing-mode lab proves enumerate, hydrate, evict, rehydrate, mutation upload/readback, and CLI conflict/status content preservation, but production Finder claims remain experimental
+- **Finder badges / progress**: Implemented in code and observed only as evidence; not yet a reliable release gate
 - **Filesystem surface**: Experimental; Linux remains the better-proven mount/runtime path
 - **Fleet sync**: Core sync engine and NATS path are shared with Linux, but macOS-specific acceptance coverage is not yet at the same bar
 - **Encryption**: Core crypto path is shared and available
-- **Build targets**: aarch64 (.tar.gz, .pkg; notarization attempted but non-blocking), x86_64 (.tar.gz)
+- **Build targets**: aarch64 (.tar.gz, .pkg), x86_64 (.tar.gz). A dedicated
+  GitHub-hosted proof workflow has built a source package, notarized it,
+  stapled it, passed Gatekeeper install assessment, and run strict package
+  smoke; published-release install and Finder lifecycle proof remain separate
+  gates.
 - **Homebrew**: manual tap flow required today because the formula is published on the `homebrew-tap` branch, not the default branch
-- **Current proof**: CI covers Rust builds plus Swift type-check; release workflow cuts `.pkg` and FileProvider artifacts; broader desktop UX proof is still pending
+- **Current proof**: CI covers the Rust FileProvider staticlib/header and iOS
+  Swift type-check; release workflow cuts `.pkg` and FileProvider artifacts;
+  PZM testing-mode lab proof is green beyond read/hydrate; production
+  clean-host Finder proof is still pending. The latest neo inventory confirms
+  the canonical `/Applications/TCFSProvider.app` install is absent and the
+  existing `~/Applications/TCFSProvider.app` fails strict production signing
+  preflight because Keychain access-group entitlements and embedded
+  provisioning profiles are missing. A source-built Developer ID app on neo now
+  passes strict signing-only preflight with compatible local profiles embedded,
+  and a local candidate `.pkg` structure/signature proof wraps it with
+  source-built `tcfs`/`tcfsd`. Remote run `25973109986` proves the current
+  source package can be notarized, stapled, accepted by Gatekeeper install
+  assessment, and pass strict package smoke with stapled-ticket enforcement.
+  That proof is a workflow artifact, not a published release install, and it
+  has not been installed or exercised through Finder.
 - **Current posture**: see [Apple Surface Status](ops/apple-surface-status.md)
   and [Distribution Smoke Matrix](ops/distribution-smoke-matrix.md)
 
 ### Not Yet Proven
 
-- Fresh-install Finder/FileProvider acceptance from install through register,
-  enumerate, hydrate, mutate, and conflict handling
+- Production Developer ID clean-host Finder/FileProvider acceptance from
+  install through user enablement, register, enumerate, hydrate, mutate, and
+  conflict handling
 - Finder badges, progress UI, or notification behavior as release gates
 - Every published macOS artifact on day zero without explicit post-cut smoke
 
@@ -79,25 +110,31 @@ Windows 10 1809+ placeholder files. 10 TODOs remain before functional:
 The iOS direction exists, but it is not yet a continuously proven distribution
 surface.
 
-- **FileProvider**: NSFileProviderExtension with enumeration + hydration
+- **FileProvider**: NSFileProviderExtension with enumeration + hydration; experimental write hooks exist but are not accepted as supported behavior
 - **UniFFI**: Swift bindings via uniffi-bindgen
-- **Encryption**: Full E2E decryption support
+- **Encryption**: Core crypto/decryption bindings are available; real-device
+  credential and Files.app behavior are not yet proven
 - **Build**: Swift sources type-check in CI; Xcode/TestFlight remains a manual lane
 - **Status**: Proof-of-concept, not in App Store
 - **Current posture**: see [Apple Surface Status](ops/apple-surface-status.md)
 
 ### Limitations
-- Read-only (no upload/push from iOS)
+- Public posture remains read-only; write affordances may appear because hooks
+  exist in code, but upload/push/delete flows are not accepted product behavior
 - No background sync
 - No conflict resolution UI
 - Requires manual provisioning profile setup
+- Shared Keychain/App Group behavior still needs real-device entitlement proof
 - No continuously exercised TestFlight or App Store delivery lane
 
 ## Container (K8s Worker)
 
 Stateless worker for horizontal scaling.
 
-- **Image**: `ghcr.io/jesssullivan/tcfsd:latest` (distroless/cc-debian12)
+- **Current proof image**: `ghcr.io/jesssullivan/tcfsd:v0.12.12`
+  (distroless/cc-debian12; `latest` is convenience-only)
 - **Mode**: `--mode=worker` (NATS consumer, no FUSE)
 - **Features**: k8s-worker feature flag, KEDA auto-scaling support
 - **Metrics**: Prometheus on port 9100
+- **Current proof**: `v0.12.12` proves explicit amd64 pull/version/startup
+  only; native arm64 manifests and full Kubernetes rollout proof remain open

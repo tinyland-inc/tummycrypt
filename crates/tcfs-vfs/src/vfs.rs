@@ -1,7 +1,7 @@
 //! The `VirtualFilesystem` trait — platform-agnostic filesystem operations.
 //!
 //! This trait abstracts the filesystem logic shared between all backends:
-//! - FUSE (Linux legacy, macOS legacy)
+//! - FUSE (Linux primary mount backend, macOS legacy)
 //! - NFS loopback (Linux + macOS, no kernel modules)
 //! - FileProvider (macOS + iOS native)
 //! - fanotify pre-content (Linux 6.14+, future)
@@ -50,8 +50,8 @@ pub trait VirtualFilesystem: Send + Sync {
 
     /// Open a file and return its hydrated content.
     ///
-    /// For stub-based filesystems, this triggers hydration (fetching from
-    /// remote storage). Returns the full file content as bytes.
+    /// For remote-backed filesystems, this triggers hydration (fetching from
+    /// remote storage or cache). Returns the full file content as bytes.
     ///
     /// The returned `u64` is a file handle ID for use with `read` and `release`.
     async fn open(&self, path: &str) -> Result<(u64, Vec<u8>)>;
@@ -60,6 +60,11 @@ pub trait VirtualFilesystem: Send + Sync {
     ///
     /// `fh` is the handle returned by `open`. Returns the requested slice.
     async fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>>;
+
+    /// Read the target of a symbolic link.
+    async fn readlink(&self, _path: &str) -> Result<String> {
+        anyhow::bail!("EINVAL: not a symlink")
+    }
 
     /// Release (close) a file handle.
     ///
@@ -93,6 +98,15 @@ pub trait VirtualFilesystem: Send + Sync {
         anyhow::bail!("ENOSYS: write not supported")
     }
 
+    /// Truncate an open file handle or path to `size` bytes.
+    ///
+    /// FUSE sends this for shell redirection, `cp`, and other `O_TRUNC`
+    /// replacement writes. Backends should preserve exact replacement
+    /// semantics, including shrinking a previously hydrated remote file.
+    async fn truncate(&self, _path: Option<&str>, _fh: Option<u64>, _size: u64) -> Result<VfsAttr> {
+        anyhow::bail!("ENOSYS: truncate not supported")
+    }
+
     /// Flush buffered writes to remote storage.
     ///
     /// Called on fsync(). For SeaweedFS-backed VFS, this chunks the file,
@@ -104,7 +118,7 @@ pub trait VirtualFilesystem: Send + Sync {
     /// Create a directory.
     ///
     /// For SeaweedFS-backed VFS, directories are implicit (derived from
-    /// index entry paths). This creates a placeholder index entry.
+    /// index entry paths). This creates a directory marker index entry.
     async fn mkdir(&self, _parent: &str, _name: &OsStr, _mode: u32) -> Result<VfsAttr> {
         anyhow::bail!("ENOSYS: mkdir not supported")
     }

@@ -6,21 +6,34 @@ Companion to [RFC 0001: Fleet Sync Integration](../rfc/0001-fleet-sync-integrati
 For the named live acceptance lane built on this fleet, see
 [Neo-Honey Live Acceptance](neo-honey-acceptance.md).
 
+Current authority note: this guide still contains the Civo-era deployment path.
+Treat those commands as legacy/standby unless an operator explicitly targets the
+Civo environment. The active on-prem authority path is honey/on-prem and is
+tracked in [On-Prem Authority Recovery](onprem-authority-recovery.md).
+
 ## Prerequisites
 
 - tcfs v0.3.0+ installed on all machines
 - SeaweedFS S3 reachable from all machines (verified: `dees-appu-bearts:8333`)
-- Each machine enrolled: `tcfs device enroll --name $(hostname)`
+- Each machine enrolled with a real age key and storage-backed registry merge:
+  `tcfs device enroll --name $(hostname) --sync-remote`
+  - If a host already has a legacy `age1-device-*` placeholder entry, repair it
+    explicitly with `--repair-placeholder --sync-remote`.
 - All fleet machines on the same Tailscale tailnet
 
 ---
 
 ## 1. NATS Access Path
 
-NATS JetStream runs in the Civo K8s cluster (`nats.tcfs.svc.cluster.local:4222`).
-Lab machines access it via the Tailscale operator — no public IP, tailnet only.
+The historical Civo path ran NATS JetStream in the Civo K8s cluster
+(`nats.tcfs.svc.cluster.local:4222`). Current live/on-prem authority is moving
+through the honey OpenTofu migration lane; lab machines still access NATS via a
+tailnet-only path rather than a public IP.
 
 ### Tailscale Exposure + DNS
+
+Legacy/standby Civo helper path only. Do not use this as the active honey/on-prem
+authority cutover path; that remains the downtime-gated OpenTofu migration lane.
 
 The `tailscale-nats` OpenTofu module creates a Tailscale-only LoadBalancer service,
 and the `porkbun-dns` module creates an A record pointing at the Tailscale CGNAT IP.
@@ -34,15 +47,15 @@ cd infra/tofu/environments/civo && tofu apply
 ```
 
 This creates a `LoadBalancer` service with `loadBalancerClass: tailscale` and
-hostname annotation `nats-tcfs`. The Tailscale operator picks it up and exposes
-NATS as a tailnet device.
+the legacy Civo hostname annotation `nats-tcfs`. The Tailscale operator picks it
+up and exposes NATS as a tailnet device.
 
-Lab machines connect via the IaC-managed FQDN:
+Legacy Civo standby machines may connect via the IaC-managed FQDN:
 ```
 nats://nats.tcfs.tummycrypt.dev:4222
 ```
 
-MagicDNS fallback (works without Porkbun):
+Current honey/on-prem lab acceptance should prefer the MagicDNS/tailnet name:
 ```
 nats://nats-tcfs:4222
 ```
@@ -75,8 +88,8 @@ just dns-status
 # Test NATS connectivity via Tailscale
 just nats-status
 
-# Or manually
-nats server info --server nats://nats.tcfs.tummycrypt.dev:4222
+# Or manually against the active tailnet path
+nats server info --server nats://nats-tcfs:4222
 
 # Check JetStream streams
 just nats-streams
@@ -105,11 +118,11 @@ Run it with:
 
 ```bash
 export TCFS_E2E_LIVE=1
-export TCFS_S3_ENDPOINT=http://100.120.66.67:8333
+export TCFS_S3_ENDPOINT=http://seaweedfs-tcfs:8333
 export TCFS_S3_BUCKET=tcfs
 export AWS_ACCESS_KEY_ID=<from seaweedfs-admin secret>
 export AWS_SECRET_ACCESS_KEY=<from seaweedfs-admin secret>
-export TCFS_NATS_URL=nats://100.71.19.127:4222
+export TCFS_NATS_URL=nats://nats-tcfs:4222
 just neo-honey-smoke
 ```
 
@@ -178,7 +191,7 @@ creation_rules:
 s3_access: "<access-credential>"
 s3_secret: "<secret-credential>"
 s3_endpoint: "http://dees-appu-bearts:8333"
-nats_url: "nats://nats.tcfs.tummycrypt.dev:4222"
+nats_url: "nats://nats-tcfs:4222"
 ```
 
 ```bash
@@ -209,7 +222,7 @@ For non-NixOS machines:
 TCFS_S3_ACCESS=<your-access-credential>
 TCFS_S3_SECRET=<your-secret-credential>
 TCFS_S3_ENDPOINT=http://dees-appu-bearts:8333
-TCFS_NATS_URL=nats://nats.tcfs.tummycrypt.dev:4222
+TCFS_NATS_URL=nats://nats-tcfs:4222
 ```
 
 ### Credential Rotation
@@ -235,7 +248,7 @@ sops --encrypt --in-place secrets/hosts/yoga.yaml
 
 ## 3. Automatic Daemon Startup
 
-### Home Manager (All Platforms — Recommended)
+### Home Manager (Linux/macOS — Recommended)
 
 The Home Manager module handles both Linux (systemd) and macOS (launchd) automatically:
 
@@ -247,7 +260,7 @@ programs.tcfs = {
   identity = "~/.config/sops/age/keys.txt";
   deviceName = "yoga";
   conflictMode = "interactive";
-  natsUrl = "nats://nats.tcfs.tummycrypt.dev:4222";
+  natsUrl = "nats://nats-tcfs:4222";
   syncRoot = "~/tcfs";
   mounts = [
     { remote = "seaweedfs://dees-appu-bearts:8333/tcfs"; local = "~/tcfs"; }
@@ -269,7 +282,7 @@ services.tcfsd = {
   enable = true;
   deviceName = "yoga";
   conflictMode = "interactive";
-  natsUrl = "nats://nats.tcfs.tummycrypt.dev:4222";
+  natsUrl = "nats://nats-tcfs:4222";
   syncRoot = "/srv/tcfs";
 };
 ```
@@ -290,7 +303,16 @@ systemctl --user start tcfsd
 
 ### macOS (launchd, non-Nix)
 
-For manual installs without Home Manager:
+For packaged installs, the current postinstall path writes
+`/Library/LaunchAgents/io.tinyland.tcfsd.plist` and starts `tcfsd` with:
+
+```bash
+--config "$HOME/.config/tcfs/config.toml"
+```
+
+The older `dist/com.tummycrypt.tcfsd.plist` file is a historical/manual helper,
+not the active package evidence path. If you use it for a manual install, treat
+the result as local operator setup, not release proof.
 
 ```bash
 # Copy plist
@@ -330,15 +352,16 @@ tcfs sync-status
 
 ## 4. IaC Operations
 
-All Civo infrastructure is managed via OpenTofu. Use the Justfile for common operations:
+For the legacy/standby Civo environment, infrastructure is managed via OpenTofu.
+Use the Justfile for common readback and explicitly targeted operations:
 
 ```bash
 # List all recipes
 just --list
 
-# Plan and apply infrastructure changes
-just tofu-plan
-just tofu-apply
+# Plan and apply Civo infrastructure changes
+just tofu-plan env=civo
+just tofu-apply env=civo
 
 # Check cluster status
 just k8s-status
@@ -351,7 +374,8 @@ just nats-streams
 just k8s-logs app=tcfsd
 ```
 
-The Justfile is at the project root. All recipes use the `civo` environment by default.
+The Justfile is at the project root. Mutating recipes require an explicit
+environment argument; verify the intended environment before applying changes.
 
 ---
 
@@ -369,6 +393,8 @@ NATS and the tcfsd gRPC socket also run unencrypted. For production hardening:
 - Set `storage.enforce_tls = true` in tcfs config for HTTPS S3
 - Set `sync.nats_tls = true` for TLS NATS connections
 - Wire `security.toml` into SeaweedFS Ansible roles / Helm values for mTLS
+- Wire JetStream `sync_always: true` into the Helm/OpenTofu NATS path before
+  claiming production-grade NATS durability
 
 ---
 
@@ -382,6 +408,10 @@ is used. **All production NATS servers MUST set `sync_always: true`** in
 the jetstream configuration block.
 
 See `config/nats-server.conf` for a reference configuration.
+
+Current repo reality: the reference config carries this setting, but the
+OpenTofu/Helm NATS module path has not yet been audited as carrying it through.
+Treat that as a production-hardening tracker item, not a completed guarantee.
 
 ### Architectural Note
 

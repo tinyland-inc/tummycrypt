@@ -149,6 +149,11 @@ pub struct DaemonConfig {
     /// The sandboxed FileProvider .appex cannot reach the primary socket, so the daemon
     /// binds a second listener here (e.g. ~/Library/Group Containers/group.io.tinyland.tcfs/tcfsd.sock).
     pub fileprovider_socket: Option<PathBuf>,
+    /// HTTP endpoint handed to the macOS FileProvider extension.
+    ///
+    /// This is consumed by the provisioning script and used by tcfsd only to
+    /// identify FileProvider mode; the actual TCP bind address is `listen`.
+    pub fileprovider_endpoint: Option<String>,
     /// TCP listen address for remote gRPC (optional)
     pub listen: Option<String>,
     /// Prometheus metrics endpoint (default: 127.0.0.1:9100)
@@ -181,6 +186,18 @@ pub struct StorageConfig {
     /// Maximum concurrent S3 operations (0 = unlimited). Default: 0.
     #[serde(default)]
     pub max_concurrent_ops: usize,
+    /// S3 HTTP connect timeout in seconds (0 = reqwest/OpenDAL default).
+    #[serde(default)]
+    pub s3_connect_timeout_secs: u64,
+    /// S3 HTTP connection-pool idle timeout in seconds (0 = reqwest/OpenDAL default).
+    #[serde(default)]
+    pub s3_pool_idle_timeout_secs: u64,
+    /// Maximum idle S3 HTTP connections per host (0 = reqwest/OpenDAL default).
+    #[serde(default)]
+    pub s3_pool_max_idle_per_host: usize,
+    /// Force S3 HTTP/1 only for transport experiments and S3-compatible servers.
+    #[serde(default)]
+    pub s3_http1_only: bool,
     /// Maximum upload speed in bytes/sec (0 = unlimited). Default: 0.
     #[serde(default)]
     pub max_upload_bytes_per_sec: u64,
@@ -241,6 +258,8 @@ pub struct SyncConfig {
     pub sync_hidden_dirs: bool,
     /// Glob patterns to exclude from sync
     pub exclude_patterns: Vec<String>,
+    /// Whether to preserve POSIX symbolic links as links during tree sync.
+    pub sync_symlinks: bool,
     /// Whether to sync empty directories via `.tcfs_dir` markers.
     /// Default: true.
     pub sync_empty_dirs: bool,
@@ -310,6 +329,12 @@ pub struct CryptoConfig {
     /// Generated once per vault. If unset and passphrase_file is used, a random
     /// salt is generated and must be persisted by the caller.
     pub kdf_salt: Option<String>,
+    /// Wrap file keys per-device (age/X25519) for non-revoked devices instead of
+    /// under the shared master key (TIN-1417). When true, new manifests carry
+    /// `wrapped_file_keys` and omit `encrypted_file_key`, so a revoked device
+    /// cannot decrypt newly written content. Default false (legacy shared-master)
+    /// until a fleet has real per-device identities enrolled.
+    pub per_device_wrapping: bool,
 }
 
 impl Default for CryptoConfig {
@@ -323,6 +348,7 @@ impl Default for CryptoConfig {
             device_identity: None,
             passphrase_file: None,
             kdf_salt: None,
+            per_device_wrapping: false,
         }
     }
 }
@@ -370,6 +396,7 @@ impl Default for DaemonConfig {
         Self {
             socket,
             fileprovider_socket: None,
+            fileprovider_endpoint: None,
             listen: None,
             metrics_addr: Some("127.0.0.1:9100".into()),
             log_level: "info".into(),
@@ -389,6 +416,10 @@ impl Default for StorageConfig {
             enforce_tls: false,
             ca_cert_path: None,
             max_concurrent_ops: 0,
+            s3_connect_timeout_secs: 0,
+            s3_pool_idle_timeout_secs: 0,
+            s3_pool_max_idle_per_host: 0,
+            s3_http1_only: false,
             max_upload_bytes_per_sec: 0,
             max_download_bytes_per_sec: 0,
         }
@@ -412,6 +443,7 @@ impl Default for SyncConfig {
             git_sync_mode: "bundle".into(),
             sync_hidden_dirs: false,
             exclude_patterns: Vec::new(),
+            sync_symlinks: false,
             sync_empty_dirs: true,
             sync_root: None,
             auto_unsync_max_age_secs: 0,
@@ -457,6 +489,11 @@ endpoint = "https://s3.example.com:8333"
 region = "us-west-2"
 bucket = "my-bucket"
 enforce_tls = true
+max_concurrent_ops = 8
+s3_connect_timeout_secs = 5
+s3_pool_idle_timeout_secs = 30
+s3_pool_max_idle_per_host = 8
+s3_http1_only = true
 
 [secrets]
 age_identity = "/home/user/.age/key.txt"
@@ -487,6 +524,11 @@ argon2_parallelism = 8
         assert_eq!(config.storage.endpoint, "https://s3.example.com:8333");
         assert!(config.storage.enforce_tls);
         assert_eq!(config.storage.bucket, "my-bucket");
+        assert_eq!(config.storage.max_concurrent_ops, 8);
+        assert_eq!(config.storage.s3_connect_timeout_secs, 5);
+        assert_eq!(config.storage.s3_pool_idle_timeout_secs, 30);
+        assert_eq!(config.storage.s3_pool_max_idle_per_host, 8);
+        assert!(config.storage.s3_http1_only);
         assert!(config.sync.nats_tls);
         assert_eq!(config.sync.workers, 4);
         assert_eq!(
@@ -517,6 +559,11 @@ argon2_parallelism = 8
         assert_eq!(config.storage.endpoint, "http://localhost:8333");
         assert!(!config.storage.enforce_tls);
         assert_eq!(config.storage.bucket, "tcfs");
+        assert_eq!(config.storage.max_concurrent_ops, 0);
+        assert_eq!(config.storage.s3_connect_timeout_secs, 0);
+        assert_eq!(config.storage.s3_pool_idle_timeout_secs, 0);
+        assert_eq!(config.storage.s3_pool_max_idle_per_host, 0);
+        assert!(!config.storage.s3_http1_only);
         assert_eq!(config.sync.nats_url, "nats://localhost:4222");
         assert!(config.sync.nats_tls);
         assert_eq!(config.sync.orphan_chunk_cleanup_grace_secs, 24 * 3600);
