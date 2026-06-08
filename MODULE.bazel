@@ -1,0 +1,8 @@
+"""Bzlmod module for TCFS package-contract targets."""
+
+module(
+    name = "tummycrypt",
+    version = "0.12.14",
+)
+
+bazel_dep(name = "platforms", version = "1.0.0")
