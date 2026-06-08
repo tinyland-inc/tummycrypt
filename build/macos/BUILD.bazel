@@ -76,3 +76,19 @@ tcfs_macos_pkg(
     target_compatible_with = ["@platforms//os:macos"],
     version = "0.12.14",
 )
+
+tcfs_macos_pkg(
+    name = "darwin_package_release_artifacts_unsigned",
+    cli_tar = "@tcfs_v0_12_14_macos_aarch64_cli_tar//file",
+    fileprovider_zip = "@tcfs_v0_12_14_macos_aarch64_fileprovider_zip//file",
+    output_name = "tcfs-0.12.14-macos-aarch64-release-artifacts-unsigned.pkg",
+    tags = [
+        "gloriousflywheel-rbe-contract",
+        "manual",
+        "release-artifact-inputs",
+        "requires-darwin-packaging-tools",
+        "unsigned-package",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    version = "0.12.14",
+)
