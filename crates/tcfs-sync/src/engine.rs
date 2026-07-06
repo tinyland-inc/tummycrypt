@@ -1138,6 +1138,8 @@ pub struct UploadResult {
     pub hash: String,
     pub chunks: usize,
     pub bytes: u64,
+    /// Vector clock committed in the uploaded manifest/state entry.
+    pub vclock: VectorClock,
     /// true if file was already up-to-date (skipped)
     pub skipped: bool,
     /// Sync outcome if conflict detection was performed
@@ -1485,6 +1487,7 @@ async fn upload_file_with_device_with_state(
                 hash: cached.blake3.clone(),
                 chunks: cached.chunk_count,
                 bytes: cached.size,
+                vclock: cached.vclock.clone(),
                 skipped: true,
                 outcome: Some(SyncOutcome::UpToDate),
             };
@@ -1662,6 +1665,7 @@ async fn upload_file_with_device_with_state(
                             hash: file_hash_hex,
                             chunks: 0,
                             bytes: file_size,
+                            vclock: remote_manifest_obj.vclock.clone(),
                             skipped: true,
                             outcome: Some(sync_outcome),
                         },
@@ -1673,6 +1677,8 @@ async fn upload_file_with_device_with_state(
                     let remote_manifest_path = current_remote_manifest_path
                         .clone()
                         .unwrap_or_else(|| remote_manifest.clone());
+                    let mut conflict_info = conflict_info.clone();
+                    conflict_info.remote_manifest_key = Some(remote_manifest_path.clone());
                     // Record local state with conflict info so `tcfs resolve` can find it
                     let mut sync_state = make_sync_state_full(
                         local_path,
@@ -1691,8 +1697,9 @@ async fn upload_file_with_device_with_state(
                             hash: file_hash_hex,
                             chunks: 0,
                             bytes: file_size,
+                            vclock: sync_state.vclock.clone(),
                             skipped: true,
-                            outcome: Some(sync_outcome),
+                            outcome: Some(SyncOutcome::Conflict(conflict_info)),
                         },
                         Some(sync_state),
                     ));
@@ -1718,6 +1725,7 @@ async fn upload_file_with_device_with_state(
                             hash: file_hash_hex,
                             chunks: 0,
                             bytes: file_size,
+                            vclock: sync_state.vclock.clone(),
                             skipped: true,
                             outcome: Some(sync_outcome),
                         },
@@ -1777,6 +1785,7 @@ async fn upload_file_with_device_with_state(
                 hash: file_hash_hex,
                 chunks: chunk_count,
                 bytes: file_size,
+                vclock: sync_state.vclock.clone(),
                 skipped: false,
                 outcome: None,
             },
@@ -2249,6 +2258,7 @@ async fn upload_file_with_device_with_state(
             hash: file_hash_hex,
             chunks: num_chunks,
             bytes: file_size,
+            vclock: sync_state.vclock.clone(),
             skipped: false,
             outcome,
         },
@@ -2321,6 +2331,7 @@ pub async fn upload_symlink_with_device(
         device_id.to_string(),
         target.len() as u64,
     )?;
+    let result_vclock = sync_state.vclock.clone();
     state.set(local_path, sync_state);
 
     let assume_fresh_prefix = upload_assume_fresh_prefix();
@@ -2338,6 +2349,7 @@ pub async fn upload_symlink_with_device(
         hash: symlink_hash,
         chunks: 0,
         bytes: target.len() as u64,
+        vclock: result_vclock,
         skipped: false,
         outcome: None,
     })
@@ -4864,6 +4876,39 @@ mod tests {
         assert_eq!(content, "hello world");
     }
 
+    #[tokio::test]
+    async fn upload_result_vclock_matches_committed_manifest_and_state() {
+        let op = memory_op();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut state = StateCache::open(&state_path).unwrap();
+
+        let local = dir.path().join("todo.txt");
+        std::fs::write(&local, b"ship the watcher event clock").unwrap();
+
+        let up = upload_file_with_device(
+            &op,
+            &local,
+            "data",
+            &mut state,
+            None,
+            "neo",
+            Some("notes/todo.txt"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!up.skipped);
+        assert_eq!(up.vclock.get("neo"), 1);
+
+        let manifest_bytes = op.read(&up.remote_path).await.unwrap();
+        let manifest = SyncManifest::from_bytes(&manifest_bytes.to_bytes()).unwrap();
+        let cached = state.get(&local).unwrap();
+
+        assert_eq!(up.vclock, manifest.vclock);
+        assert_eq!(up.vclock, cached.vclock);
+    }
+
     #[test]
     fn systemtime_to_unix_parts_roundtrips_post_epoch() {
         // A representative post-epoch instant with sub-second precision.
@@ -5332,13 +5377,25 @@ mod tests {
         .unwrap();
 
         assert!(result.skipped);
-        assert!(matches!(result.outcome, Some(SyncOutcome::Conflict(_))));
+        let result_conflict = match result.outcome {
+            Some(SyncOutcome::Conflict(info)) => info,
+            other => panic!("expected conflict outcome, got: {other:?}"),
+        };
+        assert_eq!(
+            result_conflict.remote_manifest_key.as_deref(),
+            Some("data/manifests/remotehash123")
+        );
 
         let entry = state.get(&local).expect("conflicted state entry");
         assert_eq!(entry.status, FileSyncStatus::Conflict);
-        assert!(
-            entry.conflict.is_some(),
-            "conflict payload should be preserved"
+        assert_eq!(
+            entry
+                .conflict
+                .as_ref()
+                .expect("conflict payload should be preserved")
+                .remote_manifest_key
+                .as_deref(),
+            Some("data/manifests/remotehash123")
         );
     }
 

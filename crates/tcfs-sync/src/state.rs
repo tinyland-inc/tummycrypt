@@ -236,6 +236,13 @@ pub struct StateCache {
     last_flush: Instant,
 }
 
+/// In-memory rollback snapshot for a bounded set of state-cache keys.
+#[derive(Debug, Clone)]
+pub struct StateCacheKeySnapshot {
+    entries: HashMap<String, Option<SyncState>>,
+    dirty: bool,
+}
+
 impl StateCache {
     /// Load or create a state cache at the given path.
     ///
@@ -281,6 +288,18 @@ impl StateCache {
             device_id,
             last_flush: Instant::now(),
         })
+    }
+
+    /// Machine-local directory that owns this state cache.
+    ///
+    /// Git recovery artifacts such as keep-both / loser-guard undo bundles must
+    /// live here, not under a sync root.
+    pub fn state_dir(&self) -> PathBuf {
+        self.db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
     }
 
     fn load_from_file(path: &Path) -> Result<(HashMap<String, SyncState>, u64, String)> {
@@ -396,6 +415,52 @@ impl StateCache {
             .map(|(k, v)| (k.as_str(), v))
     }
 
+    /// Read-only view of every entry that currently carries a recorded
+    /// conflict, as `(cache key, state)` pairs.
+    ///
+    /// The cache key is the normalized (canonical-parent) local path; the
+    /// recorded `ConflictInfo` (with its repo-relative `rel_path`) lives on the
+    /// returned [`SyncState`]. Used by `tcfs conflicts` to enumerate and group
+    /// conflicts without any daemon RPC. Order is unspecified (HashMap).
+    pub fn conflicts(&self) -> Vec<(&str, &SyncState)> {
+        self.entries
+            .iter()
+            .filter(|(_, s)| s.conflict.is_some())
+            .map(|(k, v)| (k.as_str(), v))
+            .collect()
+    }
+
+    /// Capture a bounded set of cache entries so callers can roll back
+    /// in-memory mutations if their outer atomic operation fails.
+    pub fn snapshot_cache_keys<'a, I>(&self, cache_keys: I) -> StateCacheKeySnapshot
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let entries = cache_keys
+            .into_iter()
+            .map(|key| (key.to_string(), self.entries.get(key).cloned()))
+            .collect();
+        StateCacheKeySnapshot {
+            entries,
+            dirty: self.dirty,
+        }
+    }
+
+    /// Restore entries captured by [`StateCache::snapshot_cache_keys`].
+    pub fn restore_cache_key_snapshot(&mut self, snapshot: &StateCacheKeySnapshot) {
+        for (key, state) in &snapshot.entries {
+            match state {
+                Some(state) => {
+                    self.entries.insert(key.clone(), state.clone());
+                }
+                None => {
+                    self.entries.remove(key);
+                }
+            }
+        }
+        self.dirty = snapshot.dirty;
+    }
+
     /// Flush dirty changes to disk using an atomic write (write then rename).
     ///
     /// Persists cache metadata alongside entries so restart recovery does not
@@ -473,6 +538,12 @@ impl StateCache {
     ) -> bool {
         let key = path_key(local_path);
         if let Some(entry) = self.entries.get_mut(&key) {
+            let mut conflict = conflict;
+            if conflict.remote_manifest_key.is_none() {
+                if let Some(existing) = entry.conflict.as_ref() {
+                    conflict.remote_manifest_key = existing.remote_manifest_key.clone();
+                }
+            }
             entry.conflict = Some(conflict);
             entry.status = FileSyncStatus::Conflict;
             self.dirty = true;
@@ -492,6 +563,31 @@ impl StateCache {
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.conflict = None;
             entry.status = FileSyncStatus::Synced;
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear conflict state for an already-known cache key and replace its
+    /// vector clock with the resolution clock.
+    ///
+    /// Repo-group `.git` resolution operates on conflict groups discovered via
+    /// [`StateCache::conflicts`]. Those records already carry canonical cache
+    /// keys; using the key directly avoids re-canonicalizing paths while the
+    /// resolver is mutating refs under `.git/tcfs.lock`.
+    pub fn resolve_conflict_by_cache_key(
+        &mut self,
+        cache_key: &str,
+        vclock: VectorClock,
+        device_id: String,
+    ) -> bool {
+        if let Some(entry) = self.entries.get_mut(cache_key) {
+            entry.conflict = None;
+            entry.status = FileSyncStatus::Synced;
+            entry.vclock = vclock;
+            entry.device_id = device_id;
             self.dirty = true;
             true
         } else {
@@ -1465,6 +1561,8 @@ mod tests {
             local_device: "neo".into(),
             remote_device: "honey".into(),
             detected_at: 1700000000,
+            times_recorded: 0,
+            remote_manifest_key: None,
         };
 
         cache.set(
@@ -1542,6 +1640,8 @@ mod tests {
                     local_device: "neo".into(),
                     remote_device: "honey".into(),
                     detected_at: 0,
+                    times_recorded: 0,
+                    remote_manifest_key: None,
                 }),
                 status: FileSyncStatus::Conflict,
             },
@@ -1550,6 +1650,57 @@ mod tests {
 
         cache.resolve_conflict(&file_path);
         assert!(cache.dirty, "cache must be dirty after resolve_conflict");
+    }
+
+    #[test]
+    fn cache_key_snapshot_restores_conflict_and_dirty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        let file_path = dir.path().join("file.txt");
+        std::fs::write(&file_path, b"x").unwrap();
+
+        cache.set(
+            &file_path,
+            SyncState {
+                blake3: "abc".into(),
+                size: 1,
+                mtime: 0,
+                chunk_count: 1,
+                remote_path: "data/index/file.txt".into(),
+                last_synced: 0,
+                vclock: VectorClock::new(),
+                device_id: "neo".into(),
+                conflict: Some(crate::conflict::ConflictInfo {
+                    rel_path: "file.txt".into(),
+                    local_vclock: VectorClock::new(),
+                    remote_vclock: VectorClock::new(),
+                    local_blake3: "abc".into(),
+                    remote_blake3: "def".into(),
+                    local_device: "neo".into(),
+                    remote_device: "honey".into(),
+                    detected_at: 0,
+                    times_recorded: 0,
+                    remote_manifest_key: None,
+                }),
+                status: FileSyncStatus::Conflict,
+            },
+        );
+        cache.flush().unwrap();
+        assert!(!cache.dirty);
+
+        let key = cache.conflicts()[0].0.to_string();
+        let snapshot = cache.snapshot_cache_keys([key.as_str()]);
+        assert!(cache.resolve_conflict_by_cache_key(&key, VectorClock::new(), "neo".into()));
+        assert!(cache.dirty);
+        assert!(cache.entries.get(&key).unwrap().conflict.is_none());
+
+        cache.restore_cache_key_snapshot(&snapshot);
+        let restored = cache.entries.get(&key).unwrap();
+        assert_eq!(restored.status, FileSyncStatus::Conflict);
+        assert!(restored.conflict.is_some());
+        assert!(!cache.dirty);
     }
 
     #[test]
@@ -1595,6 +1746,8 @@ mod tests {
                         local_device: "neo".into(),
                         remote_device: "honey".into(),
                         detected_at: 0,
+                        times_recorded: 0,
+                        remote_manifest_key: None,
                     }),
                     status: FileSyncStatus::Conflict,
                 },
@@ -1663,6 +1816,8 @@ mod tests {
             local_device: "neo".into(),
             remote_device: "honey".into(),
             detected_at: 0,
+            times_recorded: 0,
+            remote_manifest_key: None,
         };
 
         assert!(cache.mark_conflict(&file_path, conflict.clone()));
@@ -1673,6 +1828,83 @@ mod tests {
         assert_eq!(stored.rel_path, conflict.rel_path);
         assert_eq!(stored.local_device, conflict.local_device);
         assert_eq!(stored.remote_device, conflict.remote_device);
+    }
+
+    #[test]
+    fn mark_conflict_preserves_existing_remote_manifest_key_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut cache = StateCache::open(&path).unwrap();
+
+        let file_path = dir.path().join("conflicted.txt");
+        std::fs::write(&file_path, b"data").unwrap();
+
+        cache.set(
+            &file_path,
+            SyncState {
+                blake3: "abc".into(),
+                size: 4,
+                mtime: 0,
+                chunk_count: 1,
+                remote_path: "data/index/conflicted.txt".into(),
+                last_synced: 0,
+                vclock: VectorClock::new(),
+                device_id: "neo".into(),
+                conflict: None,
+                status: FileSyncStatus::Synced,
+            },
+        );
+
+        let mut conflict = crate::conflict::ConflictInfo {
+            rel_path: "conflicted.txt".into(),
+            local_vclock: VectorClock::new(),
+            remote_vclock: VectorClock::new(),
+            local_blake3: "abc".into(),
+            remote_blake3: "def".into(),
+            local_device: "neo".into(),
+            remote_device: "honey".into(),
+            detected_at: 0,
+            times_recorded: 0,
+            remote_manifest_key: Some("data/manifests/first".into()),
+        };
+        assert!(cache.mark_conflict(&file_path, conflict.clone()));
+
+        conflict.remote_manifest_key = None;
+        assert!(cache.mark_conflict(&file_path, conflict));
+        assert_eq!(
+            cache
+                .get(&file_path)
+                .unwrap()
+                .conflict
+                .as_ref()
+                .unwrap()
+                .remote_manifest_key
+                .as_deref(),
+            Some("data/manifests/first")
+        );
+
+        let replacement = crate::conflict::ConflictInfo {
+            remote_manifest_key: Some("data/manifests/replacement".into()),
+            ..cache
+                .get(&file_path)
+                .unwrap()
+                .conflict
+                .as_ref()
+                .unwrap()
+                .clone()
+        };
+        assert!(cache.mark_conflict(&file_path, replacement));
+        assert_eq!(
+            cache
+                .get(&file_path)
+                .unwrap()
+                .conflict
+                .as_ref()
+                .unwrap()
+                .remote_manifest_key
+                .as_deref(),
+            Some("data/manifests/replacement")
+        );
     }
 
     #[test]
