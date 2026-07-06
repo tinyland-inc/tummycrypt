@@ -34,7 +34,6 @@ pub fn git_is_safe(git_dir: &Path) -> GitSafetyCheck {
         "index.lock",
         "HEAD.lock",
         "gc.pid",
-        "refs/heads/*.lock",
         "shallow.lock",
         "packed-refs.lock",
     ];
@@ -45,6 +44,7 @@ pub fn git_is_safe(git_dir: &Path) -> GitSafetyCheck {
             check.blocking.push(format!("lock file exists: {}", lock));
         }
     }
+    collect_ref_head_locks(&git_dir.join("refs/heads"), "refs/heads", &mut check);
 
     // In-progress operations
     let in_progress = [
@@ -76,6 +76,24 @@ pub fn git_is_safe(git_dir: &Path) -> GitSafetyCheck {
     }
 
     check
+}
+
+fn collect_ref_head_locks(dir: &Path, rel: &str, check: &mut GitSafetyCheck) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let child_rel = format!("{rel}/{name}");
+        if path.is_dir() {
+            collect_ref_head_locks(&path, &child_rel, check);
+        } else if name.ends_with(".lock") {
+            check
+                .blocking
+                .push(format!("lock file exists: {child_rel}"));
+        }
+    }
 }
 
 /// Create a git bundle for atomic .git snapshot.
@@ -275,6 +293,7 @@ fn is_hex_sha(s: &str) -> bool {
 pub fn repo_root_for_git_path(local_root: &Path, rel_path: &str) -> Option<std::path::PathBuf> {
     // Split the rel path on the first `.git` component. Everything before it is
     // the repo subdir (possibly empty).
+    let rel_path = rel_path.replace('\\', "/");
     let mut prefix_components: Vec<&str> = Vec::new();
     let mut found = false;
     for comp in rel_path.split('/') {
@@ -303,6 +322,7 @@ pub fn repo_root_for_git_path(local_root: &Path, rel_path: &str) -> Option<std::
 pub fn head_ref_for_git_path(rel_path: &str) -> Option<String> {
     // Locate the `.git/refs/heads/` segment and take the remainder as the
     // branch name (which may itself contain slashes, e.g. `feature/x`).
+    let rel_path = rel_path.replace('\\', "/");
     let needle = ".git/refs/heads/";
     let idx = rel_path.find(needle)?;
     let branch = &rel_path[idx + needle.len()..];
@@ -538,6 +558,25 @@ mod tests {
         let check = git_is_safe(&git_dir);
         assert!(!check.blocking.is_empty());
         assert!(check.blocking[0].contains("index.lock"));
+    }
+
+    #[test]
+    fn test_unsafe_with_nested_branch_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let branch_dir = git_dir.join("refs/heads/feature");
+        std::fs::create_dir_all(&branch_dir).unwrap();
+        std::fs::write(branch_dir.join("x.lock"), b"").unwrap();
+
+        let check = git_is_safe(&git_dir);
+        assert!(
+            check
+                .blocking
+                .iter()
+                .any(|entry| entry.contains("refs/heads/feature/x.lock")),
+            "nested branch lock must block: {:?}",
+            check.blocking
+        );
     }
 
     #[test]

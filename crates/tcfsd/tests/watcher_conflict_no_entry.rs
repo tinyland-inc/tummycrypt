@@ -19,6 +19,8 @@ fn sample_info() -> ConflictInfo {
         local_device: "local".to_string(),
         remote_device: "remote".to_string(),
         detected_at: 0,
+        times_recorded: 0,
+        remote_manifest_key: None,
     }
 }
 

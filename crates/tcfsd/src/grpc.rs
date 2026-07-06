@@ -24,6 +24,96 @@ use tcfs_core::proto::{
 };
 use tcfs_sync::state::StateCacheBackend;
 
+fn path_resolves_to_git_internal(path: &Path) -> bool {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        if tcfs_sync::git_safety::repo_root_for_git_path(
+            Path::new(""),
+            &canonical.to_string_lossy(),
+        )
+        .is_some()
+        {
+            return true;
+        }
+    }
+
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(parent) = std::fs::canonicalize(parent) else {
+        return false;
+    };
+    let resolved = match path.file_name() {
+        Some(name) => parent.join(name),
+        None => parent,
+    };
+    tcfs_sync::git_safety::repo_root_for_git_path(Path::new(""), &resolved.to_string_lossy())
+        .is_some()
+}
+
+fn resolve_conflict_git_fence_error(
+    path: &Path,
+    resolution: &str,
+    state_entry: Option<&tcfs_sync::state::SyncState>,
+) -> Option<String> {
+    if resolution == "defer" {
+        return None;
+    }
+
+    let raw_path = path.to_string_lossy();
+    let is_git_internal = tcfs_sync::git_safety::repo_root_for_git_path(Path::new(""), &raw_path)
+        .is_some()
+        || path_resolves_to_git_internal(path)
+        || state_entry
+            .and_then(|entry| entry.conflict.as_ref())
+            .is_some_and(|conflict| {
+                tcfs_sync::git_safety::repo_root_for_git_path(Path::new(""), &conflict.rel_path)
+                    .is_some()
+            });
+
+    is_git_internal.then(|| {
+        format!(
+            "'{}' is a git-internal path; per-file resolution ({resolution}) would corrupt the \
+             repository object store. Resolve the whole repo group instead \
+             (`tcfs resolve <repo> --strategy keep-both --execute`). Inspect with `tcfs conflicts`.",
+            path.display()
+        )
+    })
+}
+
+fn repo_keep_both_mode(resolution: &str) -> Option<tcfs_sync::conflict_git::GitKeepBothMode> {
+    match resolution {
+        "git_keep_both_dry_run" => Some(tcfs_sync::conflict_git::GitKeepBothMode::DryRun),
+        "git_keep_both_execute" => Some(tcfs_sync::conflict_git::GitKeepBothMode::Execute),
+        _ => None,
+    }
+}
+
+/// Machine-local directory for the keep-both undo bundle. It MUST be outside any
+/// sync root, so anchor it to the daemon state DB's directory (the same
+/// machine-local location the state cache uses; see `worker.rs`/`daemon.rs`).
+/// Expands a leading `~/` and falls back to the platform data dir (BLOCKING 2).
+fn undo_bundle_state_dir(config: &TcfsConfig) -> PathBuf {
+    config
+        .sync
+        .state_db
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(expand_home_prefix)
+        .unwrap_or_else(|| dirs::data_dir().unwrap_or_default().join("tcfsd"))
+}
+
+/// Expand a leading `~/` against the current user's home directory. Leaves any
+/// other path untouched.
+fn expand_home_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Build an `EncryptionContext` honoring `crypto.wrap_mode` (TIN-1417).
 ///
 /// - `Master` (default): legacy shared-master wrap. Byte-identical to the prior
@@ -328,6 +418,65 @@ impl TcfsDaemonImpl {
             totp_provider,
             webauthn_provider,
             rate_limiter,
+        }
+    }
+
+    async fn resolve_git_keep_both_repo(
+        &self,
+        path: &Path,
+        mode: tcfs_sync::conflict_git::GitKeepBothMode,
+    ) -> Result<tonic::Response<ResolveConflictResponse>, tonic::Status> {
+        let op = {
+            let op_guard = self.operator.lock().await;
+            op_guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| tonic::Status::unavailable("no storage operator"))?
+        };
+        let prefix = self.config.storage.resolved_prefix().to_string();
+        let undo_state_dir = undo_bundle_state_dir(&self.config);
+        let enc_ctx = {
+            let mk_guard = self.master_key.lock().await;
+            mk_guard
+                .as_ref()
+                .map(|mk| build_encryption_context(&self.config, &self.device_id, mk))
+        };
+
+        let result = {
+            let mut cache = self.state_cache.lock().await;
+            if let Err(e) = cache.reload_from_disk() {
+                tracing::warn!("failed to reload state cache: {e}");
+            }
+            tcfs_sync::conflict_git::resolve_repo_keep_both(
+                &op,
+                &mut cache,
+                path,
+                &prefix,
+                &self.device_id,
+                &undo_state_dir,
+                mode,
+                enc_ctx.as_ref(),
+            )
+            .await
+        };
+
+        match result {
+            Ok(result) => {
+                if mode.is_execute() {
+                    self.publish_conflict_resolved(&path.to_string_lossy(), "git_keep_both")
+                        .await;
+                }
+                Ok(tonic::Response::new(ResolveConflictResponse {
+                    success: true,
+                    resolved_path: result.repo_root.display().to_string(),
+                    error: result.summary(),
+                }))
+            }
+            Err(e) => Ok(tonic::Response::new(ResolveConflictResponse {
+                success: false,
+                resolved_path: String::new(),
+                error: format!("{e:#}"),
+            })),
         }
     }
 
@@ -1532,7 +1681,12 @@ impl TcfsDaemon for TcfsDaemonImpl {
         let req = request.into_inner();
 
         let resolution = match req.resolution.as_str() {
-            "keep_local" | "keep_remote" | "keep_both" | "defer" => req.resolution.clone(),
+            "keep_local"
+            | "keep_remote"
+            | "keep_both"
+            | "defer"
+            | "git_keep_both_dry_run"
+            | "git_keep_both_execute" => req.resolution.clone(),
             other => {
                 return Ok(tonic::Response::new(ResolveConflictResponse {
                     success: false,
@@ -1545,22 +1699,81 @@ impl TcfsDaemon for TcfsDaemonImpl {
             }
         };
 
+        let path = std::path::PathBuf::from(&req.path);
+
+        // Reload state from disk in case the CLI wrote new entries. The git
+        // fence below also consults the stored ConflictInfo rel_path, which is
+        // the authoritative repo-relative path when the request arrived through
+        // a symlink alias or another local spelling.
+        let state_entry = {
+            let mut cache = self.state_cache.lock().await;
+            if let Err(e) = cache.reload_from_disk() {
+                tracing::warn!("failed to reload state cache: {e}");
+            }
+            cache.get(&path).cloned()
+        };
+
+        if let Some(mode) = repo_keep_both_mode(&resolution) {
+            // Operator-deliberate invariant: repo-group git keep-both is a live
+            // `.git` WRITE path (parks peer branch heads, ticks the local clock
+            // to dominate the fleet). It is reachable ONLY through the human
+            // `tcfs resolve` CLI, which sets `operator_cli=true`. MCP's tool
+            // input cannot set that flag (and MCP also rejects git_keep_both_*
+            // before reaching this RPC), and no auto/NATS path sets it — so an
+            // agent / generic client can never trigger committed-work loss.
+            // Fail closed. This dispatch stays ahead of the per-file `.git`
+            // fence below because the repo-group path targets the repo ROOT
+            // (not a `.git`-internal path); the fence is for per-file
+            // keep_local/keep_remote/keep_both and does not apply here.
+            if !req.operator_cli {
+                tracing::warn!(
+                    path = %req.path,
+                    resolution = %resolution,
+                    "refusing repo-group git keep-both: missing operator CLI provenance"
+                );
+                return Ok(tonic::Response::new(ResolveConflictResponse {
+                    success: false,
+                    resolved_path: String::new(),
+                    error: "repo-group git keep-both is operator-only: run it deliberately from \
+                            the CLI (`tcfs resolve <repo> --strategy keep-both [--execute]`), not \
+                            through MCP or an automated client"
+                        .to_string(),
+                }));
+            }
+            return self.resolve_git_keep_both_repo(&path, mode).await;
+        }
+
+        // keep-both PR-1 (safety invariant S1): per-file conflict resolution
+        // must NEVER touch `.git` internals. keep_local rewrites the manifest,
+        // keep_remote splices the remote device's ref/index over this device's
+        // object store, and keep_both renames a loose ref into the branch
+        // namespace — each is the G5-git-5 `.git` corruption vector (no lock,
+        // no fsck, no objects-before-refs ordering). Refuse them for any
+        // `.git`-internal path and point the operator at repo-group resolution.
+        // `defer` is a no-op (records intent only) and stays allowed. This
+        // guard also covers the MCP `resolve_conflict` tool, which is a thin
+        // passthrough to this same RPC.
+        if let Some(error) =
+            resolve_conflict_git_fence_error(&path, &resolution, state_entry.as_ref())
+        {
+            tracing::warn!(
+                path = %req.path,
+                resolution = %resolution,
+                "refusing per-file resolution of a .git-internal conflict"
+            );
+            return Ok(tonic::Response::new(ResolveConflictResponse {
+                success: false,
+                resolved_path: String::new(),
+                error,
+            }));
+        }
+
         info!(
             path = %req.path,
             resolution = %resolution,
             device = %self.device_id,
             "conflict resolution requested"
         );
-
-        let path = std::path::PathBuf::from(&req.path);
-
-        // Reload state from disk in case the CLI wrote new entries
-        {
-            let mut cache = self.state_cache.lock().await;
-            if let Err(e) = cache.reload_from_disk() {
-                tracing::warn!("failed to reload state cache: {e}");
-            }
-        }
 
         match resolution.as_str() {
             "defer" => {
@@ -3860,6 +4073,215 @@ mod tests {
 
         assert!(!resp.success);
         assert!(resp.error.contains("invalid resolution"));
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_repo_git_keep_both_requires_operator_cli() {
+        // BLOCKING 1b: repo-group git keep-both must be refused (fail-closed)
+        // when operator-CLI provenance is absent — i.e. for MCP / automated /
+        // generic clients that cannot set `operator_cli`. Both dry-run and
+        // execute are gated BEFORE any storage/ref work happens.
+        let daemon = test_daemon();
+        for resolution in ["git_keep_both_dry_run", "git_keep_both_execute"] {
+            let resp = daemon
+                .resolve_conflict(tonic::Request::new(ResolveConflictRequest {
+                    path: "myrepo".into(),
+                    resolution: resolution.into(),
+                    operator_cli: false,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(
+                !resp.success,
+                "{resolution} must be refused without operator provenance"
+            );
+            assert!(
+                resp.error.contains("operator-only"),
+                "{resolution} error must direct to the CLI, got: {}",
+                resp.error
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_refuses_git_internal_path() {
+        // keep-both PR-1 (S1): keep_remote on a `.git`-internal ref must be
+        // refused with repo-group guidance and ZERO side effects.
+        let daemon = test_daemon();
+        let resp = daemon
+            .resolve_conflict(tonic::Request::new(ResolveConflictRequest {
+                path: "myrepo/.git/refs/heads/main".into(),
+                resolution: "keep_remote".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.success, "keep_remote on a .git path must be refused");
+        assert!(
+            resp.error.contains("git-internal"),
+            "error must name the git-internal refusal, got: {}",
+            resp.error
+        );
+        assert!(resp.resolved_path.is_empty());
+
+        // keep_both and keep_local on a `.git` path are likewise refused.
+        for strat in ["keep_both", "keep_local"] {
+            let resp = daemon
+                .resolve_conflict(tonic::Request::new(ResolveConflictRequest {
+                    path: "myrepo/.git/index".into(),
+                    resolution: strat.into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(!resp.success, "{strat} on a .git path must be refused");
+            assert!(resp.error.contains("git-internal"), "strat={strat}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_conflict_refuses_git_internal_symlink_alias() {
+        // A local path spelling with no `.git` component can still resolve into
+        // `.git`; the fence must classify the resolved path and stored
+        // ConflictInfo, not just the raw request string.
+        let daemon = test_daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let git_heads = repo.join(".git/refs/heads");
+        std::fs::create_dir_all(&git_heads).unwrap();
+        let git_path = git_heads.join("main");
+        std::fs::write(&git_path, b"0123456789012345678901234567890123456789\n").unwrap();
+
+        let alias = dir.path().join("refslink");
+        std::os::unix::fs::symlink(repo.join(".git/refs"), &alias).unwrap();
+        let alias_path = alias.join("heads/main");
+
+        let mut entry = test_sync_state("data/manifests/git", 1_700_000_000);
+        entry.status = tcfs_sync::state::FileSyncStatus::Conflict;
+        entry.conflict = Some(tcfs_sync::conflict::ConflictInfo {
+            rel_path: "repo/.git/refs/heads/main".into(),
+            local_vclock: tcfs_sync::conflict::VectorClock::new(),
+            remote_vclock: tcfs_sync::conflict::VectorClock::new(),
+            local_blake3: "local-git".into(),
+            remote_blake3: "remote-git".into(),
+            local_device: "neo".into(),
+            remote_device: "honey".into(),
+            detected_at: 43,
+            times_recorded: 1,
+            remote_manifest_key: None,
+        });
+
+        {
+            let mut cache = daemon.state_cache.lock().await;
+            cache.set(&git_path, entry);
+            cache.flush().unwrap();
+        }
+
+        let resp = daemon
+            .resolve_conflict(tonic::Request::new(ResolveConflictRequest {
+                path: alias_path.display().to_string(),
+                resolution: "keep_remote".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.resolved_path.is_empty());
+        assert!(resp.error.contains("git-internal"));
+        assert!(resp.error.contains("per-file"));
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_refuses_stored_git_internal_rel_path() {
+        // A cache key can be an ordinary local spelling while the recorded
+        // ConflictInfo carries the authoritative repo-relative `.git` path.
+        // The fence must consult that stored rel_path before keep_* can write.
+        let daemon = test_daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let request_path = dir.path().join("visible-conflict");
+        std::fs::write(&request_path, b"ordinary-looking path").unwrap();
+
+        let mut entry = test_sync_state("data/manifests/git", 1_700_000_000);
+        entry.status = tcfs_sync::state::FileSyncStatus::Conflict;
+        entry.conflict = Some(tcfs_sync::conflict::ConflictInfo {
+            rel_path: "repo/.git/refs/heads/main".into(),
+            local_vclock: tcfs_sync::conflict::VectorClock::new(),
+            remote_vclock: tcfs_sync::conflict::VectorClock::new(),
+            local_blake3: "local-git".into(),
+            remote_blake3: "remote-git".into(),
+            local_device: "neo".into(),
+            remote_device: "honey".into(),
+            detected_at: 44,
+            times_recorded: 1,
+            remote_manifest_key: None,
+        });
+
+        {
+            let mut cache = daemon.state_cache.lock().await;
+            cache.set(&request_path, entry);
+            cache.flush().unwrap();
+        }
+
+        let resp = daemon
+            .resolve_conflict(tonic::Request::new(ResolveConflictRequest {
+                path: request_path.display().to_string(),
+                resolution: "keep_remote".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.resolved_path.is_empty());
+        assert!(resp.error.contains("git-internal"));
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_defer_allowed_on_git_internal_path() {
+        // `defer` records intent only (no writes), so it stays allowed even for
+        // a `.git`-internal path — the fence targets keep_* only.
+        let daemon = test_daemon();
+        let resp = daemon
+            .resolve_conflict(tonic::Request::new(ResolveConflictRequest {
+                path: "myrepo/.git/refs/heads/main".into(),
+                resolution: "defer".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success, "defer must be allowed on a .git path");
+        assert!(resp.error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_fence_ignores_normal_file_path() {
+        // A NON-`.git` file path must NOT hit the fence: keep_remote proceeds
+        // past the guard and fails later for an ordinary reason (no state /
+        // no remote path), never with the git-internal refusal.
+        let daemon = test_daemon();
+        let resp = daemon
+            .resolve_conflict(tonic::Request::new(ResolveConflictRequest {
+                path: "notes/todo.txt".into(),
+                resolution: "keep_remote".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.success, "no state for the path → still fails");
+        assert!(
+            !resp.error.contains("git-internal"),
+            "a normal file must not be fenced as git-internal, got: {}",
+            resp.error
+        );
     }
 
     #[tokio::test]
