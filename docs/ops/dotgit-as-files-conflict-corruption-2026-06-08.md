@@ -125,12 +125,15 @@ For `TIN-1620` / G5 the live-repo conflict and rollback proof must add, for
 - **G5-git-4 (dirty-child refusal incl. `.git`):** `tcfs unsync <repo>` with a
   dirty `.git` child (e.g. a fresh commit not yet synced) **refuses** without
   `--force`. No silent loss, no partial dehydration.
-- **G5-git-5 (concurrent-write corruption row):** the per-file `.git` conflict
-  interleave under `conflict_mode=auto` must be **detected** — `git fsck` reports
-  the half-applied ref. Until resolution is made `.git`-aware (resolve a repo's
-  `.git/*` as one unit, or fall back to bundle on `.git` conflict), this row is
-  expected to FAIL and stands as the corruption-risk gate that must be closed
-  before G5 can claim concurrent-edit safety.
+- **G5-git-5 (concurrent-write corruption row):** historical red row for per-file
+  `.git` conflict interleaves under `conflict_mode=auto`. **CLOSED end-to-end**
+  by the merged `.git`-aware FF and divergent keep-both stack (#513, #529, #534):
+  FF half live-proven 2026-07-05, divergent (non-FF) half live-proven 2026-07-08
+  on a two-host neo ⇄ honey fleet canary — the deployed #534 loser-side no-loss
+  guard parked the loser head, converged both hosts to zero conflicts, no
+  committed work lost
+  (`docs/release/evidence/divergent-keep-both-canary-20260707T071335Z/RESULTS.md`,
+  harness row **G5-git-13** LIVE-PROVEN).
 
 ## Harness
 
@@ -162,4 +165,6 @@ Run: `bash scripts/test-git-dotgit-fsck-conflict-harness.sh`.
 3. Make unsync `.git` dehydration **atomic** (stage all stubs, swap last) or
    bracket it with the git lock + a `git_is_safe` precheck.
 4. Add the `git fsck` assertions above to the live-repo (`TIN-1620`) packet so
-   G5 cannot be claimed while G5-git-5 is red.
+   G5 cannot be claimed while G5-git-5 is red. (Done: the FF and divergent
+   keep-both live canaries carry `git fsck --full` rc=0 on both hosts; G5-git-5
+   is green as of 2026-07-08.)
