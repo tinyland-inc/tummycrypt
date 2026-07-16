@@ -1,5 +1,15 @@
 # Product Reality And Priority
 
+> 2026-07-06 update: this document is historical posture, not the current
+> daily-driver blocker list. Current workspace `main` is `0.12.16`; #513
+> fast-forward `.git` resolution is merged and live-proven; #534 loser-side
+> no-loss guard is merged; the remaining G5-git-5 divergent keep-both gate is
+> fleet deploy plus the live neo<->honey canary in
+> `docs/release/evidence/divergent-keep-both-canary-PLAN.md`. Do not use this
+> May release-candidate text to justify local neo builds or PZM offload while
+> PZM's SSH/launchd/Nix contexts are failing directory-health/System Policy
+> probes.
+
 As of May 19, 2026, `tummycrypt` is in a much better state operationally than
 its remaining gaps might suggest.
 
@@ -155,7 +165,7 @@ Canonical docs:
 
 - [Apple Surface Status](apple-surface-status.md)
 - [macOS Finder and FileProvider Reality](macos-fileprovider-reality.md)
-- [TCFS Usage Reality Sprint Plan](usage-reality-sprint-plan-2026-05-06.md)
+- [TCFS Usage Reality Sprint Plan](../archive/usage-reality-sprint-plan-2026-05-06.md)
 
 ### Lazy Traversal And Hydration Demo
 
@@ -471,6 +481,6 @@ Linear hygiene decision on April 29, 2026:
 - [Apple Surface Status](apple-surface-status.md)
 - [macOS Finder and FileProvider Reality](macos-fileprovider-reality.md)
 - [iOS Surface Status](ios-surface-status.md)
-- [TCFS Workstream Reality Check - 2026-05-09](workstream-reality-check-2026-05-09.md)
+- [TCFS Workstream Reality Check - 2026-05-09](../archive/workstream-reality-check-2026-05-09.md)
 - [TCFS Fleet Parity Sprint Plan - 2026-05-09](fleet-parity-sprint-plan-2026-05-09.md)
 - [Feature Parity Gap Analysis](../../odrive-re/docs/feature-parity-gap-analysis.md)
